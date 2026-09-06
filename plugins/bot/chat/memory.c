@@ -291,7 +291,7 @@ memory_register_kv(void)
   kv_register("memory.recall_top_k", KV_UINT32, "4",
       memory_kv_changed, NULL,
       "Top-K semantic-recall hits from conversation_embeddings"
-      " (dossier-scoped) blended into the RECENT CONVERSATION block."
+      " (dossier-scoped) blended into the RECALLED prompt block."
       " 0 disables semantic recall for replies, leaving the block to"
       " the name-mention rows alone — facts, logging and the"
       " /show bot <name> memories verb are unaffected. It is the A/B"
@@ -1398,6 +1398,97 @@ memory_recent_own_replies(const char *bot_name, const char *method,
 
   else if(res->error[0] != '\0')
     clam(CLAM_WARN, "memory", "recent_own_replies: %s", res->error);
+
+  db_result_free(res);
+
+cleanup:
+  if(e_bot)  mem_free(e_bot);
+  if(e_meth) mem_free(e_meth);
+  if(e_chan) mem_free(e_chan);
+  return(n);
+}
+
+// The room is scoped by bot_name because every bot logs its own copy of
+// every line it witnessed: one bot's rows are exactly one transcript of
+// the channel, its own replies in place. The dossier join is a LEFT one
+// — an unresolved speaker is a line that was still said, and dropping it
+// would put a hole in the dialogue where a stranger spoke.
+//
+// EXCHANGE_OUT rows carry the ADDRESSEE's dossier_id, not a speaker's,
+// so the label on them is meaningless; `kind` is what the caller reads
+// to know the bot said it.
+size_t
+memory_recent_turns(const char *bot_name, const char *method,
+    const char *channel, uint32_t ns_id, uint32_t max_age_secs,
+    mem_turn_t *out, size_t max_k)
+{
+  db_result_t *res;
+  char sql[1024];
+  char age_clause[64];
+  char *e_bot;
+  char *e_meth;
+  char *e_chan;
+  size_t n;
+
+  if(!memory_ready || out == NULL || max_k == 0)
+    return(0);
+  if(bot_name == NULL || method == NULL || channel == NULL)
+    return(0);
+
+  e_bot  = db_escape(bot_name);
+  e_meth = db_escape(method);
+  e_chan = db_escape(channel);
+
+  n = 0;
+
+  if(e_bot == NULL || e_meth == NULL || e_chan == NULL)
+    goto cleanup;
+
+  age_clause[0] = '\0';
+  if(max_age_secs > 0)
+    snprintf(age_clause, sizeof(age_clause),
+        " AND c.ts >= NOW() - INTERVAL '%u seconds'", max_age_secs);
+
+  // DESC + LIMIT takes the NEWEST max_k; the caller wants them oldest
+  // first, so the rows are reversed on the way out. id breaks a ts tie
+  // into insertion order, which is the order the room saw them in.
+  snprintf(sql, sizeof(sql),
+      "SELECT c.kind, COALESCE(d.display_label, ''), c.text,"
+      " EXTRACT(EPOCH FROM c.ts)::bigint"
+      " FROM conversation_log c"
+      " LEFT JOIN dossier d ON d.id = c.dossier_id"
+      " WHERE c.ns_id = %u AND c.bot_name = '%s' AND c.method = '%s'"
+      "   AND c.channel = '%s'%s"
+      " ORDER BY c.ts DESC, c.id DESC LIMIT %zu",
+      ns_id, e_bot, e_meth, e_chan, age_clause, max_k);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) == SUCCESS && res->ok)
+  {
+    uint32_t rows = res->rows < max_k ? res->rows : (uint32_t)max_k;
+
+    for(uint32_t i = 0; i < rows; i++)
+    {
+      mem_turn_t *t = &out[rows - 1 - i];
+      const char *v;
+
+      memset(t, 0, sizeof(*t));
+      v = db_result_get(res, i, 0);
+      if(v) t->kind = (mem_msg_kind_t)strtol(v, NULL, 10);
+      v = db_result_get(res, i, 1);
+      if(v) strlcpy(t->speaker, v, sizeof(t->speaker));
+      v = db_result_get(res, i, 2);
+      if(v) strlcpy(t->text, v, sizeof(t->text));
+      v = db_result_get(res, i, 3);
+      if(v) t->ts = (time_t)strtoll(v, NULL, 10);
+    }
+
+    n = rows;
+  }
+
+  else if(res->error[0] != '\0')
+    clam(CLAM_WARN, "memory", "recent_turns: %s", res->error);
 
   db_result_free(res);
 

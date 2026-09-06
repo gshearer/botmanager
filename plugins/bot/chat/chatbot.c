@@ -358,6 +358,20 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " actually replies. When false, any inbound EXCHANGE_IN stamps the"
     " slot regardless of whether the speak policy gated a reply.", NULL },
 
+  // --- behavior.history.* — the dialogue handed to the model ----------
+  { "behavior.history.turns", KV_UINT32, "40",
+    "Lines of this channel's dialogue handed to the model as real"
+    " user/assistant turns, oldest first — the bot's own replies"
+    " included, which is what lets it know what it just said. Capped at"
+    " CHATBOT_HISTORY_TURNS_MAX (200). 0 disables the history entirely,"
+    " which is the pre-2026-09-06 shape: one system prompt and one bare"
+    " line, with no turn-taking the model can see.", NULL },
+  { "behavior.history.max_age_secs", KV_UINT32, "10800",
+    "Age beyond which a line is no longer part of THIS conversation."
+    " A room quiet for hours has moved on, and dragging yesterday's"
+    " dialogue in as live turns invites the model to answer it."
+    " 0 applies no age filter.", NULL },
+
   // --- behavior.mention.* — mention-expansion knobs --------------------
   { "behavior.mention.top_k", KV_UINT32, "6",
     "Facts per mentioned dossier to inject into EXCHANGE_IN replies."

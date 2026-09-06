@@ -361,6 +361,7 @@ req_free(chatbot_req_t *r)
   if(r->stash_mentions)   mem_free(r->stash_mentions);
   if(r->stash_images)     mem_free(r->stash_images);
   if(r->image_b64)        mem_free(r->image_b64);
+  if(r->turns)            mem_free(r->turns);
   chatbot_hold_unlink(&r->hold);
   mem_free(r);
 }
@@ -2664,7 +2665,16 @@ prompt_emit_nl_commands(char *buf, size_t pos, size_t cap,
   return pos + n;
 }
 
-// Emit the RECENT CONVERSATION block and trace what survived into it.
+// Emit the RECALLED block and trace what survived into it.
+//
+// ⚠ This is NOT the conversation, and it was labelled RECENT
+// CONVERSATION until 2026-09-06, which cost a session: the rows are
+// retrieval output — namespace-wide, ordered by cosine and by mention
+// rather than by time, with the bot's own replies filtered out — so a
+// line from another channel three weeks ago rendered under a heading
+// that told the model it had just been said. The dialogue is real
+// user/assistant turns now (see req_load_history); this block is what
+// was dredged up from outside that window, and the fence says so.
 //
 // The rows arrive already merged: name-mention rows fetched by plain SQL
 // and semantic-recall rows fetched by cosine are one undifferentiated
@@ -2675,7 +2685,7 @@ prompt_emit_nl_commands(char *buf, size_t pos, size_t cap,
 // only place the distinction is observable at all. EMBED-TRUTH §8 —
 // whether any of this improves the reply — cannot be judged without it.
 static size_t
-prompt_emit_conversation(char *buf, size_t pos, size_t cap,
+prompt_emit_recalled(char *buf, size_t pos, size_t cap,
     const chatbot_req_t *r, const mem_msg_t *msgs, size_t nm)
 {
   size_t block_start;
@@ -2707,7 +2717,8 @@ prompt_emit_conversation(char *buf, size_t pos, size_t cap,
       ? (size_t)r->memory_max_chars
       : (size_t)-1;
 
-  pos += snprintf(buf + pos, cap - pos, "<<<RECENT CONVERSATION>>>\n");
+  pos += snprintf(buf + pos, cap - pos,
+      "<<<RECALLED FROM EARLIER CONVERSATIONS>>>\n");
 
   n_emitted = 0;
   n_recall  = 0;
@@ -2735,7 +2746,7 @@ prompt_emit_conversation(char *buf, size_t pos, size_t cap,
   }
 
   if(pos < cap)
-    pos += snprintf(buf + pos, cap - pos, "<<<END CONVERSATION>>>\n\n");
+    pos += snprintf(buf + pos, cap - pos, "<<<END RECALLED>>>\n\n");
 
   clam(CLAM_DEBUG, "rag",
       "trace=block target=%s rows=%zu/%zu recall=%zu mention=%zu"
@@ -3077,7 +3088,7 @@ assemble_prompt(chatbot_req_t *r, const mem_fact_t *facts, size_t nf,
   pos = prompt_emit_nl_commands(buf, pos, work_cap, r);
 
   // 4. Conversation snippets, sanitized.
-  pos = prompt_emit_conversation(buf, pos, work_cap, r, msgs, nm);
+  pos = prompt_emit_recalled(buf, pos, work_cap, r, msgs, nm);
 
   // 4b. Knowledge chunks — external corpus RAG.
   pos = prompt_emit_knowledge(buf, pos, work_cap, r, kchunks, n_kchunks);
@@ -3135,12 +3146,13 @@ assemble_and_submit(chatbot_req_t *r,
     const knowledge_chunk_t *kchunks, size_t n_kchunks,
     const knowledge_image_t *kimages, size_t n_kimages)
 {
-  llm_message_t messages[2];
+  llm_message_t messages[CHATBOT_HISTORY_TURNS_MAX + 2];
   llm_content_block_t user_blocks[2];
+  llm_chat_params_t params;
+  size_t n_messages;
+
   memset(messages, 0, sizeof(messages));
   memset(user_blocks, 0, sizeof(user_blocks));
-  llm_chat_params_t params;
-
   memset(&params, 0, sizeof(params));
 
   assemble_prompt(r, facts, nf, msgs, nm, mentions, n_mentions,
@@ -3156,7 +3168,28 @@ assemble_and_submit(chatbot_req_t *r,
 
   messages[0].role    = LLM_ROLE_SYSTEM;
   messages[0].content = r->system_prompt;
-  messages[1].role    = LLM_ROLE_USER;
+  n_messages = 1;
+
+  // The dialogue, as dialogue. Everything the system prompt carries
+  // describes the bot or what it has been told; these are the turns
+  // themselves, and the role is what says which of them the bot spoke.
+  // A room is multi-party, so consecutive user turns from different
+  // people are normal and deliberately not merged — the speaker prefix
+  // inside each one is what keeps them apart.
+  //
+  // r->turns is clamped to CHATBOT_HISTORY_TURNS_MAX at load, which is
+  // what the array above is sized from; the guard is the load path's,
+  // not a second bound restated here.
+  for(size_t i = 0; i < r->n_turns; i++)
+  {
+    messages[n_messages].role = r->turns[i].is_own
+        ? LLM_ROLE_ASSISTANT
+        : LLM_ROLE_USER;
+    messages[n_messages].content = r->turns[i].content;
+    n_messages++;
+  }
+
+  messages[n_messages].role = LLM_ROLE_USER;
 
   // IV3: two-block user message for the vision path (text + image).
   // Lifetime of user_blocks ends with this function, but
@@ -3169,18 +3202,20 @@ assemble_and_submit(chatbot_req_t *r,
     user_blocks[1].image_mime = r->image_mime;
     user_blocks[1].image_b64  = r->image_b64;
 
-    messages[1].blocks   = user_blocks;
-    messages[1].n_blocks = 2;
+    messages[n_messages].blocks   = user_blocks;
+    messages[n_messages].n_blocks = 2;
   }
   else
-    messages[1].content = r->text;
+    messages[n_messages].content = r->text;
+
+  n_messages++;
 
   params.temperature = r->temperature;
   params.max_tokens  = r->max_tokens;
   params.effort      = r->effort;
   params.stream      = true;
 
-  if(llm_chat_submit(r->chat_model, &params, messages, 2,
+  if(llm_chat_submit(r->chat_model, &params, messages, n_messages,
         llm_done, llm_chunk, r) != SUCCESS)
   {
     clam(CLAM_WARN, "chatbot",
@@ -3497,6 +3532,99 @@ reply_bot_effort(const char *botname)
   return(e);
 }
 
+// Load the dialogue this turn continues, rendered as the model will be
+// handed it. Fetch and render are one step because the rendered form is
+// what has to outlive the request: mem_turn_t is the row, chatbot_turn_t
+// is the turn, and nothing downstream of here needs the row again.
+//
+// The tail trim is the one subtle part. The line being replied to was
+// already written to conversation_log by chatbot_observe before this
+// path ran, so the newest rows ARE the current turn and would otherwise
+// be handed to the model twice — once as history, once as the live
+// message. Walking back from the newest while the row's text is part of
+// r->text drops exactly those: one row in the ordinary case, and every
+// constituent line when the coalescer joined a paste into one turn.
+//
+// ⭑ A synthetic turn trims whatever it QUOTES, which is the behaviour we
+// want and not the one the shape suggests. interpret.c's cue reads
+// `[internal cue: <nick> asked "<their line>"…]`, so the line it is about
+// matches and is dropped — correctly, because the cue already carries it.
+// A chore cue quoting nothing trims nothing and keeps the whole room.
+//
+// ⚠ The `now - ts` bound is what stops the walk running away. Without it
+// a coalesced paste of short lines ("ok", "lol") could match identical
+// lines from an hour ago and eat the history a row at a time, silently.
+// The current turn is seconds old by construction — the coalescer flushes
+// within behavior.coalesce_ms — so anything older was never part of it.
+static void
+req_load_history(chatbot_req_t *r, const char *botname)
+{
+  mem_turn_t *rows;
+  uint32_t cap;
+  uint32_t max_age;
+  time_t floor_ts;
+  size_t n;
+
+  cap = (uint32_t)kv_get_bot_uint(botname, "behavior.history.turns");
+
+  if(cap == 0)
+    return;
+
+  if(cap > CHATBOT_HISTORY_TURNS_MAX)
+    cap = CHATBOT_HISTORY_TURNS_MAX;
+
+  max_age = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.history.max_age_secs");
+
+  rows = mem_alloc("chatbot", "history_rows", cap * sizeof(*rows));
+  n = memory_recent_turns(botname, method_inst_kind(r->method),
+      r->channel, r->ns_id, max_age, rows, cap);
+
+  floor_ts = time(NULL) - CHATBOT_HISTORY_TRIM_WINDOW_SECS;
+
+  while(n > 0 && rows[n - 1].kind != MEM_MSG_EXCHANGE_OUT
+      && rows[n - 1].ts >= floor_ts
+      && rows[n - 1].text[0] != '\0'
+      && strstr(r->text, rows[n - 1].text) != NULL)
+    n--;
+
+  if(n == 0)
+  {
+    mem_free(rows);
+    return;
+  }
+
+  r->turns = mem_alloc("chatbot", "history_turns", n * sizeof(*r->turns));
+
+  for(size_t i = 0; i < n; i++)
+  {
+    chatbot_turn_t *t = &r->turns[i];
+    char safe_text[MEM_TURN_TEXT_SZ];
+
+    sanitize_copy(safe_text, sizeof(safe_text), rows[i].text);
+    t->is_own = (rows[i].kind == MEM_MSG_EXCHANGE_OUT);
+
+    if(t->is_own)
+      strlcpy(t->content, safe_text, sizeof(t->content));
+
+    else
+    {
+      char safe_who[MEM_TURN_SPEAKER_SZ];
+
+      sanitize_copy(safe_who, sizeof(safe_who), rows[i].speaker);
+      snprintf(t->content, sizeof(t->content), "<%s> %s",
+          safe_who[0] != '\0' ? safe_who : "someone", safe_text);
+    }
+  }
+
+  r->n_turns = n;
+  mem_free(rows);
+
+  clam(CLAM_DEBUG, "chatbot",
+      "trace=history bot=%s target=%s turns=%zu/%u age=%us",
+      botname, r->reply_target, r->n_turns, cap, max_age);
+}
+
 // Entry point.
 //   1. Captures a chatbot_req_t with everything needed to reply.
 //   2. Loads the active personality body.
@@ -3795,6 +3923,8 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
         r->recent_replies,
         rr_cap);
   }
+
+  req_load_history(r, botname);
 
   // CV-13 — Snapshot the post-generation near-repeat threshold. Read
   // here rather than in send_reply_line so every streamed line of a
@@ -4182,6 +4312,8 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
         r->recent_replies,
         rr_cap);
   }
+
+  req_load_history(r, botname);
 
   r->anti_repeat_threshold_pct = (uint32_t)kv_get_uint(
       "chatbot.anti_repeat_jaccard_pct");

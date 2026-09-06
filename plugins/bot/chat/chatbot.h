@@ -1060,6 +1060,38 @@ bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
 // size the stored mem_recent_reply_t buffer uses).
 #define CHATBOT_RECENT_REPLIES_MAX         10
 
+// One prior line of the room, rendered as the model will receive it.
+//
+// `is_own` carries the whole role decision: the bot's own lines go back
+// as assistant turns and everything else as user turns, which is how a
+// chat model tells its own voice from the room's without being told in
+// prose. A user turn is rendered "<speaker> text" because a channel is
+// multi-party and the `user` role alone cannot say who spoke; an
+// assistant turn is bare, the way the model's own output always is.
+//
+// The buffer holds a whole stored line plus the widest speaker a
+// dossier can carry, so a render never truncates what the row kept.
+#define CHATBOT_TURN_TEXT_SZ  (MEM_TURN_TEXT_SZ + MEM_TURN_SPEAKER_SZ + 8)
+
+// Hard cap on the dialogue handed to the model, clamping
+// bot.<n>.behavior.history.turns. The window is not the constraint —
+// the chat model's context dwarfs any plausible value — but a KV typo
+// should not be able to ask Postgres for a hundred thousand rows.
+#define CHATBOT_HISTORY_TURNS_MAX          200
+
+// How far back req_load_history's tail trim may reach. The rows it drops
+// are the current turn, already logged before the reply path ran, so they
+// are seconds old — a coalesced paste flushes within behavior.coalesce_ms.
+// The bound exists so a paste of short, common lines cannot match older
+// identical ones and eat the history a row at a time with nothing to see.
+#define CHATBOT_HISTORY_TRIM_WINDOW_SECS   120
+
+typedef struct
+{
+  bool  is_own;
+  char  content[CHATBOT_TURN_TEXT_SZ];
+} chatbot_turn_t;
+
 // Forward: full definition lives in reply.c, where the mention bundle
 // is assembled. chatbot_req_t only holds a heap-pointer.
 struct chatbot_mention;
@@ -1128,7 +1160,7 @@ typedef struct
   uint32_t        knowledge_top_k;
   uint32_t        knowledge_max_chars;
 
-  // Byte budget for the RECENT CONVERSATION block, snapshot from
+  // Byte budget for the RECALLED block, snapshot from
   // `memory.rag_max_context_chars` at submit time for the same reason
   // the knowledge budget is. 0 means unbounded — the whole system
   // prompt is still capped by the per-request budget.
@@ -1252,6 +1284,15 @@ typedef struct
   // rule has teeth.
   mem_recent_reply_t recent_replies[CHATBOT_RECENT_REPLIES_MAX];
   size_t             n_recent_replies;
+
+  // The dialogue this turn is a continuation of, oldest first, handed
+  // to the model as real user/assistant turns rather than described to
+  // it inside the system prompt. Heap-owned for the life of the
+  // request: llm_chat_submit copies every string, so these only have to
+  // outlive the submit call, but the request is what owns them until
+  // req_free. NULL / 0 when history is disabled or the room is new.
+  chatbot_turn_t    *turns;
+  size_t             n_turns;
 
   // CV-13 — Trigram-Jaccard percent (0..99) required to drop an
   // outgoing line as a near-repeat of any recent_replies entry. The

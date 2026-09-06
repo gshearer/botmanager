@@ -151,6 +151,29 @@ typedef struct
   int64_t ts;                      // epoch seconds
 } mem_recent_reply_t;
 
+// One prior line of a room, as the dialogue rather than as retrieval.
+//
+// Held apart from mem_msg_t on purpose: that type is a log row and the
+// retrieval paths hand it back unordered, unattributed and with the
+// bot's own replies filtered out, which is right for a semantic bag and
+// wrong for a conversation. This one is chronological, attributed, and
+// keeps EXCHANGE_OUT — `kind` is what tells the reader which lines the
+// bot said itself.
+//
+// The text cap is well under mem_msg_t's: an outbound line is bounded
+// by the wire budget the method enforces, and a history entry long
+// enough to overrun this adds nothing a reply needs.
+#define MEM_TURN_SPEAKER_SZ  128      // dossier.display_label VARCHAR(128)
+#define MEM_TURN_TEXT_SZ     1024
+
+typedef struct
+{
+  char            speaker[MEM_TURN_SPEAKER_SZ];   // "" when unresolved
+  char            text[MEM_TURN_TEXT_SZ];
+  mem_msg_kind_t  kind;
+  time_t          ts;
+} mem_turn_t;
+
 // Opaque retrieval handle (reserved for Chunk D async path).
 typedef struct mem_retrieval mem_retrieval_t;
 
@@ -202,6 +225,17 @@ void memory_exit(void);
 size_t memory_recent_own_replies(const char *bot_name, const char *method,
     const char *channel, uint32_t ns_id, uint32_t max_age_secs,
     mem_recent_reply_t *out, size_t max_k);
+
+// Fetch the last `max_k` lines of one room — every kind, the bot's own
+// replies included — as dialogue: oldest first, each attributed through
+// dossier.display_label. Rows older than max_age_secs are excluded (0 =
+// no age filter), because a room that has been quiet for hours is a new
+// conversation and not the tail of the last one.
+//
+// out must have at least max_k elements. Returns the number written.
+size_t memory_recent_turns(const char *bot_name, const char *method,
+    const char *channel, uint32_t ns_id, uint32_t max_age_secs,
+    mem_turn_t *out, size_t max_k);
 
 // Fire-and-forget insert into conversation_log. Synchronous DB round
 // trip in this chunk. Caller copies are taken; msg may be freed after
