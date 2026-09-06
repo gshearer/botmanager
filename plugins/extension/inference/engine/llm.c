@@ -2689,14 +2689,25 @@ llm_accumulate_stats(llm_request_t *req, bool ok)
 }
 
 // A 200 that carried no answer: the provider was reached, agreed, and said
-// nothing. On a thinking model that means the reasoning pass ate the whole
-// budget — the three wire shapes it arrives in are in LLM.md §Thinking /
-// reasoning models. Naming the effort here is the diagnosis; without it the
-// same failure went eleven hours unread.
+// nothing. Naming the effort here is the diagnosis; without it the same
+// failure went eleven hours unread.
+//
+// ⚠ There are TWO of these and the token count is what separates them, so
+// the line must not name a cause its own numbers disprove. Tokens spent
+// with nothing in `content` is the thinking model eating its budget —
+// LLM.md §Thinking / reasoning models has the three wire shapes, and
+// raising max_tokens or setting reasoning_effort is the fix. But
+// `completion_tokens == 0` is the model declining to write a single
+// token, which no budget can be too small for; measured twice in 4,269
+// chat requests over six days (2026-09-03 and 09-06, both at
+// reasoning_effort=none), i.e. a sampler outcome and not a knob. The
+// advice was printed unconditionally until 09-06 and sends a reader to
+// tune the one thing that cannot be responsible.
 static void
 llm_warn_empty_chat(const llm_request_t *req, long http_status)
 {
   const char *reff;
+  const char *cause;
 
   if(req->type != LLM_REQ_CHAT || http_status != 200
       || req->assembled_len != 0)
@@ -2704,15 +2715,22 @@ llm_warn_empty_chat(const llm_request_t *req, long http_status)
 
   reff = llm_effort_in_force(req);
 
+  cause = req->completion_tokens == 0
+      ? "The model emitted no token at all — not a budget, and rare"
+        " enough to be a sampler outcome. Nothing to tune; check the"
+        " service is serving the weights you think it is"
+      : "A thinking model with too small a budget spends it all"
+        " thinking; raise max_tokens or set the service's"
+        " reasoning_effort";
+
   clam(CLAM_WARN, "llm",
       "model %s (service %s) answered 200 with no content —"
-      " reasoning_effort=%s finish_reason=%s completion_tokens=%u."
-      " A thinking model with too small a budget spends it all thinking;"
-      " raise max_tokens or set llm.service.%s.reasoning_effort",
+      " reasoning_effort=%s finish_reason=%s completion_tokens=%u. %s"
+      " (llm.service.%s.reasoning_effort)",
       req->model_name, req->service_name,
       reff != NULL ? reff : "(omitted)",
       req->finish_reason[0] != '\0' ? req->finish_reason : "(none)",
-      req->completion_tokens, req->service_name);
+      req->completion_tokens, cause, req->service_name);
 }
 
 // Deliver the final chat/embed callback and release the request.
