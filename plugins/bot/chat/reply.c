@@ -3481,7 +3481,8 @@ retrieve_cb(const mem_fact_t *facts, size_t n_facts,
   }
 
   if(knowledge_retrieve(r->knowledge_corpus, r->text,
-        r->knowledge_top_k, knowledge_cb, r) != SUCCESS)
+        r->knowledge_top_k, r->knowledge_lexical_k,
+        knowledge_cb, r) != SUCCESS)
   {
     clam(CLAM_WARN, "chatbot",
         "knowledge_retrieve failed — submitting memory-only reply");
@@ -3783,6 +3784,8 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
       "%s", cl ? cl : "");
   r->knowledge_top_k = (uint32_t)kv_get_bot_uint(botname,
       "behavior.knowledge.top_k");
+  r->knowledge_lexical_k = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.knowledge.lexical_k");
   r->knowledge_max_chars = (uint32_t)kv_get_bot_uint(botname,
       "behavior.knowledge.max_chars");
 
@@ -4242,6 +4245,8 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   // did not skip its corpus is retrieving against the same budget.
   r->knowledge_top_k = (uint32_t)kv_get_bot_uint(botname,
       "behavior.knowledge.top_k");
+  r->knowledge_lexical_k = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.knowledge.lexical_k");
   r->knowledge_max_chars = (uint32_t)kv_get_bot_uint(botname,
       "behavior.knowledge.max_chars");
 

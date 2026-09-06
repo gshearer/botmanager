@@ -605,7 +605,10 @@ verb_llm_knowledge(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   verb_reply_to_snapshot(st, ctx);
 
-  if(knowledge_retrieve(corpus_list, rest, 0, kw_rag_cb, st) != SUCCESS)
+  // Bot-agnostic: this verb answers about a corpus, not as a bot, so it
+  // has no per-bot widths to apply and defers to the plugin's.
+  if(knowledge_retrieve(corpus_list, rest, KNOWLEDGE_K_INHERIT,
+        KNOWLEDGE_K_INHERIT, kw_rag_cb, st) != SUCCESS)
   {
     cmd_reply(ctx, "knowledge_retrieve failed");
     mem_free(st);

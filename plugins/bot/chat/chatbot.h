@@ -1158,6 +1158,7 @@ typedef struct
   // changes can't tear off mid-reply.
   char            knowledge_corpus[CHATBOT_CORPUS_LIST_SZ];
   uint32_t        knowledge_top_k;
+  uint32_t        knowledge_lexical_k;
   uint32_t        knowledge_max_chars;
 
   // Byte budget for the RECALLED block, snapshot from

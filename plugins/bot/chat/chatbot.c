@@ -379,14 +379,18 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
   // support questions and a bot in a games channel want different
   // amounts of encyclopedia and neither should have to move a knob that
   // changes the other.
-  { "behavior.knowledge.top_k", KV_UINT32, "0",
-    "Chunks the cosine channel retrieves per reply for THIS bot."
-    " 0 inherits the plugin-wide knowledge.rag_top_k, which is where"
-    " the default lives — the engine resolves it, so a bot that never"
-    " sets this is byte-identical to one built before the key existed."
-    " ⚠ The lexical channel is NOT covered: knowledge.rag_lexical_k is"
-    " still plugin-wide for every bot, because knowledge_retrieve takes"
-    " no parameter for it.", NULL },
+  { "behavior.knowledge.top_k", KV_UINT32, "5",
+    "How many corpus chunks THIS bot pulls by meaning (the search that"
+    " matches what a line is about). 0 turns that search off; use"
+    " `set bot <name> --delete` to come back to this default. Mirrors"
+    " the plugin-wide knowledge.rag_top_k, which is the value every bot"
+    " used before this key existed.", NULL },
+  { "behavior.knowledge.lexical_k", KV_UINT32, "3",
+    "How many corpus chunks THIS bot pulls by keyword (the search that"
+    " matches literal words). 0 turns keyword search off for this bot"
+    " and is a normal thing to want: a chatty bot in a social channel"
+    " gets hits on a person's nickname this way. Mirrors the"
+    " plugin-wide knowledge.rag_lexical_k.", NULL },
   { "behavior.knowledge.max_chars", KV_UINT32, "0",
     "Byte budget for THIS bot's KNOWLEDGE prompt block, trimmed from the"
     " tail once exceeded. 0 inherits knowledge.rag_max_context_chars."

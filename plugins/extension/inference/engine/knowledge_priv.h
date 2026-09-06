@@ -130,7 +130,8 @@ bool knowledge_insert_image(int64_t chunk_id, const char *url,
 // Retrieval (extern — also exposed via inference.h shim outside the
 // plugin).
 bool knowledge_retrieve(const char *corpus_list, const char *query,
-    uint32_t top_k, knowledge_retrieve_cb_t cb, void *user);
+    uint32_t top_k, uint32_t lexical_k, knowledge_retrieve_cb_t cb,
+    void *user);
 
 size_t knowledge_images_for_chunks(const int64_t *chunk_ids, size_t n_ids,
     knowledge_image_t *out, size_t out_cap);

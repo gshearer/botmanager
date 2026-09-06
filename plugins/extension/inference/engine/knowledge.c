@@ -1824,7 +1824,7 @@ knowledge_deliver_hits(const knowledge_hit_t *hits, size_t n,
 static void
 knowledge_retrieve_with_vec(const char *corpus_list, const char *query,
     const char *model, uint32_t dim, const float *qvec, uint32_t top_k,
-    knowledge_retrieve_cb_t cb, void *user)
+    uint32_t lexical_k, knowledge_retrieve_cb_t cb, void *user)
 {
   knowledge_rank_t          rank;
   knowledge_hit_t           out[KNOWLEDGE_HITS_MAX];
@@ -1837,14 +1837,26 @@ knowledge_retrieve_with_vec(const char *corpus_list, const char *query,
 
   knowledge_cfg_snapshot(&cfg);
 
-  if(top_k == 0 || top_k > KNOWLEDGE_HITS_MAX)
+  // Each channel's width is the caller's to choose, and 0 is a width:
+  // it turns that channel off for this retrieval. Only
+  // KNOWLEDGE_K_INHERIT defers to the plugin-wide value, which is what
+  // lets a caller ask for no lexical rows at all — the thing a knob
+  // whose 0 meant "default" could never express. ⚠ Until 2026-09-06
+  // top_k's 0 DID mean inherit and there was no lexical parameter; a
+  // caller written against that reads as "no dense channel" now.
+  if(top_k == KNOWLEDGE_K_INHERIT)
     top_k = cfg.rag_top_k;
 
-  if(top_k == 0 || top_k > KNOWLEDGE_HITS_MAX)
-    top_k = KNOWLEDGE_DEF_RAG_TOP_K;
+  // No floor to the compiled default here: knowledge_load_config already
+  // refuses a zero cfg.rag_top_k, so the only way to arrive at 0 is to
+  // have asked for it.
+  if(top_k > KNOWLEDGE_HITS_MAX)
+    top_k = KNOWLEDGE_HITS_MAX;
 
-  lex_k = cfg.rag_lexical_k;
+  lex_k = lexical_k == KNOWLEDGE_K_INHERIT ? cfg.rag_lexical_k : lexical_k;
 
+  // Both channels' slots come out of one delivery buffer, so the lexical
+  // width is bounded by what the dense width left.
   if(lex_k > KNOWLEDGE_HITS_MAX - top_k)
     lex_k = KNOWLEDGE_HITS_MAX - top_k;
 
@@ -1887,6 +1899,7 @@ typedef struct
   char                     model[KNOWLEDGE_EMBED_MODEL_SZ];
   char                    *query;                 // mem_strdup'd; freed here
   uint32_t                 top_k;
+  uint32_t                 lexical_k;
   knowledge_retrieve_cb_t  cb;
   void                    *user;
 } knowledge_retrieval_ctx_t;
@@ -1915,14 +1928,15 @@ knowledge_retrieve_embed_done(const llm_embed_response_t *resp)
   }
 
   knowledge_retrieve_with_vec(c->corpus, c->query, c->model, resp->dim,
-      resp->vectors[0], c->top_k, c->cb, c->user);
+      resp->vectors[0], c->top_k, c->lexical_k, c->cb, c->user);
 
   knowledge_retrieval_ctx_free(c);
 }
 
 bool
 knowledge_retrieve(const char *corpus, const char *query,
-    uint32_t top_k, knowledge_retrieve_cb_t cb, void *user)
+    uint32_t top_k, uint32_t lexical_k, knowledge_retrieve_cb_t cb,
+    void *user)
 {
   knowledge_cfg_t cfg;
   char model[KNOWLEDGE_EMBED_MODEL_SZ];
@@ -1953,7 +1967,8 @@ knowledge_retrieve(const char *corpus, const char *query,
   // The lexical channel runs off the query text, on the embed
   // callback's thread, long after the caller's buffer may be gone.
   c->query = mem_strdup("knowledge", "rag_query", query);
-  c->top_k = top_k;
+  c->top_k     = top_k;
+  c->lexical_k = lexical_k;
   c->cb    = cb;
   c->user  = user;
 

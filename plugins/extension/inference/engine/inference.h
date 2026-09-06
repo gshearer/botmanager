@@ -541,6 +541,22 @@ typedef void (*acquire_ingest_cb_t)(
     int64_t chunk_id, uint32_t relevance,
     acquire_ingest_mode_t mode, void *user);
 
+// Width sentinel for knowledge_retrieve's two channels.
+//
+// ⭑⭑ 0 is a WIDTH, not a request for the default: it turns that channel
+// off for this retrieval, which is the only way to ask for no lexical
+// rows at all. KNOWLEDGE_K_INHERIT is how a caller with no opinion defers
+// to knowledge.rag_top_k / knowledge.rag_lexical_k — and a caller with no
+// opinion is the bot-agnostic kind, because a bot's own widths come from
+// bot.<name>.behavior.knowledge.*.
+//
+// ⚠⚠ Until 2026-09-06 top_k's 0 meant inherit and there was no lexical
+// parameter at all. Code written against that signature does not fail to
+// compile against this one if it passes 0 — it silently asks for an empty
+// dense channel. Both in-tree callers were migrated in the same commit;
+// anything new must not copy the old shape from an old diff.
+#define KNOWLEDGE_K_INHERIT  UINT32_MAX
+
 // -----------------------------------------------------------------------
 // dlsym shim helpers
 // -----------------------------------------------------------------------
@@ -882,11 +898,13 @@ knowledge_corpus_upsert(const char *name, const char *description)
   return(fn(name, description));
 }
 
+
 static inline bool
 knowledge_retrieve(const char *corpus_list, const char *query,
-    uint32_t top_k, knowledge_retrieve_cb_t cb, void *user)
+    uint32_t top_k, uint32_t lexical_k, knowledge_retrieve_cb_t cb,
+    void *user)
 {
-  typedef bool (*fn_t)(const char *, const char *, uint32_t,
+  typedef bool (*fn_t)(const char *, const char *, uint32_t, uint32_t,
       knowledge_retrieve_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -904,7 +922,7 @@ knowledge_retrieve(const char *corpus_list, const char *query,
     fn = u.fn;
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
-  return(fn(corpus_list, query, top_k, cb, user));
+  return(fn(corpus_list, query, top_k, lexical_k, cb, user));
 }
 
 static inline float
