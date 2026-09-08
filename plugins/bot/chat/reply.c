@@ -1268,10 +1268,10 @@ anti_repeat_blocks_line(const chatbot_req_t *r, const char *line)
   return(false);
 }
 
-// Which of the two emote spellings the model used, if either. The rule
+// Which of the three emote spellings the model used, if any. The rule
 // itself is documented at CHATBOT_EMOTE_PREFIX; what belongs here is
 // why it is a function: persona_reply.c puts a model's line on the wire
-// too, and a second copy of the compare would drift the day a third
+// too, and a second copy of the compare would drift the day a fourth
 // spelling shows up.
 size_t
 chatbot_emote_prefix_len(const char *line)
@@ -1294,6 +1294,17 @@ chatbot_emote_prefix_len(const char *line)
         CHATBOT_ACTION_PREFIX_LEN) == 0
       && line[off + CHATBOT_ACTION_PREFIX_LEN] != '\0')
     return(off + CHATBOT_ACTION_PREFIX_LEN);
+
+  // The speaker tag borrowed from our own transcript. The prompt renders
+  // every turn the bot did not speak as "<nick> text", so a model
+  // performing an action reaches for the bracket it has seen on every
+  // other line and writes "<me curls up ...". The trailing space is what
+  // keeps this off real speech: a nick tag closes its bracket first, so
+  // "<mercury> ..." and "<me> ..." are both untouched.
+  if(strncmp(line, CHATBOT_TAGGED_EMOTE_PREFIX,
+        CHATBOT_TAGGED_EMOTE_PREFIX_LEN) == 0
+      && line[CHATBOT_TAGGED_EMOTE_PREFIX_LEN] != '\0')
+    return(CHATBOT_TAGGED_EMOTE_PREFIX_LEN);
 
   return(0);
 }

@@ -1025,14 +1025,17 @@ bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
 // SKIPs several direct lines in a row. Silence is the lesser evil.
 #define CHATBOT_CV4_FALLBACK_COOLDOWN_SECS 90
 
-// The two spellings of "this line is an action, not speech". "/me " is
+// The three spellings of "this line is an action, not speech". "/me " is
 // the IRC convention the capability block teaches; the bare CTCP verb
 // is what a model hands back when it skips past the convention to the
 // wire format, and it is accepted as an alias so the channel sees a
 // properly-framed emote rather than a literal "ACTION ..." PRIVMSG.
-// Keep each prefix beside its length so the compare and the `line + N`
-// bump stay in sync; chatbot_emote_prefix_len matches both and is the
-// only place either is spelled out.
+// "<me " is the third, and it comes from our own prompt: every turn the
+// bot did not speak is rendered "<nick> text", so a model performing an
+// action blends the two conventions and reaches for the bracket it has
+// seen on every other line. Keep each prefix beside its length so the
+// compare and the `line + N` bump stay in sync; chatbot_emote_prefix_len
+// matches all three and is the only place any of them is spelled out.
 // The action verb and the prefix that carries it. Two names because the
 // parser wants the trailing space and the prose does not — and because
 // the base prompt substitutes this into a sentence an author wrote, so
@@ -1042,6 +1045,8 @@ bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
 #define CHATBOT_EMOTE_PREFIX_LEN           4
 #define CHATBOT_ACTION_PREFIX              "ACTION "
 #define CHATBOT_ACTION_PREFIX_LEN          7
+#define CHATBOT_TAGGED_EMOTE_PREFIX        "<me "
+#define CHATBOT_TAGGED_EMOTE_PREFIX_LEN    4
 
 // A model that reached all the way to the wire format wrote the CTCP
 // frame around the verb as well, so the verb is recognised delimited or
