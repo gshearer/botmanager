@@ -269,6 +269,36 @@ render_dossier_detail(const cmd_ctx_t *ctx, dossier_id_t did)
   }
 
   db_result_free(res);
+
+  // Opt-outs. The one place an operator can see why a chore went quiet
+  // about this person — the scans skip them without a word.
+  snprintf(sql, sizeof(sql),
+      "SELECT string_agg(CASE chore WHEN '" DOSSIER_OPTOUT_ALL "'"
+      " THEN 'everything' ELSE chore END, ', ' ORDER BY chore)"
+      " FROM dossier_optout WHERE dossier_id = %" PRId64,
+      (int64_t)did);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
+  {
+    const char *v = db_result_get(res, 0, 0);
+
+    if(v != NULL && v[0] != '\0')
+    {
+      snprintf(tline, sizeof(tline),
+          "  " CLR_CYAN "opted out:" CLR_RESET " %s", v);
+      cmd_reply(ctx, tline);
+    }
+  }
+
+  else if(res->error[0] != '\0')
+  {
+    clam(CLAM_WARN, "dossier", "show optout: %s", res->error);
+    cmd_reply(ctx, "  " CLR_CYAN "opted out:" CLR_RESET " (read failed)");
+  }
+
+  db_result_free(res);
 }
 
 static const cmd_arg_desc_t ad_show_dossier[] = {

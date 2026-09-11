@@ -181,6 +181,7 @@ chatbot_occasions_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
       "  ORDER BY last_seen DESC LIMIT 1) sg ON TRUE"
       " WHERE d.ns_id = %" PRIu32 " AND df.fact_key = 'birthday'"
       " AND " MEM_SRC_CHORE_KEYABLE("df.source")
+      " AND " DOSSIER_OPTOUT_EXCLUDES("df.dossier_id", SOUL_CHORE_OCCASIONS)
       " ORDER BY df.dossier_id, df.last_seen DESC"
       " LIMIT %d",
       ns_id, OCCASIONS_ROWS_MAX);

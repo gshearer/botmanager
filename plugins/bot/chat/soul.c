@@ -112,10 +112,10 @@ static bool soul_chore_pricewatch(soul_sched_t *, uint32_t,
 static const soul_chore_t soul_chores[] = {
   { "deferred",   NULL,         0,                              soul_chore_deferred   },
   { "presence",   NULL,         0,                              soul_chore_presence   },
-  { "weather",    "weather",    SOUL_WX_INTERVAL_DEFAULT_SECS,  soul_chore_weather    },
-  { "occasions",  "occasions",  SOUL_OCC_INTERVAL_DEFAULT_SECS, soul_chore_occasions  },
-  { "followups",  "followups",  SOUL_FUP_INTERVAL_DEFAULT_SECS, soul_chore_followups  },
-  { "pricewatch", "pricewatch", SOUL_PW_INTERVAL_DEFAULT_SECS,  soul_chore_pricewatch },
+  { SOUL_CHORE_WEATHER,    SOUL_CHORE_WEATHER,    SOUL_WX_INTERVAL_DEFAULT_SECS,  soul_chore_weather    },
+  { SOUL_CHORE_OCCASIONS,  SOUL_CHORE_OCCASIONS,  SOUL_OCC_INTERVAL_DEFAULT_SECS, soul_chore_occasions  },
+  { SOUL_CHORE_FOLLOWUPS,  SOUL_CHORE_FOLLOWUPS,  SOUL_FUP_INTERVAL_DEFAULT_SECS, soul_chore_followups  },
+  { SOUL_CHORE_PRICEWATCH, SOUL_CHORE_PRICEWATCH, SOUL_PW_INTERVAL_DEFAULT_SECS,  soul_chore_pricewatch },
 };
 
 #define SOUL_CHORE_COUNT (sizeof(soul_chores) / sizeof(soul_chores[0]))
@@ -1237,6 +1237,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
       " AND (df.fact_key IN ('postal_code', 'location')"
       "  OR df.fact_key LIKE 'city_of_interest:%%')"
       " AND " MEM_SRC_CHORE_KEYABLE("df.source")
+      " AND " DOSSIER_OPTOUT_EXCLUDES("df.dossier_id", SOUL_CHORE_WEATHER)
       " ORDER BY df.dossier_id,"
       " CASE df.fact_key WHEN 'postal_code' THEN 0"
       " WHEN 'location' THEN 1 ELSE 2 END, df.last_seen DESC"

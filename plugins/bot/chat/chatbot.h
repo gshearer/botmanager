@@ -1595,7 +1595,39 @@ bool chatbot_pricewatch_register(void);
 // argument, which is the whole of their permission model.
 bool chatbot_remember_register(void);
 
+// The dossier of whoever typed ctx's line, created when `create` is set
+// and this is the first the bot has heard of them; 0 when the speaker
+// cannot be told apart from anyone else. Deliberately not the reply
+// path's resolver: a verb that writes about its speaker must find the
+// dossier every later scan will find, anonymous_dossiers or not.
+int64_t chatbot_sender_dossier(const cmd_ctx_t *ctx, bool create);
+
+// ---- optout.c — a person's standing refusal of a chore ----
+
+// Register /optout and /optin. Called from chatbot_cmds_register. Like
+// /remember they write only the speaker's own dossier.
+bool chatbot_optout_register(void);
+
+// Has `dossier_id` refused `chore` (a SOUL_CHORE_* name), directly or
+// through "all"? A dossier <= 0 names nobody and has refused nothing.
+// FAIL when the lookup could not run, and a caller about to speak must
+// then hold its tongue: a refusal nobody could read is still a refusal.
+// Blocking (sync db_query).
+bool chatbot_optout_has(int64_t dossier_id, const char *chore, bool *out);
+
+// The chore that writes deferred rows under `source`, or NULL for a
+// source no chore owns (/remind and /in are the person's own asks).
+const char *chatbot_optout_chore_of_source(const char *source);
+
 // ---- soul.c — the per-bot heartbeat (SOUL-2) ----
+
+// The names of the chores a person may refuse. Each is the chore's row
+// in soul.c's table, its KV family (behavior.soul.<name>.*) and the key
+// dossier_optout stores, so one spelling serves all three.
+#define SOUL_CHORE_WEATHER     "weather"
+#define SOUL_CHORE_OCCASIONS   "occasions"
+#define SOUL_CHORE_FOLLOWUPS   "followups"
+#define SOUL_CHORE_PRICEWATCH  "pricewatch"
 
 // Release a chore's in-flight latch. Called exactly once by whichever
 // completion path owns an airborne chore — never by a chore that

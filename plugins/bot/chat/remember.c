@@ -101,13 +101,11 @@ remember_trim(char *s)
   s[len] = '\0';
 }
 
-// The speaker's own dossier, created if this is the first thing we ever
-// learn about them — the same resolution nl_observe uses, and
-// deliberately not the reply path's: these verbs write about whoever
+// The same resolution nl_observe uses. These verbs write about whoever
 // typed them and nobody else, which is the whole of their permission
 // model (there is no target argument to abuse).
-static int64_t
-remember_sender_dossier(const cmd_ctx_t *ctx)
+int64_t
+chatbot_sender_dossier(const cmd_ctx_t *ctx, bool create)
 {
   userns_t *ns;
 
@@ -119,7 +117,7 @@ remember_sender_dossier(const cmd_ctx_t *ctx)
   if(ns == NULL)
     return(0);
 
-  return(chat_user_dossier_id(ctx->msg, ns->id, ctx->msg->sender, true));
+  return(chat_user_dossier_id(ctx->msg, ns->id, ctx->msg->sender, create));
 }
 
 // Shared preamble: canonical key or a refusal that names the vocabulary.
@@ -176,7 +174,7 @@ cmd_remember(const cmd_ctx_t *ctx)
     return;
   }
 
-  did = remember_sender_dossier(ctx);
+  did = chatbot_sender_dossier(ctx, true);
 
   if(did <= 0)
   {
@@ -231,7 +229,7 @@ cmd_forget(const cmd_ctx_t *ctx)
   if(v == NULL)
     return;
 
-  did = remember_sender_dossier(ctx);
+  did = chatbot_sender_dossier(ctx, true);
 
   if(did <= 0)
   {

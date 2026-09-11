@@ -277,12 +277,16 @@ chatbot_cmds_register(void)
   if(chatbot_remember_register() != SUCCESS)
     goto fail_remember;
 
+  if(chatbot_optout_register() != SUCCESS)
+    goto fail_optout;
+
   return(SUCCESS);
 
   // A registration failure here is CLAM_FATAL to the load, and the
   // daemon does not come up with a half-registered chat surface — so
   // these labels unwind what they can name and leave the rest to the
   // reclamation that runs before any mapping is dropped.
+fail_optout:
 fail_remember:
 fail_pricewatch:
 fail_deferred:

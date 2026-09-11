@@ -696,6 +696,8 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
   double            spot;
   uint32_t          cap;
   int64_t           pending;
+  dossier_id_t      did;
+  bool              opted = false;
   char              pair[EXCHANGE_PRODUCT_ID_SZ];
   char              owner_pred[768];
   char              ack[256];
@@ -799,9 +801,10 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(chatbot_pricewatch_insert(ns->id, chatbot_resolve_dossier(st, ctx->msg),
-      ctx->msg, bot_name, method_name, pair, (int)dir,
-      threshold) != SUCCESS)
+  did = chatbot_resolve_dossier(st, ctx->msg);
+
+  if(chatbot_pricewatch_insert(ns->id, did, ctx->msg, bot_name, method_name,
+      pair, (int)dir, threshold) != SUCCESS)
   {
     cmd_reply(ctx, "failed to store the watch");
     return;
@@ -813,11 +816,20 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
       "bot=%s watch set by %s: %s %s %s in '%s'", bot_name, ctx->msg->sender,
       pair, pricewatch_dir_word(dir), num, ctx->msg->channel);
 
+  // Stored either way — the refusal is theirs to lift, and lifting it
+  // should find the watch still armed — but a promise the sweep will
+  // skip must not be made at all, so this ack outranks the two below.
+  if(chatbot_optout_has(did, SOUL_CHORE_PRICEWATCH, &opted) == SUCCESS
+      && opted)
+    snprintf(ack, sizeof(ack),
+        "set — but you've opted out of price alerts, so I won't say a word"
+        " about %s until you 'optin prices'.", pair);
+
   // A threshold the market already satisfies is not an error — it is
   // the honest answer to "tell me if it drops below 90k" when it is at
   // 63k — but silently promising to tell them "once it happens" would
   // be, so the ack says which of the two they just asked for.
-  if(pricewatch_crossed(spot, (int64_t)dir, threshold))
+  else if(pricewatch_crossed(spot, (int64_t)dir, threshold))
   {
     char now[48];
 
@@ -1334,6 +1346,8 @@ pricewatch_load_rows(pricewatch_sweep_t *sweep)
       " method_name, channel, sender, nickname, username, hostname,"
       " verified_id, metadata FROM chat_pricewatch"
       " WHERE ns_id = %" PRIu32 " AND bot_name = '%s' AND fired_at IS NULL"
+      " AND " DOSSIER_OPTOUT_EXCLUDES("chat_pricewatch.dossier_id",
+                                      SOUL_CHORE_PRICEWATCH)
       " ORDER BY id ASC LIMIT %d", sweep->ns_id, e_bot, PRICEWATCH_ROWS_MAX);
   mem_free(e_bot);
 

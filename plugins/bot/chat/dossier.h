@@ -71,6 +71,28 @@ typedef struct dossier_sig
 
 typedef bool (*dossier_sig_filter_t)(const dossier_sig_t *sig, void *user);
 
+// Opt-outs
+//
+// dossier_optout holds a person's standing refusal of one of the bot's
+// own-initiative chores: (dossier_id, chore), where chore is a soul chore
+// name or DOSSIER_OPTOUT_ALL. ALL is stored as itself rather than as one
+// row per chore, because "leave me out of all of it" also means the next
+// chore somebody writes. It is dossier state rather than soul state for
+// one reason — dossier_merge and dossier_split_signature must carry it,
+// and a refusal a merge quietly dropped would put someone back on a
+// watch they had left.
+#define DOSSIER_OPTOUT_ALL      "*"
+#define DOSSIER_OPTOUT_CHORE_SZ 32
+
+// The guard a chore's scan carries in its WHERE clause, beside
+// MEM_SRC_CHORE_KEYABLE and for the same reason: enforced where the
+// person is selected, not remembered by each chore afterwards. `col`
+// names the scanned row's dossier id, `chore` a string literal. A NULL
+// dossier passes — it names nobody who could have refused.
+#define DOSSIER_OPTOUT_EXCLUDES(col, chore) \
+    "NOT EXISTS (SELECT 1 FROM dossier_optout o WHERE o.dossier_id = " col \
+    " AND o.chore IN ('" chore "', '" DOSSIER_OPTOUT_ALL "'))"
+
 // Summary row returned by dossier_get(). Facts are retrieved via the
 // memory_retrieve_dossier() API, not duplicated here.
 #define DOSSIER_INFO_LABEL_SZ  DOSSIER_LABEL_SZ
@@ -141,8 +163,9 @@ bool dossier_record_sighting(dossier_id_t dossier_id,
 bool dossier_set_user(dossier_id_t dossier_id, int user_id);
 
 // Collapse absorbed dossiers into the survivor: all signatures and
-// facts are reassigned, message_count is summed, first_seen/last_seen
-// are unified, and absorbed rows are deleted. Absorbed rows must be
+// facts are reassigned, opt-outs are unioned onto the survivor,
+// message_count is summed, first_seen/last_seen are unified, and
+// absorbed rows are deleted. Absorbed rows must be
 // in the same namespace as the survivor (and must not include the
 // survivor itself). Deduplicates on (dossier_id, method_kind, nickname,
 // username, hostname, verified_id) and (dossier_id, kind, fact_key)
@@ -162,6 +185,11 @@ bool dossier_get(dossier_id_t dossier_id, dossier_info_t *out);
 // facts synthesized from prior sightings stay with the original
 // dossier. Admins who need to move specific facts can do so via
 // follow-up `memory_*_dossier_fact` calls.
+//
+// Opt-outs are the exception and are COPIED to the new dossier: nothing
+// says which of the two people made the refusal, and silencing the wrong
+// one costs them an `optin` while un-silencing the right one breaks a
+// promise.
 //
 // Returns FAIL if signature_id is not found, or if the source dossier
 // would be left with zero signatures.

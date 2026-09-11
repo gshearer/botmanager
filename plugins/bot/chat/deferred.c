@@ -780,6 +780,37 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
     return;
   }
 
+  // A chore's row was written before its subject opted out, or it would
+  // not exist — the scans exclude them. Dropped rather than returned: a
+  // presence row put back would be re-claimed on their every next line.
+  // An unreadable refusal holds the row for a later tick instead, since
+  // a check that could not complete must not read as a yes.
+  {
+    const char *chore = chatbot_optout_chore_of_source(source);
+    bool        opted = false;
+
+    if(chore != NULL
+        && chatbot_optout_has(db_result_get_i64(res, i, DC_DOSSIER, 0),
+               chore, &opted) != SUCCESS)
+    {
+      bool back = deferred_unclaim(id, repeating);
+
+      clam(CLAM_WARN, DEFERRED_CTX,
+          "bot=%s deferred %" PRId64 " (%s) opt-out unreadable — %s",
+          bot_name, id, source,
+          back ? "returned to pending" : "occurrence skipped");
+      return;
+    }
+
+    if(opted)
+    {
+      clam(CLAM_INFO, DEFERRED_CTX,
+          "bot=%s deferred %" PRId64 " (%s) — its subject opted out of %s,"
+          " dropped unspoken", bot_name, id, source, chore);
+      return;
+    }
+  }
+
   if(deferred_row_to_msg(res, i, &msg, now) == NULL)
   {
     // Claim-then-fail must un-claim: with the method gone (unbound,

@@ -141,6 +141,15 @@ dossier_ensure_tables(void)
       "CREATE INDEX IF NOT EXISTS idx_dossier_facts_lastseen"
       " ON dossier_facts(last_seen)");
 
+  // The primary key is also the index every chore's guard probes.
+  dossier_run_ddl(
+      "CREATE TABLE IF NOT EXISTS dossier_optout ("
+      " dossier_id  BIGINT       NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,"
+      " chore       VARCHAR(32)  NOT NULL,"
+      " created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
+      " PRIMARY KEY (dossier_id, chore)"
+      ")");
+
   // conversation_log.dossier_id was created by memory_register_config()
   // without a FK because the dossier table did not yet exist. Now that
   // dossier is in place, attach the FK (idempotent).
@@ -521,10 +530,10 @@ dossier_txn_step(db_txn_t *txn, const char *sql, const char *what)
 }
 
 // Absorb a single source dossier into the survivor: reassign signatures
-// and facts that don't collide, let colliding rows fall through ON
-// DELETE CASCADE when the source row is removed, and unify the counters
-// on the survivor. Four statements that are one change — the caller's
-// transaction is what makes them so.
+// and facts that don't collide, union the opt-outs, let colliding rows
+// fall through ON DELETE CASCADE when the source row is removed, and
+// unify the counters on the survivor. Five statements that are one
+// change — the caller's transaction is what makes them so.
 static bool
 dossier_merge_one(db_txn_t *txn, dossier_id_t survivor, dossier_id_t source)
 {
@@ -562,6 +571,19 @@ dossier_merge_one(db_txn_t *txn, dossier_id_t survivor, dossier_id_t source)
       (int64_t)survivor, (int64_t)source, (int64_t)survivor);
 
   if(dossier_txn_step(txn, sql, "merge facts") != SUCCESS)
+    return(FAIL);
+
+  // A refusal made under either name is the one person's. Unioned, not
+  // reassigned: the survivor may already hold the same row, and the
+  // absorbed copy cascades away with its dossier below.
+  snprintf(sql, sizeof(sql),
+      "INSERT INTO dossier_optout (dossier_id, chore, created_at)"
+      " SELECT %" PRId64 ", chore, created_at FROM dossier_optout"
+      " WHERE dossier_id = %" PRId64
+      " ON CONFLICT (dossier_id, chore) DO NOTHING",
+      (int64_t)survivor, (int64_t)source);
+
+  if(dossier_txn_step(txn, sql, "merge optout") != SUCCESS)
     return(FAIL);
 
   // Unify counters on the survivor using LEAST/GREATEST.
@@ -853,6 +875,19 @@ dossier_split_signature(int64_t signature_id, dossier_id_t *out_new_id)
   db_result_free(res);
 
   if(!ok)
+  {
+    db_txn_rollback(txn);
+    return(FAIL);
+  }
+
+  // Both halves keep any refusal (dossier.h says why it is copied).
+  snprintf(sql, sizeof(sql),
+      "INSERT INTO dossier_optout (dossier_id, chore, created_at)"
+      " SELECT %" PRId64 ", chore, created_at FROM dossier_optout"
+      " WHERE dossier_id = %" PRId64,
+      (int64_t)new_id, (int64_t)src_pid);
+
+  if(dossier_txn_step(txn, sql, "split optout") != SUCCESS)
   {
     db_txn_rollback(txn);
     return(FAIL);
