@@ -42,6 +42,13 @@ note_init(void)
     return(FAIL);
   }
 
+  if(note_show_register() != SUCCESS)
+  {
+    clam(CLAM_WARN, NOTE_CTX, "show note registration failed");
+    note_commands_unregister();
+    return(FAIL);
+  }
+
   clam(CLAM_INFO, NOTE_CTX, "note plugin initialized");
   return(SUCCESS);
 }
@@ -66,6 +73,7 @@ static void
 note_deinit(void)
 {
   note_deliver_stop();
+  note_show_unregister();
   note_commands_unregister();
   clam(CLAM_INFO, NOTE_CTX, "note plugin deinitialized");
 }

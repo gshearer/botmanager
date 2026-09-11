@@ -266,6 +266,42 @@ note_db_pending_count(uint32_t ns_id, const char *recipient)
 }
 
 // ------------------------------------------------------------------ //
+// Queue listing                                                       //
+// ------------------------------------------------------------------ //
+
+bool
+note_db_list(uint32_t ns_id, uint32_t limit, db_result_t *res)
+{
+  char table[NOTE_TABLE_SZ];
+  char sql[768];
+
+  if(res == NULL || limit == 0)
+    return(FAIL);
+
+  if(note_table_name(table, sizeof(table)) != SUCCESS)
+    return(FAIL);
+
+  // COUNT(*) OVER () is taken before the LIMIT, so one statement says
+  // both what is shown and how much was held back. It rides every row
+  // and is read off the first. The pending index covers the WHERE.
+  snprintf(sql, sizeof(sql),
+      "SELECT id, sender, recipient, method, channel,"
+      " EXTRACT(EPOCH FROM created_at)::BIGINT, body, COUNT(*) OVER ()"
+      " FROM %s WHERE ns_id = %" PRIu32 " AND delivered_at IS NULL"
+      " ORDER BY id ASC LIMIT %" PRIu32,
+      table, ns_id, limit);
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    clam(CLAM_WARN, NOTE_CTX, "note list failed: %s",
+        (res->error[0] != '\0') ? res->error : "(no driver error)");
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
 // Claim                                                               //
 // ------------------------------------------------------------------ //
 

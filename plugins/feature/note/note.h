@@ -23,6 +23,7 @@
 #include "clam.h"
 #include "cmd.h"
 #include "common.h"
+#include "db.h"
 #include "method.h"
 #include "plugin.h"
 #include "userns.h"
@@ -79,6 +80,24 @@ int64_t note_db_add(uint32_t ns_id, const char *sender,
 // Returns -1 on error.
 int note_db_pending_count(uint32_t ns_id, const char *recipient);
 
+// The oldest `limit` undelivered notes of one namespace, for `show note`.
+// Columns are the NOTE_LIST_COL_* below; the last carries the whole
+// queue's size before the LIMIT, identical on every row. FAIL on a
+// query error, with `res` still owned by the caller.
+enum
+{
+  NOTE_LIST_COL_ID,
+  NOTE_LIST_COL_SENDER,
+  NOTE_LIST_COL_RECIPIENT,
+  NOTE_LIST_COL_METHOD,
+  NOTE_LIST_COL_CHANNEL,
+  NOTE_LIST_COL_CREATED,
+  NOTE_LIST_COL_BODY,
+  NOTE_LIST_COL_TOTAL,
+};
+
+bool note_db_list(uint32_t ns_id, uint32_t limit, db_result_t *res);
+
 // Atomically claim up to `cap` of `recipient`'s undelivered notes —
 // the UPDATE ... RETURNING stamps delivered_at and hands back the rows
 // in one statement, so two bots witnessing the same line cannot announce
@@ -113,6 +132,16 @@ void note_deliver_stop(void);
 
 bool note_commands_register(void);
 void note_commands_unregister(void);
+
+// ---- Telemetry (note_show.c) --------------------------------------- //
+
+// Most rows `show note` draws. Past this the reply stops being a table
+// and becomes a flood on whatever method asked; the footer says how
+// many were held back.
+#define NOTE_SHOW_ROWS      25
+
+bool note_show_register(void);
+void note_show_unregister(void);
 
 #endif // NOTE_INTERNAL
 
