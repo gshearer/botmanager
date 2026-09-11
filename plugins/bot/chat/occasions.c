@@ -261,8 +261,10 @@ chatbot_occasions_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
     occasions_compose_wish(wish, sizeof(wish), label);
 
     if(chatbot_deferred_insert(bot_name, ns_id, dossier, &msg, method_name,
-        "occasion", DEFERRED_KIND_SAY, wish, NULL, 0, true,
-        OCCASIONS_WISH_TTL_SECS) != SUCCESS)
+        "occasion", DEFERRED_KIND_SAY, wish, NULL,
+        &(deferred_moment_t){ .on_presence  = true,
+                              .expires_secs = OCCASIONS_WISH_TTL_SECS })
+        != SUCCESS)
     {
       // The claim is spent and the row is not written, so this birthday
       // is missed for the year. Loud, because it is the one outcome

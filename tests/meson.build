@@ -113,6 +113,18 @@ test_cooldown = executable('test_cooldown',
   link_with : [test_harness],
 )
 
+# The grammar /remind and /in read a moment with. A phrase read wrong
+# stores a reminder for the wrong time and says nothing until it fires,
+# so it is silent wrongness by construction; when.c is libc-only, so
+# the one file compiles here directly.
+test_when = executable('test_when',
+  'test_when.c',
+  '../plugins/bot/chat/when.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/bot/chat')],
+  link_with : [test_harness],
+)
+
 # The chat plugin's drain for the async records core cannot see. A
 # shutdown that returns early is silent until a reload lands on a
 # running callback months later, which is exactly the silent-wrongness
@@ -593,6 +605,7 @@ test('clam', test_clam)
 test('shorturl_token', test_shorturl_token)
 test('db_txn', test_db_txn)
 test('cooldown', test_cooldown)
+test('when', test_when)
 test('hold', test_hold)
 test('baseprompt', test_baseprompt)
 test('warm_chain', test_warm_chain)

@@ -27,6 +27,13 @@
 // project the same columns and share one deliver, so say/run, expiry
 // and the method-gone un-claim behave identically whichever moment
 // arrived. CARE-5/6 are the first writers of presence rows.
+//
+// What a person may ask for is when.h's grammar — a delay, a clock
+// time, a repeat, or "back". A clock time is a rule until Postgres
+// turns it into an instant (chat_deferred_next below), because the
+// zone database is there and a thread-safe per-zone conversion is not
+// in POSIX. A repeating row stays one row: the claim moves its due_at
+// on instead of writing a successor.
 
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
@@ -35,6 +42,7 @@
 #include "colors.h"
 #include "db.h"
 #include "util.h"
+#include "when.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -51,9 +59,9 @@
 // One claim batch per tick per bot; a backlog drains at this rate.
 #define DEFERRED_CLAIM_MAX      5
 
-// Recurrence floor. Nothing in this chunk writes a repeating row —
-// CARE-5/6/7 will — so this is the guard that keeps a hand-seeded row
-// from turning the tick into a spin loop.
+// Recurrence floor for an interval repeat: "every 30s" would make the
+// persona a metronome, and a hand-seeded row below it would turn the
+// tick into a spin loop. A weekly rule has no floor to need.
 #define DEFERRED_REPEAT_MIN     300
 
 // The word that buys a presence row instead of a timed one, and how
@@ -81,14 +89,47 @@ enum
 {
   DC_ID = 0, DC_DOSSIER, DC_SOURCE, DC_KIND, DC_SENDER, DC_NICKNAME,
   DC_USERNAME, DC_HOSTNAME, DC_VERIFIED_ID, DC_METADATA, DC_METHOD_NAME,
-  DC_CHANNEL, DC_BODY, DC_CMD_NAME, DC_REPEAT, DC_CREATED, DC_EXPIRED,
+  DC_CHANNEL, DC_BODY, DC_CMD_NAME, DC_REPEAT, DC_REPEAT_DAYS,
+  DC_REPEAT_MINUTE, DC_TZ, DC_CREATED, DC_EXPIRED,
 };
 
 #define DEFERRED_CLAIM_COLS \
     "id, dossier_id, source, kind, sender, nickname, username, hostname," \
     " verified_id, metadata, method_name, channel, body, cmd_name," \
-    " repeat_secs, EXTRACT(EPOCH FROM created_at)::BIGINT AS created_epoch," \
+    " repeat_secs, repeat_days, repeat_minute, tz," \
+    " EXTRACT(EPOCH FROM created_at)::BIGINT AS created_epoch," \
     " (expires_at IS NOT NULL AND expires_at < NOW()) AS expired"
+
+// Is this row a repeat, as SQL. One spelling, because the claim reads
+// it twice and the floor must be the same number both times.
+#define DEFERRED_STR_(x)        #x
+#define DEFERRED_STR(x)         DEFERRED_STR_(x)
+#define DEFERRED_REPEATING_SQL \
+    "(repeat_days <> 0 OR repeat_secs >= " DEFERRED_STR(DEFERRED_REPEAT_MIN) ")"
+
+// The next instant a weekly rule names: the first `p_minute` past local
+// midnight in `p_tz`, on a `p_days` weekday (bit n = DOW n), between
+// `p_lo` and `p_hi` days from today there, and strictly after now. NULL
+// when no day in the window qualifies — which for a one-shot "today at
+// 9am" asked at noon is the answer "that has passed". Daylight saving
+// is Postgres's: 3 PM on the east coast is 19:00 UTC in September and
+// 20:00 in November, and nothing here has to know.
+//
+// ⚠ An unknown zone RAISES rather than returning NULL. Schedule time
+// resolves every rule through this function before storing it, so a
+// stored zone was valid once; if tzdata ever drops one, every claim
+// for that bot fails until the row is cancelled.
+#define DEFERRED_NEXT_FN_DDL \
+    "CREATE OR REPLACE FUNCTION chat_deferred_next(p_tz TEXT," \
+    " p_minute INTEGER, p_days INTEGER, p_lo INTEGER, p_hi INTEGER)" \
+    " RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS $fn$" \
+    " SELECT MIN(c.t) FROM (" \
+    "  SELECT ((NOW() AT TIME ZONE p_tz)::date + o" \
+    "          + make_interval(mins => p_minute)) AT TIME ZONE p_tz AS t," \
+    "         (NOW() AT TIME ZONE p_tz)::date + o AS d" \
+    "    FROM generate_series(p_lo, p_hi) AS o) c" \
+    " WHERE c.t > NOW() AND (p_days >> EXTRACT(DOW FROM c.d)::int) & 1 = 1" \
+    " $fn$"
 
 // ---------- schema ----------
 
@@ -120,6 +161,11 @@ chatbot_deferred_ensure_schema(void)
       " body         TEXT         NOT NULL,"
       " cmd_name     VARCHAR(32)  NOT NULL DEFAULT '',"
       " repeat_secs  INTEGER      NOT NULL DEFAULT 0,"
+      " repeat_days  SMALLINT     NOT NULL DEFAULT 0"
+      "   CHECK (repeat_days BETWEEN 0 AND 127),"
+      " repeat_minute SMALLINT    NOT NULL DEFAULT 0"
+      "   CHECK (repeat_minute BETWEEN 0 AND 1439),"
+      " tz           VARCHAR(64)  NOT NULL DEFAULT '',"
       " deliver_on_presence BOOLEAN NOT NULL DEFAULT FALSE,"
       " due_at       TIMESTAMPTZ  NOT NULL,"
       " expires_at   TIMESTAMPTZ,"
@@ -145,6 +191,22 @@ chatbot_deferred_ensure_schema(void)
       " DROP CONSTRAINT IF EXISTS chat_deferred_bot_name_fkey,"
       " ADD CONSTRAINT chat_deferred_bot_name_fkey FOREIGN KEY (bot_name)"
       " REFERENCES bot_instances(name) ON DELETE CASCADE", res);
+
+  // The weekly rule (when.h). Additive, so a table that predates it
+  // takes the columns with their defaults and every old row reads as
+  // not repeating — which is what every old row was.
+  (void)db_query(
+      "ALTER TABLE chat_deferred"
+      " ADD COLUMN IF NOT EXISTS repeat_days SMALLINT NOT NULL DEFAULT 0"
+      "   CHECK (repeat_days BETWEEN 0 AND 127),"
+      " ADD COLUMN IF NOT EXISTS repeat_minute SMALLINT NOT NULL DEFAULT 0"
+      "   CHECK (repeat_minute BETWEEN 0 AND 1439),"
+      " ADD COLUMN IF NOT EXISTS tz VARCHAR(64) NOT NULL DEFAULT ''", res);
+
+  if(db_query(DEFERRED_NEXT_FN_DDL, res) != SUCCESS || !res->ok)
+    clam(CLAM_WARN, DEFERRED_CTX,
+        "chat_deferred_next install failed — clock-time reminders will"
+        " refuse: %s", res->error[0] != '\0' ? res->error : "(no driver error)");
 
   // The claim's predicate leads with (ns_id, bot_name), so the index
   // must. The old (ns_id, due_at) name is dropped rather than left
@@ -285,14 +347,14 @@ bool
 chatbot_deferred_insert(const char *bot_name, uint32_t ns_id, int64_t dossier,
     const method_msg_t *msg, const char *method_name, const char *source,
     deferred_kind_t kind, const char *body, const char *cmd_name,
-    uint64_t secs, bool on_presence, uint64_t expires_secs)
+    const deferred_moment_t *when)
 {
   // Escaped in one array so the all-or-nothing guard and the release
   // are each one loop; E_COUNT keeps the two from drifting apart.
   enum
   {
     E_SENDER = 0, E_NICK, E_USER, E_HOST, E_VID, E_META, E_METH,
-    E_CHAN, E_BODY, E_CMD, E_BOT, E_COUNT,
+    E_CHAN, E_BODY, E_CMD, E_BOT, E_TZ, E_COUNT,
   };
   char *e[E_COUNT];
   bool  ok    = FAIL;
@@ -309,6 +371,7 @@ chatbot_deferred_insert(const char *bot_name, uint32_t ns_id, int64_t dossier,
   e[E_BODY]   = db_escape(body);
   e[E_CMD]    = db_escape(cmd_name != NULL ? cmd_name : "");
   e[E_BOT]    = db_escape(bot_name);
+  e[E_TZ]     = db_escape(when->tz != NULL ? when->tz : "");
 
   for(size_t i = 0; i < E_COUNT; i++)
     if(e[i] == NULL)
@@ -318,6 +381,7 @@ chatbot_deferred_insert(const char *bot_name, uint32_t ns_id, int64_t dossier,
   {
     char dossier_cell[32];
     char expires_cell[64];
+    char due_cell[64];
     char sql[4096];
 
     if(dossier > 0)
@@ -331,29 +395,40 @@ chatbot_deferred_insert(const char *bot_name, uint32_t ns_id, int64_t dossier,
     // who never comes back would otherwise hold a slot against their
     // own pending cap forever, and the tick's expiry sweep dropping it
     // unspoken is the honest end for work whose moment never arrived.
-    if(expires_secs > 0)
+    if(when->expires_secs > 0)
       snprintf(expires_cell, sizeof(expires_cell),
           "NOW() + %llu * INTERVAL '1 second'",
-          (unsigned long long)expires_secs);
+          (unsigned long long)when->expires_secs);
 
-    else if(on_presence)
+    else if(when->on_presence)
       snprintf(expires_cell, sizeof(expires_cell), "NOW() + INTERVAL '30 days'");
 
     else
       snprintf(expires_cell, sizeof(expires_cell), "NULL");
 
+    if(when->due_epoch > 0)
+      snprintf(due_cell, sizeof(due_cell), "to_timestamp(%" PRId64 ")",
+          when->due_epoch);
+
+    else
+      snprintf(due_cell, sizeof(due_cell),
+          "NOW() + %llu * INTERVAL '1 second'",
+          (unsigned long long)when->delay_secs);
+
     snprintf(sql, sizeof(sql),
         "INSERT INTO chat_deferred"
         " (ns_id, bot_name, dossier_id, source, kind, sender, nickname,"
         "  username, hostname, verified_id, metadata, method_name, channel,"
-        "  body, cmd_name, deliver_on_presence, due_at, expires_at)"
+        "  body, cmd_name, repeat_secs, repeat_days, repeat_minute, tz,"
+        "  deliver_on_presence, due_at, expires_at)"
         " VALUES (%" PRIu32 ", '%s', %s, '%s', %d, '%s', '%s', '%s', '%s',"
-        " '%s', '%s', '%s', '%s', '%s', '%s', %s,"
-        " NOW() + %llu * INTERVAL '1 second', %s)",
+        " '%s', '%s', '%s', '%s', '%s', '%s', %" PRIu32 ", %u, %u, '%s',"
+        " %s, %s, %s)",
         ns_id, e[E_BOT], dossier_cell, source, (int)kind, e[E_SENDER],
         e[E_NICK], e[E_USER], e[E_HOST], e[E_VID], e[E_META], e[E_METH],
-        e[E_CHAN], e[E_BODY], e[E_CMD], on_presence ? "TRUE" : "FALSE",
-        (unsigned long long)secs, expires_cell);
+        e[E_CHAN], e[E_BODY], e[E_CMD], when->repeat_secs,
+        (unsigned)when->repeat_days, (unsigned)when->repeat_minute, e[E_TZ],
+        when->on_presence ? "TRUE" : "FALSE", due_cell, expires_cell);
 
     ok = db_exec(sql, DEFERRED_CTX);
   }
@@ -400,24 +475,61 @@ deferred_row_to_msg(const db_result_t *res, uint32_t i, method_msg_t *msg,
 
 // Put a claimed row back to pending so a later moment can deliver it.
 //
-// ⚠ Never call this for a REPEATING row. The claim statement already
-// wrote its successor, so un-claiming re-offers this occurrence on the
-// very next tick and writes another successor, and another — one child
-// per tick for as long as the condition lasts (measured 2026-08-11:
-// three ticks, three rows). A recurrence is by definition re-offered,
-// so for one the honest outcome is to skip the occurrence and let the
-// successor stand. Returns whether the row was actually returned.
+// A REPEATING row is never claimed in the first place — the claim moved
+// its due_at on and left it pending — so there is nothing to return,
+// and the honest outcome is that this occurrence is skipped and the
+// next one stands. (Until the in-place advance, the claim wrote a
+// successor row instead, and un-claiming a repeat wrote a new one every
+// tick — measured 2026-08-11, three ticks, three rows.) Returns whether
+// the row was actually returned.
 static bool
-deferred_unclaim(int64_t id, int64_t repeat_secs)
+deferred_unclaim(int64_t id, bool repeating)
 {
   char sql[128];
 
-  if(repeat_secs >= DEFERRED_REPEAT_MIN)
+  if(repeating)
     return(false);
 
   snprintf(sql, sizeof(sql),
       "UPDATE chat_deferred SET delivered_at = NULL WHERE id = %" PRId64, id);
   (void)db_exec(sql, DEFERRED_CTX);
+  return(true);
+}
+
+// A row's repeat in words ("every Monday at 3:00 PM"), read from the
+// four rule columns starting at `col` — repeat_secs, repeat_days,
+// repeat_minute, tz, in that order in every projection that carries
+// them. Returns whether the row repeats; `rule` is empty when not.
+static bool
+deferred_row_rule(const db_result_t *res, uint32_t i, uint32_t col,
+    char *rule, size_t cap)
+{
+  int64_t secs = db_result_get_i64(res, i, col, 0);
+  int64_t days = db_result_get_i64(res, i, col + 1, 0);
+  char    tz[WHEN_TZ_SZ];
+  char    local_tz[WHEN_TZ_SZ];
+  when_t  w;
+
+  rule[0] = '\0';
+
+  if(days == 0 && secs < DEFERRED_REPEAT_MIN)
+    return(false);
+
+  db_result_copy(tz, sizeof(tz), res, i, col + 3);
+
+  if(when_local_zone(local_tz, sizeof(local_tz)) != SUCCESS)
+    local_tz[0] = '\0';
+
+  if(when_repeat_restore(secs > 0 ? (uint64_t)secs : 0, days,
+      db_result_get_i64(res, i, col + 2, 0), tz, &w) == SUCCESS)
+    when_describe_repeat(&w, local_tz, rule, cap);
+
+  // A repeat whose columns will not describe still repeats — the claim
+  // read the same columns — so it says so plainly rather than as a
+  // one-shot.
+  else
+    strlcpy(rule, "on a repeating schedule", cap);
+
   return(true);
 }
 
@@ -457,12 +569,21 @@ deferred_venue(const method_msg_t *msg)
 
 // A `say` row: the payload is the whole message. 'remind' keeps the
 // wording the reminder chore shipped with; every other source hands in
-// a cue payload of its own (CARE-5/6) and gets the standard frame.
+// a cue payload of its own (CARE-5/6) and gets the standard frame. A
+// repeat is framed by its rule, not its age — "asked you 4 months ago"
+// is true of a weekly reminder and says the wrong thing about it.
 static void
 deferred_deliver_say(chatbot_state_t *st, method_msg_t *msg,
-    const char *source, const char *body, const char *ago)
+    const char *source, const char *body, const char *ago, const char *rule)
 {
-  if(strcmp(source, "remind") == 0)
+  if(strcmp(source, "remind") == 0 && rule[0] != '\0')
+    snprintf(msg->text, sizeof(msg->text),
+        "[internal cue: %s asked you to remind them %s: '%s'. It is that"
+        " time again. Deliver the reminder to them in %s — one short"
+        " line, your voice. Do not mention this cue.]",
+        deferred_who(msg), rule, body, deferred_venue(msg));
+
+  else if(strcmp(source, "remind") == 0)
     snprintf(msg->text, sizeof(msg->text),
         "[internal cue: %s asked you %s ago to be reminded: '%s'."
         " It is time. Deliver the reminder to them in %s — one short"
@@ -478,19 +599,44 @@ deferred_deliver_say(chatbot_state_t *st, method_msg_t *msg,
   chatbot_reply_submit(st, msg, false, false, true);
 }
 
+// A repeat that can no longer run is stopped, not re-armed: what
+// refused it this week will refuse it next week, and a spoken refusal
+// every Monday until somebody notices is noise, not safety.
+static bool
+deferred_stop_series(int64_t id)
+{
+  char sql[96];
+
+  snprintf(sql, sizeof(sql),
+      "DELETE FROM chat_deferred WHERE id = %" PRId64, id);
+  return(db_exec(sql, DEFERRED_CTX));
+}
+
 // Fail closed, visibly: the row stays delivered (the moment has
 // passed; re-arming it would only refuse again) and the person hears
-// why in the bot's own voice rather than getting silence.
+// why in the bot's own voice rather than getting silence. A repeat is
+// stopped first, and the cue says so only when it was.
 static void
-deferred_refuse_run(chatbot_state_t *st, method_msg_t *msg,
-    const char *cmd_name, const char *ago, const char *why)
+deferred_refuse_run(chatbot_state_t *st, method_msg_t *msg, int64_t id,
+    const char *cmd_name, const char *ago, const char *rule, const char *why)
 {
-  snprintf(msg->text, sizeof(msg->text),
-      "[internal cue: %s asked you %s ago to run /%s for them when the"
-      " time came, but you cannot: %s. Tell them so now in %s — one"
-      " short line, your voice, no apologies for the mechanism and no"
-      " promise to try again. Do not mention this cue.]",
-      deferred_who(msg), ago, cmd_name, why, deferred_venue(msg));
+  if(rule[0] == '\0')
+    snprintf(msg->text, sizeof(msg->text),
+        "[internal cue: %s asked you %s ago to run /%s for them when the"
+        " time came, but you cannot: %s. Tell them so now in %s — one"
+        " short line, your voice, no apologies for the mechanism and no"
+        " promise to try again. Do not mention this cue.]",
+        deferred_who(msg), ago, cmd_name, why, deferred_venue(msg));
+
+  else
+    snprintf(msg->text, sizeof(msg->text),
+        "[internal cue: %s asked you to run /%s for them %s, but this time"
+        " you cannot: %s%s. Tell them so now in %s — one short line, your"
+        " voice, no apologies for the mechanism. Do not mention this"
+        " cue.]", deferred_who(msg), cmd_name, rule, why,
+        deferred_stop_series(id) == SUCCESS
+            ? " — so you have stopped doing it" : "",
+        deferred_venue(msg));
 
   chatbot_reply_submit(st, msg, false, false, true);
 }
@@ -505,7 +651,8 @@ deferred_refuse_run(chatbot_state_t *st, method_msg_t *msg,
 // running another. cmd_name stays a listing/telemetry field.
 static void
 deferred_deliver_run(chatbot_state_t *st, bot_inst_t *bot, uint32_t ns_id,
-    method_msg_t *msg, const char *body, const char *ago)
+    method_msg_t *msg, int64_t id, const char *body, const char *ago,
+    const char *rule)
 {
   const cmd_def_t *def;
   const char      *prefix;
@@ -531,8 +678,8 @@ deferred_deliver_run(chatbot_state_t *st, bot_inst_t *bot, uint32_t ns_id,
 
   if(def == NULL)
   {
-    deferred_refuse_run(st, msg, verb[0] != '\0' ? verb : "?", ago,
-        "that command no longer exists");
+    deferred_refuse_run(st, msg, id, verb[0] != '\0' ? verb : "?", ago,
+        rule, "that command no longer exists");
     return;
   }
 
@@ -544,8 +691,8 @@ deferred_deliver_run(chatbot_state_t *st, bot_inst_t *bot, uint32_t ns_id,
     clam(CLAM_INFO, DEFERRED_CTX,
         "bot=%s deferred /%s for %s denied at fire time",
         bot_inst_name(bot), verb, msg->sender);
-    deferred_refuse_run(st, msg, verb,
-        ago, "they are no longer allowed to run it");
+    deferred_refuse_run(st, msg, id, verb, ago, rule,
+        "they are no longer allowed to run it");
     return;
   }
 
@@ -554,10 +701,16 @@ deferred_deliver_run(chatbot_state_t *st, bot_inst_t *bot, uint32_t ns_id,
   if(prefix == NULL || prefix[0] == '\0')
     prefix = "/";
 
-  snprintf(premise, sizeof(premise),
-      "%s asked you %s ago to run /%s%s%s when the time came, and you"
-      " just did.", deferred_who(msg), ago, verb,
-      args[0] != '\0' ? " " : "", args);
+  if(rule[0] != '\0')
+    snprintf(premise, sizeof(premise),
+        "%s asked you to run /%s%s%s %s, and you just did.",
+        deferred_who(msg), verb, args[0] != '\0' ? " " : "", args, rule);
+
+  else
+    snprintf(premise, sizeof(premise),
+        "%s asked you %s ago to run /%s%s%s when the time came, and you"
+        " just did.", deferred_who(msg), ago, verb,
+        args[0] != '\0' ? " " : "", args);
 
   // Capture first: the sink id must ride the message the dispatch
   // sees. Slot exhaustion returns 0 and the command's own output goes
@@ -608,11 +761,14 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
   int64_t      kind    = db_result_get_i64(res, i, DC_KIND, DEFERRED_KIND_SAY);
   time_t       created = (time_t)db_result_get_i64(res, i, DC_CREATED, now);
   const char  *expired = db_result_get(res, i, DC_EXPIRED);
+  bool         repeating;
   char         source[24];
   char         body[CMD_ARG_SZ];
   char         ago[UTIL_DURATION_SZ];
+  char         rule[160] = "";
 
   db_result_copy(source, sizeof(source), res, i, DC_SOURCE);
+  repeating = deferred_row_rule(res, i, DC_REPEAT, rule, sizeof(rule));
 
   // Expiry is claim-and-drop: a wish two days stale or a watch whose
   // window closed is worse spoken late than never spoken at all.
@@ -630,11 +786,11 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
     // mid-reload) the row goes back to pending, so a re-bound method
     // delivers LATE rather than never. Leaving it claimed would eat
     // the work silently — the one outcome worse than lateness.
-    bool back = deferred_unclaim(id, db_result_get_i64(res, i, DC_REPEAT, 0));
+    bool back = deferred_unclaim(id, repeating);
 
     clam(CLAM_WARN, DEFERRED_CTX,
         "bot=%s deferred %" PRId64 " method gone — %s", bot_name, id,
-        back ? "unclaimed" : "occurrence skipped (successor stands)");
+        back ? "unclaimed" : "occurrence skipped (the next one stands)");
     return;
   }
 
@@ -669,21 +825,21 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
       db_result_get_i64(res, i, DC_DOSSIER, 0),
       deferred_source_class(source), false))
   {
-    bool back = deferred_unclaim(id, db_result_get_i64(res, i, DC_REPEAT, 0));
+    bool back = deferred_unclaim(id, repeating);
 
     clam(CLAM_INFO, DEFERRED_CTX,
         "bot=%s deferred %" PRId64 " (%s) held by the voice governor — %s",
         bot_name, id, source,
-        back ? "returned to pending" : "occurrence skipped (successor stands)");
+        back ? "returned to pending" : "occurrence skipped (the next one stands)");
     method_release(msg.inst);
     return;
   }
 
   if(kind == DEFERRED_KIND_RUN)
-    deferred_deliver_run(st, bot, ns_id, &msg, body, ago);
+    deferred_deliver_run(st, bot, ns_id, &msg, id, body, ago, rule);
 
   else
-    deferred_deliver_say(st, &msg, source, body, ago);
+    deferred_deliver_say(st, &msg, source, body, ago, rule);
 
   method_release(msg.inst);
 }
@@ -714,35 +870,38 @@ chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
   // statement that blocked on the row lock would re-check a predicate
   // that cannot exclude a row already claimed and RETURNING would hand
   // it out twice — the lock is skipped instead, and one bot's own
-  // overlapping ticks lose cleanly. The recurrence insert rides the
-  // same statement, so a daemon that dies mid-tick never
-  // double-schedules: the claim IS the write barrier.
+  // overlapping ticks lose cleanly.
+  //
+  // A repeat is claimed by moving its due_at on and leaving it pending,
+  // in this same statement, so a daemon that dies mid-tick delivers the
+  // occurrence late or not at all but never schedules it twice — the
+  // claim IS the write barrier. The next moment is computed from the
+  // rule, never from NOW() + interval: a weekly rule asks
+  // chat_deferred_next, and an interval steps from the due time by
+  // whole periods, so a late tick neither drifts the series nor
+  // delivers every period it slept through. An expired repeat is
+  // claimed like a one-shot, which ends it.
   snprintf(sql, sizeof(sql),
       "WITH claimed AS ("
-      "UPDATE chat_deferred SET delivered_at = NOW() WHERE id IN ("
+      "UPDATE chat_deferred SET"
+      " delivered_at = CASE WHEN " DEFERRED_REPEATING_SQL
+      "   AND NOT (expires_at IS NOT NULL AND expires_at < NOW())"
+      "   THEN NULL ELSE NOW() END,"
+      " due_at = CASE"
+      "   WHEN NOT " DEFERRED_REPEATING_SQL
+      "     OR (expires_at IS NOT NULL AND expires_at < NOW()) THEN due_at"
+      "   WHEN repeat_days <> 0"
+      "     THEN chat_deferred_next(tz, repeat_minute, repeat_days, 0, 7)"
+      "   ELSE due_at + (FLOOR(EXTRACT(EPOCH FROM NOW() - due_at)"
+      "     / repeat_secs) + 1) * repeat_secs * INTERVAL '1 second' END"
+      " WHERE id IN ("
       "SELECT id FROM chat_deferred WHERE ns_id = %" PRIu32 " AND %s"
       " AND delivered_at IS NULL AND deliver_on_presence = FALSE"
       " AND due_at <= NOW()"
       " ORDER BY due_at ASC LIMIT %d FOR UPDATE SKIP LOCKED)"
-      " RETURNING " DEFERRED_CLAIM_COLS ","
-      // Carried past the projection the deliver path reads so the
-      // recurrence INSERT below can copy the row whole. dossier_id is
-      // not repeated here — the claim columns already carry it, and a
-      // duplicate name would make the SELECT below ambiguous.
-      " ns_id, bot_name, deliver_on_presence, expires_at),"
-      " renewed AS ("
-      "INSERT INTO chat_deferred"
-      " (ns_id, bot_name, dossier_id, source, kind, sender, nickname,"
-      "  username, hostname, verified_id, metadata, method_name, channel,"
-      "  body, cmd_name, repeat_secs, deliver_on_presence, due_at,"
-      "  expires_at)"
-      " SELECT ns_id, bot_name, dossier_id, source, kind, sender, nickname,"
-      "  username, hostname, verified_id, metadata, method_name, channel,"
-      "  body, cmd_name, repeat_secs, deliver_on_presence,"
-      "  NOW() + repeat_secs * INTERVAL '1 second', expires_at"
-      " FROM claimed WHERE repeat_secs >= %d AND NOT expired)"
+      " RETURNING " DEFERRED_CLAIM_COLS ")"
       " SELECT * FROM claimed ORDER BY id ASC",
-      ns_id, bot_pred, DEFERRED_CLAIM_MAX, DEFERRED_REPEAT_MIN);
+      ns_id, bot_pred, DEFERRED_CLAIM_MAX);
 
   res = db_result_alloc();
 
@@ -905,57 +1064,167 @@ chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
 // ---------- schedule time: the shared preamble ----------
 
 // Everything both verbs need and neither may skip. Each refusal is its
-// own reply — a user who mistyped a duration should never have to
-// guess which of five gates it was.
+// own reply — a user who mistyped a moment should never have to guess
+// which of six gates it was. `moment.tz` points into `when`, so the
+// struct is used whole or not at all.
 typedef struct
 {
-  chatbot_state_t *st;
-  userns_t        *ns;
-  const char      *method_name;
-  char             bot_pred[DEFERRED_BOT_PRED_SZ];
-  char             owner_pred[768];
-  uint64_t         secs;
-  bool             on_presence;
+  chatbot_state_t   *st;
+  userns_t          *ns;
+  const char        *method_name;
+  const char        *rest;          // what follows the moment
+  char               bot_pred[DEFERRED_BOT_PRED_SZ];
+  char               owner_pred[768];
+  char               local_tz[WHEN_TZ_SZ];
+  when_t             when;
+  deferred_moment_t  moment;
 } deferred_ask_t;
 
+// The first instant a clock rule names, asked of the same function the
+// claim will ask for every instant after it — so the acknowledgement
+// and the delivery can never disagree. `lo`..`hi` is the window of days
+// from today it may land in: the one-shot's own, or the whole week a
+// repeat's first occurrence can be anywhere in. FAIL has already
+// replied.
 static bool
-deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
-    deferred_ask_t *a)
+deferred_resolve_clock(const cmd_ctx_t *ctx, const when_t *w, uint8_t lo_day,
+    uint8_t hi_day, int64_t *epoch)
 {
-  uint32_t cap;
-  int64_t  pending;
+  db_result_t *res;
+  const char  *cell;
+  char         minute[8];
+  char         days[8];
+  char         lo[8];
+  char         hi[8];
+  const char  *params[5] = { w->tz, minute, days, lo, hi };
+  bool         ok        = FAIL;
+
+  snprintf(minute, sizeof(minute), "%u", (unsigned)w->minute);
+  snprintf(days,   sizeof(days),   "%u", (unsigned)w->days);
+  snprintf(lo,     sizeof(lo),     "%u", (unsigned)lo_day);
+  snprintf(hi,     sizeof(hi),     "%u", (unsigned)hi_day);
+
+  res = db_result_alloc();
+
+  if(db_query_params("SELECT EXTRACT(EPOCH FROM chat_deferred_next($1,"
+      " $2::int, $3::int, $4::int, $5::int))::BIGINT", params, 5, res)
+      != SUCCESS || !res->ok)
+  {
+    char msg[128];
+
+    // The one failure a person can cause here: a zone-shaped word
+    // Postgres has never heard of ("America/Cincinati").
+    if(strstr(res->error, "time zone") != NULL)
+      snprintf(msg, sizeof(msg), "I don't know the timezone '%s'", w->tz);
+
+    else
+    {
+      clam(CLAM_WARN, DEFERRED_CTX, "clock resolve failed: %s",
+          res->error[0] != '\0' ? res->error : "(no driver error)");
+      snprintf(msg, sizeof(msg), "I couldn't work out when that is —"
+          " try again shortly");
+    }
+
+    cmd_reply(ctx, msg);
+  }
+
+  // NULL is the function's "no such moment in the window", and only a
+  // one-shot "today at ..." has a window that can close.
+  else if(res->rows == 0 || (cell = db_result_get(res, 0, 0)) == NULL
+      || cell[0] == '\0')
+    cmd_reply(ctx, "that time has already passed today");
+
+  else
+  {
+    *epoch = (int64_t)strtoll(cell, NULL, 10);
+    ok     = SUCCESS;
+  }
+
+  db_result_free(res);
+  return(ok);
+}
+
+// The parsed moment against the spine's policy, then into the row's
+// terms. FAIL has already replied.
+static bool
+deferred_ask_moment(const cmd_ctx_t *ctx, deferred_ask_t *a)
+{
+  deferred_moment_t *m = &a->moment;
+  const when_t      *w = &a->when;
+
+  switch(w->kind)
+  {
+    case WHEN_DELAY:
+      if(w->secs > DEFERRED_MAX_SECS)
+      {
+        cmd_reply(ctx, "that's too far out — keep it under 30 days");
+        return(FAIL);
+      }
+
+      m->delay_secs = w->secs;
+      return(SUCCESS);
+
+    // "back" is a moment, not a length — the one place the two kinds of
+    // moment meet a user. The floor it resolves to is when the row
+    // starts WATCHING, not when it speaks.
+    case WHEN_BACK:
+      m->on_presence = true;
+      m->delay_secs  = (uint64_t)kv_get_bot_uint(bot_inst_name(ctx->bot),
+          "behavior.soul.deferred.back_quiet_secs");
+
+      if(m->delay_secs == 0)
+        m->delay_secs = DEFERRED_BACK_QUIET_DEFAULT;
+
+      return(SUCCESS);
+
+    case WHEN_EVERY:
+      if(w->secs < DEFERRED_REPEAT_MIN)
+      {
+        cmd_reply(ctx, "that's too often — every 5 minutes at the most");
+        return(FAIL);
+      }
+
+      if(w->secs > DEFERRED_MAX_SECS)
+      {
+        cmd_reply(ctx, "keep a repeat under 30 days apart");
+        return(FAIL);
+      }
+
+      m->delay_secs  = w->secs;
+      m->repeat_secs = (uint32_t)w->secs;
+      return(SUCCESS);
+
+    case WHEN_CLOCK:
+      return(deferred_resolve_clock(ctx, w, w->lo, w->hi, &m->due_epoch));
+
+    case WHEN_WEEKLY:
+      m->repeat_days   = w->days;
+      m->repeat_minute = w->minute;
+      m->tz            = w->tz;
+      return(deferred_resolve_clock(ctx, w, 0, 7, &m->due_epoch));
+  }
+
+  return(FAIL);
+}
+
+static bool
+deferred_ask_open(const cmd_ctx_t *ctx, const char *text, deferred_ask_t *a)
+{
+  const char *why = NULL;
+  uint32_t    cap;
+  int64_t     pending;
 
   memset(a, 0, sizeof(*a));
 
-  // "back" is a moment, not a length — the one place the two kinds of
-  // moment meet a user. It rides the duration slot rather than a flag
-  // or a child verb so that both verbs get it, and so `in list`, `in
-  // cancel` and the pending cap need to know nothing new. The floor it
-  // resolves to is when the row starts WATCHING, not when it speaks.
-  a->on_presence = (strcasecmp(duration, DEFERRED_BACK_WORD) == 0);
+  // A clock time means the daemon's clock unless the person names
+  // another zone. Not knowing our own is not fatal here: only a clock
+  // form needs it, and when_parse refuses exactly those.
+  if(when_local_zone(a->local_tz, sizeof(a->local_tz)) != SUCCESS)
+    a->local_tz[0] = '\0';
 
-  if(a->on_presence)
+  if(when_parse(text, a->local_tz, &a->when, &a->rest, &why) != SUCCESS)
   {
-    a->secs = (uint64_t)kv_get_bot_uint(bot_inst_name(ctx->bot),
-        "behavior.soul.deferred.back_quiet_secs");
-
-    if(a->secs == 0)
-      a->secs = DEFERRED_BACK_QUIET_DEFAULT;
-  }
-
-  else
-    a->secs = chatbot_parse_duration_secs(duration);
-
-  if(a->secs == 0)
-  {
-    cmd_reply(ctx, "bad duration (use e.g. 30s, 5m, 2h, 1d — or 'back'"
-        " to wait until you're next around)");
-    return(FAIL);
-  }
-
-  if(a->secs > DEFERRED_MAX_SECS)
-  {
-    cmd_reply(ctx, "that's too far out — keep it under 30 days");
+    cmd_reply(ctx, why);
     return(FAIL);
   }
 
@@ -1000,7 +1269,7 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
 
   // The cap is a per-bot knob and the refusal says "pending with me",
   // so the count is this bot's rows: what another bot owes you is
-  // between you and it.
+  // between you and it. A repeat holds its slot until it is cancelled.
   pending = deferred_pending_for(a->ns->id, a->bot_pred, a->owner_pred);
 
   if(pending < 0)
@@ -1021,47 +1290,105 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
     return(FAIL);
   }
 
-  return(SUCCESS);
+  // Last, because a clock form costs a DB round-trip to resolve.
+  return(deferred_ask_moment(ctx, a));
+}
+
+// The moment the way an acknowledgement says it: "in 15m", "on Mon Sep
+// 14 at 3:00 PM EDT", "every Monday at 3:00 PM (next: Mon Sep 14 at
+// 3:00 PM EDT)", "every 2h", "when you're back". An instant is rendered on the
+// daemon's own clock whatever zone its rule is kept in, so a person who
+// named another zone sees both and can check the conversion.
+static void
+deferred_fmt_moment(const deferred_ask_t *a, char *dst, size_t cap)
+{
+  char      span[UTIL_DURATION_SZ];
+  char      rule[160];
+  char      at[64] = "";
+  time_t    t      = (time_t)a->moment.due_epoch;
+  struct tm tm;
+
+  if(a->when.kind == WHEN_BACK)
+  {
+    snprintf(dst, cap, "when you're back");
+    return;
+  }
+
+  if(a->when.kind == WHEN_DELAY)
+  {
+    util_fmt_duration((time_t)a->when.secs, span, sizeof(span));
+    snprintf(dst, cap, "in %s", span);
+    return;
+  }
+
+  when_describe_repeat(&a->when, a->local_tz, rule, sizeof(rule));
+
+  if(a->when.kind == WHEN_EVERY)
+  {
+    snprintf(dst, cap, "%s", rule);
+    return;
+  }
+
+  if(localtime_r(&t, &tm) != NULL)
+  {
+    char day[16];
+    char zone[16];
+    char clock[16];
+
+    strftime(day,  sizeof(day),  "%a %b", &tm);
+    strftime(zone, sizeof(zone), "%Z",    &tm);
+    when_fmt_minute((uint16_t)(tm.tm_hour * 60 + tm.tm_min), clock,
+        sizeof(clock));
+    snprintf(at, sizeof(at), "%s %d at %s %s", day, tm.tm_mday, clock, zone);
+  }
+
+  if(a->when.kind == WHEN_CLOCK)
+    snprintf(dst, cap, "on %s", at);
+
+  else
+    snprintf(dst, cap, "%s (next: %s)", rule, at);
 }
 
 // ---------- /remind ----------
 
+// One argument, for the reason ad_in gives.
 static const cmd_arg_desc_t ad_remind[] = {
-  { "duration", CMD_ARG_NONE, CMD_ARG_REQUIRED, 32, NULL },
-  { "message",  CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
+  { "when-and-message", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0,
+    NULL },
 };
 
 static void
 cmd_remind(const cmd_ctx_t *ctx)
 {
   deferred_ask_t a;
-  char           ack[96];
+  char           when[256];
+  char           ack[320];
 
   if(deferred_ask_open(ctx, ctx->parsed->argv[0], &a) != SUCCESS)
     return;
 
+  if(a.rest[0] == '\0')
+  {
+    cmd_reply(ctx, "remind you of what? e.g. 'remind 20m flip the steaks'");
+    return;
+  }
+
   if(chatbot_deferred_insert(bot_inst_name(ctx->bot), a.ns->id,
       chatbot_resolve_dossier(a.st, ctx->msg),
       ctx->msg, a.method_name, "remind", DEFERRED_KIND_SAY,
-      ctx->parsed->argv[1], NULL, a.secs, a.on_presence, 0) != SUCCESS)
+      a.rest, NULL, &a.moment) != SUCCESS)
   {
     cmd_reply(ctx, "failed to store the reminder");
     return;
   }
 
+  deferred_fmt_moment(&a, when, sizeof(when));
+
   clam(CLAM_INFO, DEFERRED_CTX,
-      "bot=%s reminder set by %s for %s in '%s' (%llu s%s)",
-      bot_inst_name(ctx->bot), ctx->msg->sender, ctx->parsed->argv[0],
-      ctx->msg->channel, (unsigned long long)a.secs,
-      a.on_presence ? ", on presence" : "");
+      "bot=%s reminder set by %s in '%s': %s",
+      bot_inst_name(ctx->bot), ctx->msg->sender, ctx->msg->channel, when);
 
-  if(a.on_presence)
-    snprintf(ack, sizeof(ack), "noted — I'll remind you when you're back.");
-
-  else
-    snprintf(ack, sizeof(ack), "noted — I'll remind you in %s.",
-        ctx->parsed->argv[0]);
-
+  snprintf(ack, sizeof(ack), "noted — I'll remind you %s.", when);
   cmd_reply(ctx, ack);
 }
 
@@ -1102,13 +1429,14 @@ cmd_in(const cmd_ctx_t *ctx)
   const char      *args;
   char             verb[CMD_NAME_SZ];
   char             body[CMD_ARG_SZ];
-  char             ack[384];
+  char             when[256];
+  char             ack[640];
   size_t           i = 0;
 
   if(deferred_ask_open(ctx, ctx->parsed->argv[0], &a) != SUCCESS)
     return;
 
-  wrapped = deferred_strip_prefix(ctx->bot, ctx->parsed->argv[1]);
+  wrapped = deferred_strip_prefix(ctx->bot, a.rest);
 
   while(wrapped[i] != '\0' && wrapped[i] != ' ' && wrapped[i] != '\t'
       && i < sizeof(verb) - 1)
@@ -1189,26 +1517,20 @@ cmd_in(const cmd_ctx_t *ctx)
   if(chatbot_deferred_insert(bot_inst_name(ctx->bot), a.ns->id,
       chatbot_resolve_dossier(a.st, ctx->msg),
       ctx->msg, a.method_name, "in", DEFERRED_KIND_RUN, body, verb,
-      a.secs, a.on_presence, 0) != SUCCESS)
+      &a.moment) != SUCCESS)
   {
     cmd_reply(ctx, "failed to store it");
     return;
   }
 
+  deferred_fmt_moment(&a, when, sizeof(when));
+
   clam(CLAM_INFO, DEFERRED_CTX,
-      "bot=%s deferred '%s' set by %s for %s in '%s' (%llu s%s)",
-      bot_inst_name(ctx->bot), body, ctx->msg->sender,
-      ctx->parsed->argv[0], ctx->msg->channel,
-      (unsigned long long)a.secs, a.on_presence ? ", on presence" : "");
+      "bot=%s deferred '%s' set by %s in '%s': %s",
+      bot_inst_name(ctx->bot), body, ctx->msg->sender, ctx->msg->channel,
+      when);
 
-  if(a.on_presence)
-    snprintf(ack, sizeof(ack), "alright — I'll run %s when you're back.",
-        body);
-
-  else
-    snprintf(ack, sizeof(ack), "alright — I'll run %s in %s.",
-        body, ctx->parsed->argv[0]);
-
+  snprintf(ack, sizeof(ack), "alright — I'll run %s %s.", body, when);
   cmd_reply(ctx, ack);
 }
 
@@ -1221,7 +1543,7 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
 {
   // Wide enough for every field below at its own declared limit, so no
   // listed row is ever clipped.
-  char line[640];
+  char line[896];
 
   for(uint32_t i = 0; i < res->rows; i++)
   {
@@ -1231,11 +1553,11 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
     char        src  [24];
     char        venue[METHOD_CHANNEL_SZ];
     char        body [192];
+    char        rule [160];
     const char *pres = db_result_get(res, i, 7);
     int64_t     secs = db_result_get_i64(res, i, 4, 0);
     bool        back = (pres != NULL && (pres[0] == 't' || pres[0] == 'T'));
-
-    char        when [48];
+    char        when [224];
 
     util_fmt_duration(secs > 0 ? (time_t)secs : 0, due, sizeof(due));
 
@@ -1246,6 +1568,9 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
     // renders the same string about somebody else.
     if(back)
       snprintf(when, sizeof(when), "when back%s", secs > 0 ? " (arming)" : "");
+
+    else if(deferred_row_rule(res, i, 8, rule, sizeof(rule)))
+      snprintf(when, sizeof(when), "%s, next in %s", rule, due);
 
     else if(secs > 0)
       snprintf(when, sizeof(when), "in %s", due);
@@ -1277,12 +1602,14 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
   }
 }
 
-// Columns 0..7 are what deferred_render reads; every listing query
-// below produces exactly this shape.
+// Columns 0..11 are what deferred_render reads, the rule four from 8
+// in deferred_row_rule's order; every listing query below produces
+// exactly this shape.
 #define DEFERRED_LIST_COLS \
     "id, source, kind, body," \
     " GREATEST(0, EXTRACT(EPOCH FROM (due_at - NOW()))::BIGINT)," \
-    " channel, COALESCE(NULLIF(nickname,''), sender), deliver_on_presence"
+    " channel, COALESCE(NULLIF(nickname,''), sender), deliver_on_presence," \
+    " repeat_secs, repeat_days, repeat_minute, tz"
 
 static void
 cmd_in_list(const cmd_ctx_t *ctx)
@@ -1494,20 +1821,28 @@ cmd_show_deferred(const cmd_ctx_t *ctx)
 
 // ---------- registration ----------
 
+// One argument, not two: a moment is several words now ("every monday
+// at 3pm EST"), and only when_parse knows where it ends.
 static const cmd_arg_desc_t ad_in[] = {
-  { "duration", CMD_ARG_NONE, CMD_ARG_REQUIRED, 32, NULL },
-  { "command",  CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
+  { "when-and-command", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0,
+    NULL },
 };
 
 static const cmd_nl_slot_t in_slots[] = {
-  { .name  = "duration",
-    .type  = CMD_NL_ARG_DURATION,
+  { .name  = "when",
+    .type  = CMD_NL_ARG_FREE,
     .flags = CMD_NL_SLOT_REQUIRED },
   { .name  = "command",
     .type  = CMD_NL_ARG_FREE,
     .flags = CMD_NL_SLOT_REQUIRED | CMD_NL_SLOT_REMAINDER },
 };
 
+// ⚠ No repeat example here, on purpose, measured 2026-09-11 in fresh
+// channels: with "every weekday at 8am give me the weather" in this
+// list, 2 of 4 repeating REMINDERS routed to /in and refused, because
+// the model read "every <day> at <time>" as /in's shape. Without it,
+// 10 of 10 went to /remind, and repeating ACTIONS still reach /in off
+// its .syntax. /remind carries the repeat example; /in points at it.
 static const cmd_nl_example_t in_examples[] = {
   { .utterance  = "in an hour turn off the outside lights",
     .invocation = "/in 1h lights off outside" },
@@ -1530,9 +1865,10 @@ static const cmd_nl_t in_nl = {
   .when          = "Someone asks you to DO something later — run a"
                    " command, check something, or act at a future time"
                    " (not merely be reminded).",
-  .syntax        = "/in <duration|back> <command and its arguments>"
-                   " — 'back' means when they are next seen speaking,"
-                   " instead of after a length of time",
+  .syntax        = "/in <when> <command and its arguments> — <when> as"
+                   " for /remind: 20m, at 7am, tomorrow at 9am, every"
+                   " weekday at 8am, or 'back' (when they are next seen"
+                   " speaking)",
   .slots         = in_slots,
   .slot_count    = (uint8_t)(sizeof(in_slots) / sizeof(in_slots[0])),
   .examples      = in_examples,
@@ -1541,8 +1877,8 @@ static const cmd_nl_t in_nl = {
 };
 
 static const cmd_nl_slot_t remind_slots[] = {
-  { .name  = "duration",
-    .type  = CMD_NL_ARG_DURATION,
+  { .name  = "when",
+    .type  = CMD_NL_ARG_FREE,
     .flags = CMD_NL_SLOT_REQUIRED },
   { .name  = "message",
     .type  = CMD_NL_ARG_FREE,
@@ -1556,6 +1892,10 @@ static const cmd_nl_example_t remind_examples[] = {
     .invocation = "/remind 2h the laundry" },
   { .utterance  = "remind me when I'm back to look at the pull request",
     .invocation = "/remind back look at the pull request" },
+  { .utterance  = "remind me every monday at 3pm EST to water the plants",
+    .invocation = "/remind every monday at 3pm EST water the plants" },
+  { .utterance  = "remind me tomorrow at 9am to call the dentist",
+    .invocation = "/remind tomorrow at 9am call the dentist" },
 };
 
 static const cmd_nl_t remind_nl = {
@@ -1563,9 +1903,11 @@ static const cmd_nl_t remind_nl = {
   // above the sibling field.
   .when          = "Someone asks to be reminded of something after a"
                    " delay, or asks you to poke them later.",
-  .syntax        = "/remind <duration|back> <message>"
-                   " — 'back' means when they are next seen speaking,"
-                   " instead of after a length of time",
+  .syntax        = "/remind <when> <message> — <when> is a delay (20m,"
+                   " 2h), a clock time (at 3pm, tomorrow at 9am), a repeat"
+                   " (every 2h, every weekday at 8am, every mon,thu at"
+                   " 7pm), or 'back' (when they are next seen speaking)."
+                   " Add a zone only if they named one (3pm EST)",
   .slots         = remind_slots,
   .slot_count    = (uint8_t)(sizeof(remind_slots) / sizeof(remind_slots[0])),
   .examples      = remind_examples,
@@ -1577,22 +1919,32 @@ static const cmd_nl_t remind_nl = {
 static const cmd_decl_t remind_decl = {
   .module      = "chat",
   .name        = "remind",
-  .usage       = "remind <duration|back> <message>",
+  .usage       = "remind <when> <message>",
   .description = "Set a reminder the bot delivers when it comes due",
   .help_long   =
       "Stores a reminder and delivers it in the bot's own voice once\n"
       "due (checked every behavior.soul.interval_secs, default 60 s).\n"
-      "Durations read like 30s, 5m, 2h or 1d, up to 30 days. Set in a\n"
-      "channel it is delivered there; set in a DM it comes back as a\n"
-      "DM. Sugar over the same deferred spine /in uses, so 'in list'\n"
-      "and 'in cancel' see reminders too. Survives restarts and\n"
-      "reloads.\n"
+      "<when> is one of:\n"
+      "  a delay       20m, 2h, 1h30m, 1d, 15 minutes - up to 30 days\n"
+      "  a clock time  at 3pm, tomorrow at 9am, friday 15:00, at noon\n"
+      "  a repeat      every 2h, every day at 8am, every weekday at\n"
+      "                8:30, every mon,thu at 7pm, daily at noon\n"
+      "  back          when you are next around (below)\n"
+      "A clock time is the bot's own local time unless you name a zone\n"
+      "right after it - 3pm EST, 9am PT, 15:00 UTC, 8am America/Chicago\n"
+      "- and a named zone keeps its own daylight rules. The reply says\n"
+      "when that is on the bot's clock. A repeat lasts until 'in cancel\n"
+      "<id>' and holds one of your behavior.soul.deferred.max_pending\n"
+      "slots while it does.\n"
       "\n"
-      "Say 'back' instead of a duration to be reminded when you are\n"
-      "next around rather than at a set time. Since you are here when\n"
-      "you ask, it waits out a quiet period first\n"
-      "(behavior.soul.deferred.back_quiet_secs, default 30 min) and\n"
-      "then delivers on the next thing you say.",
+      "Set in a channel it is delivered there; set in a DM it comes\n"
+      "back as a DM. Sugar over the same deferred spine /in uses, so\n"
+      "'in list' and 'in cancel' see reminders too. Survives restarts\n"
+      "and reloads.\n"
+      "\n"
+      "'back' waits out a quiet period first, since you are here when\n"
+      "you ask (behavior.soul.deferred.back_quiet_secs, default 30\n"
+      "min), then delivers on the next thing you say.",
   .group       = USERNS_GROUP_EVERYONE,
   .scope       = CMD_SCOPE_ANY,
   .methods     = METHOD_T_ANY,
@@ -1605,7 +1957,7 @@ static const cmd_decl_t remind_decl = {
 static const cmd_decl_t in_decl = {
   .module      = "chat",
   .name        = "in",
-  .usage       = "in <duration|back> <command> [args]",
+  .usage       = "in <when> <command> [args]",
   .description = "Run a command later, as you, and report back in voice",
   .help_long   =
       "Schedules any conversational command to run after a delay, in\n"
@@ -1616,15 +1968,16 @@ static const cmd_decl_t in_decl = {
       "channel or DM you asked from.\n"
       "\n"
       "Only commands the bot can reach conversationally qualify, and\n"
-      "only top-level ones. Durations read like 30s, 5m, 2h or 1d, up\n"
-      "to 30 days. 'in list' shows what you have pending; 'in cancel\n"
-      "<id>' drops one.\n"
+      "only top-level ones. <when> takes every form /remind does -\n"
+      "'help -v remind' lists them - so 'in every weekday at 8am\n"
+      "weather 45069' is a morning forecast until you cancel it. A\n"
+      "repeat you are no longer allowed to run is stopped, and you are\n"
+      "told. 'in list' shows what you have pending; 'in cancel <id>'\n"
+      "drops one.\n"
       "\n"
-      "Say 'back' instead of a duration — 'in back weather 45069' —\n"
-      "to have it run when you are next around rather than at a set\n"
-      "time. Since you are here when you ask, it waits out a quiet\n"
-      "period first (behavior.soul.deferred.back_quiet_secs, default\n"
-      "30 min) and then runs on the next thing you say.",
+      "'in back weather 45069' runs it when you are next around rather\n"
+      "than at a set time, after the same quiet period /remind waits\n"
+      "out (behavior.soul.deferred.back_quiet_secs, default 30 min).",
   .group       = USERNS_GROUP_EVERYONE,
   .scope       = CMD_SCOPE_ANY,
   .methods     = METHOD_T_ANY,

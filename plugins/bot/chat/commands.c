@@ -3,36 +3,11 @@
 
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
+#include "when.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-
-// Parse a short duration string: "30s", "5m", "2h", "1d", or a bare
-// number interpreted as seconds. Returns 0 on parse failure. Shared
-// with /remind (soul.c), hence not static.
-uint64_t
-chatbot_parse_duration_secs(const char *s)
-{
-  char              *endp;
-  unsigned long long n;
-
-  if(s == NULL || s[0] == '\0') return(0);
-
-  endp = NULL;
-  n = strtoull(s, &endp, 10);
-
-  if(endp == s) return(0);
-
-  // Skip whitespace between number and unit.
-  while(*endp == ' ' || *endp == '\t') endp++;
-
-  if(*endp == '\0' || *endp == 's' || *endp == 'S') return((uint64_t)n);
-  if(*endp == 'm' || *endp == 'M')                  return((uint64_t)n * 60ULL);
-  if(*endp == 'h' || *endp == 'H')                  return((uint64_t)n * 3600ULL);
-  if(*endp == 'd' || *endp == 'D')                  return((uint64_t)n * 86400ULL);
-  return(0);
-}
 
 // D9 (CHAT-MUTE-1) — the shared mute gate. The writer (/hush below)
 // and this reader live in the same TU so the mute domain has one home.
@@ -74,7 +49,7 @@ static const cmd_arg_desc_t ad_bot_hush[] = {
 static void
 cmd_bot_hush(const cmd_ctx_t *ctx)
 {
-  uint64_t secs = chatbot_parse_duration_secs(ctx->parsed->argv[0]);
+  uint64_t secs = when_parse_duration(ctx->parsed->argv[0]);
   char buf[128];
   uint64_t until;
   const char *botname;

@@ -717,11 +717,6 @@ bool chatbot_dossiersweep_cmd_register(void);
 // Called from chatbot plugin init. Implemented in show_verbs.c.
 bool chatbot_show_verbs_register(void);
 
-// Parse a short duration string: "30s", "5m", "2h", "1d", or a bare
-// number interpreted as seconds. Returns 0 on parse failure. Shared by
-// /bot <n> hush and /remind.
-uint64_t chatbot_parse_duration_secs(const char *s);
-
 // The one reading of "hushed" for every path that can speak — the
 // reply speak path, the volunteer cascade and the soul tick (D9).
 // True while bot.<name>.behavior.mute_until is in the future; a lapsed
@@ -1433,10 +1428,11 @@ typedef enum
 // dossier_register_config (the dossier FK target must exist).
 void chatbot_deferred_ensure_schema(void);
 
-// The one insert every writer goes through — both user verbs and every
-// chore. `secs` is a DELAY, not an instant: `due_at` is computed
-// DB-side so the daemon's clock and the DB's never argue. On a
-// presence row that delay is how long the row stays disarmed before it
+// When a row comes due, and whether it comes back. Every instant here
+// is the DB's, never the daemon's clock: `delay_secs` becomes `NOW() +
+// delay` in the INSERT, and `due_epoch` is only ever an instant a
+// SELECT just resolved (the clock forms — chat_deferred_next). On a
+// presence row the delay is how long it stays disarmed before it
 // starts watching, never when it speaks.
 //
 // `expires_secs` 0 takes the default policy — 30 days for a presence
@@ -1444,6 +1440,27 @@ void chatbot_deferred_ensure_schema(void);
 // and no expiry at all for a timed one. A chore whose work has a real
 // deadline (a birthday wish is worse two days late than never) passes
 // its own.
+//
+// A repeating row is one row for its whole life: the claim moves its
+// `due_at` on in place, so the id `in list` shows is the id `in cancel`
+// takes. `repeat_days` != 0 repeats on those weekdays (bit n = Postgres
+// DOW n) at `repeat_minute` past midnight in `tz`; otherwise
+// `repeat_secs` repeats on an interval anchored to the due time, not
+// to the late tick that happened to claim it.
+typedef struct
+{
+  uint64_t    delay_secs;
+  int64_t     due_epoch;        // > 0 overrides delay_secs
+  bool        on_presence;
+  uint64_t    expires_secs;
+  uint32_t    repeat_secs;
+  uint8_t     repeat_days;
+  uint16_t    repeat_minute;
+  const char *tz;               // NULL unless repeat_days is set
+} deferred_moment_t;
+
+// The one insert every writer goes through — both user verbs and every
+// chore.
 //
 // ⚠ `msg` supplies the identity tuple the row stores, and it rides
 // whole: a chore composing one synthetically must fill it from a
@@ -1460,7 +1477,7 @@ bool chatbot_deferred_insert(const char *bot_name, uint32_t ns_id,
     int64_t dossier,
     const method_msg_t *msg, const char *method_name, const char *source,
     deferred_kind_t kind, const char *body, const char *cmd_name,
-    uint64_t secs, bool on_presence, uint64_t expires_secs);
+    const deferred_moment_t *when);
 
 // Claim and deliver every row that has come due for this namespace,
 // say and run alike. Called from the soul tick's `deferred` chore, on
