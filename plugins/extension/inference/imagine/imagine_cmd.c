@@ -675,11 +675,12 @@ imagine_done(const llm_image_response_t *resp)
 
   {
     // The URL alone can outrun a status line, so it gets a buffer sized
-    // for the configured base rather than the reply width.
+    // for the configured base rather than the reply width. The model is
+    // the registry name — the token -m takes, so the caller can ask again.
     char url[IMG_URL_LINE_SZ];
 
-    snprintf(url, sizeof(url), "[#%u %lds] %s/%s",
-        r->id, elapsed, r->public_base, filename);
+    snprintf(url, sizeof(url), "[#%u %s %lds] %s/%s",
+        r->id, r->model, elapsed, r->public_base, filename);
     imagine_reply(r, url);
   }
 

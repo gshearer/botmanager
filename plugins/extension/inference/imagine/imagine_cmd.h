@@ -44,7 +44,7 @@
 #define IMG_SIZE_SZ        32     // "1024x1024" and friends
 #define IMG_FILENAME_SZ    64     // "imagine-<uuid>.png"
 #define IMG_FULLPATH_SZ    (IMG_PATH_SZ + IMG_FILENAME_SZ + 2)  // dir + '/' + file
-#define IMG_URL_LINE_SZ    (IMG_FULLPATH_SZ + 32)  // "[#N Ms] " + public URL
+#define IMG_URL_LINE_SZ    (IMG_FULLPATH_SZ + IMG_MODEL_SZ + 32)  // "[#N model Ms] " + URL
 #define IMG_PREVIEW_CHARS  30     // prompt chars shown per queue row
 #define IMG_SHOW_MAX       24     // queue rows listed before "+N more"
 
