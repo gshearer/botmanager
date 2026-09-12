@@ -303,6 +303,19 @@ default — boot persistence is a deliberate operator choice.
 
 ### 3.1 whisper — STT on :8004
 
+⚠⚠ **Since 2026-09-07 this runs in the `inference` nspawn container
+(`10.68.100.56`), not on the botmanager host.** Install the unit there
+(`scp … doc@10.68.100.56:.config/systemd/user/`) and note it binds `0.0.0.0`,
+not loopback, because botman is on a different host. The master unit carries
+the detail. kokorod (3.2) did **not** move.
+
+⭑ **"The botmanager host" is `lab.dev.hiigara.shearer.tech`** — the dedicated
+development machine, a systemd-nspawn container with its own `/home/doc`.
+botman was in the `shell` LXC when the 09-07 notes were written and has since
+moved; anything in this tree still saying `shell` is stale. ⚠ A separate
+**production** instance on another host is planned and does not exist yet, so
+this document describes bringing up the development one.
+
 Distro package, not a source build ([[feedback-prefer-distro-packages]]):
 
 ```sh
@@ -324,7 +337,22 @@ recording still transcribed as "Amen." Gate at the ear, not here.
 
 ```sh
 # AUR: sherpa-onnx (was 1.13.4). Ships a working pkg-config, so meson finds it.
+pacman -S sherpa-onnx cargs           # BOTH — see below
 ```
+
+⚠⚠ **`cargs` is not optional, and nothing declares it.** sherpa-onnx's
+`sherpa-onnx.pc` puts `-lcargs` in `Libs:` unconditionally — its own comment
+says the flag is there only for one of their C examples — while the package
+does **not** list `cargs` in `Depends On`. `kokorod.c` never calls cargs, but
+pkg-config hands the flag to the linker anyway, so without the package the
+target fails at the *link* step with `cannot find /usr/lib/libcargs.so`.
+
+⭑ **What makes this expensive is that nothing downstream says so.** `ninja`
+leaves the stale object file and no binary; the unit then fails `203/EXEC` and
+`Restart=` loops on it forever, so the only symptom anyone sees is a silent
+robot. Bit us 2026-09-12 after the sherpa-onnx 1.13.7 upgrade — the restart
+counter had reached 3823. **Diagnose a mute robot at the unit first:**
+`systemctl --user status kokorod`, then `ninja -C build senses/kokorod/kokorod`.
 
 ⚠ **Fetch `kokoro-multi-lang-v1_0`, NOT `v1_1`.** v1.1 is the **Mandarin**
 model — its entire English voice set is `af_maple af_sol bf_vale`, and it has
@@ -368,7 +396,7 @@ These rows live in Postgres and survive restarts, so this is once-per-database,
 not once-per-boot.
 
 ```sh
-build/tools/botmanctl "llm add service senses-stt http://127.0.0.1:8004"
+build/tools/botmanctl "llm add service senses-stt http://10.68.100.56:8004"
 build/tools/botmanctl "llm add service senses-tts http://127.0.0.1:8003/v1"
 build/tools/botmanctl "llm add model stt whisper1 senses-stt whisper-large-v3-turbo"
 build/tools/botmanctl "llm add model tts kokoro1  senses-tts kokoro"
@@ -377,6 +405,14 @@ build/tools/botmanctl "show llm models"        # expect whisper1 (stt), kokoro1 
 
 ⚠ **`senses-stt` has NO `/v1`; `senses-tts` does.** whisper-server's route is
 `/inference` — `/v1/audio/transcriptions` 404s.
+
+⚠⚠ **The two also live on different hosts now, deliberately.** whisper is in
+the `inference` container (`10.68.100.56`); kokorod needs `sherpa-onnx`, which
+is in no repo a container can install from, so it runs beside botman on `lab`,
+reached over loopback. Do not "tidy" them onto one address.
+
+⭑ **To move either later, use `llm set service <name> url <base_url>`** — not
+del/add, which would take the bound model offline for the duration.
 
 ⚠ **Never run `llm service <n> refresh` against either.** Neither host serves
 `/models`, so the permanent "model_id not in this service's cached /models
@@ -474,7 +510,7 @@ re-test.
 
 ```sh
 curl -s http://reachy…:8090/health          # ear alive, floor_db set
-curl -s http://127.0.0.1:8004/inference -F file=@<a wav> -F response_format=json
+curl -s http://10.68.100.56:8004/inference -F file=@<a wav> -F response_format=json
 curl -s http://127.0.0.1:8003/health        # {"ok":true,"voices":53}
 build/tools/botmanctl "show bot mini robot"  # live DoA bearing
 build/tools/botmanctl -u doc "bot mini say the ear hears and the mouth answers"

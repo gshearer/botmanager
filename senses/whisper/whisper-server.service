@@ -1,16 +1,34 @@
 # whisper-server.service — speech-to-text for the reachy senses (RCH-2).
 #
-# Master copy. Install with:
-#   install -Dm644 senses/whisper/whisper-server.service \
-#       ~/.config/systemd/user/whisper-server.service
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now whisper-server
+# Master copy. Since 2026-09-07 this runs in the `inference` nspawn container,
+# NOT on the botmanager host — install it there:
+#   scp senses/whisper/whisper-server.service doc@10.68.100.56:.config/systemd/user/
+#   ssh doc@10.68.100.56 'systemctl --user daemon-reload
+#                         systemctl --user enable --now whisper-server'
 #
 # This is a systemd *user* unit: it runs as the operator, sees the operator's
 # CUDA environment, and needs no root. It serves the STT half of the voice
-# loop on 127.0.0.1:8004 — loopback only, because the only consumer is the
-# botman daemon on this same host (the robot never talks to it directly; the
-# ear bridge ships WAVs to botman and botman does the transcribing).
+# loop on 0.0.0.0:8004 — the consumer is the botman daemon, which lives on the
+# development host and reaches this across the network (the robot still never
+# talks to it directly; the ear bridge ships WAVs to botman and botman does
+# the transcribing).
+#
+# ⭑ That host is `lab.dev.hiigara.shearer.tech` — a dedicated development
+# machine, itself a systemd-nspawn container with its own /home/doc. botman was
+# in the `shell` LXC when the 09-07 split was written and is not any more; a
+# separate PRODUCTION instance on another host is planned but does not exist
+# yet. When it does, it needs its own answer for this address, because the
+# registry row below is per-database, not per-host.
+#
+# ⚠ 0.0.0.0, not loopback, and that IS a change of posture: the host firewall
+# does not filter container traffic (br_netfilter is not loaded — DocHat
+# DESIGN.md), so this port is reachable by anything on vlan100. Same posture as
+# every other service container, but worth knowing.
+#
+# ⭑ What points botman here is the registry row, not this file:
+# `llm set service senses-stt url http://10.68.100.56:8004` — no /v1, see the
+# --inference-path note below — and scripts/bm-restore.sh registers the same on
+# a rebuild. Moving this service again means editing both.
 #
 # The server is a distro package, not a source build — operator preference,
 # 2026-08-03. It moved from AUR to the official repos on 2026-08-22: the AUR
@@ -36,28 +54,30 @@
 #
 # Port map for the initiative: robot daemon 8000, earbridge 8090 (on the
 # robot), kokorod 8003, whisper-server 8004. The DGX Spark holds 8001/8002.
+# ⚠ Those last two no longer share a host: whisper moved to the `inference`
+# container (10.68.100.56) and kokorod did NOT, because it needs sherpa-onnx,
+# which is in no repo a container can install from. kokorod stays in `shell`
+# beside botman, on loopback. The split is deliberate, not drift.
 
 [Unit]
 Description=whisper.cpp STT server (reachy senses)
 Documentation=https://github.com/ggml-org/whisper.cpp
 After=default.target
 
-# ⚠⚠ HOST GATE (2026-08-30). /home/doc and /mnt/fast are both shared
-# out to the parent host and to the other LXC containers under
-# /mnt/fast/lxc, so this unit file AND the default.target.wants/ symlink
-# that enables it are visible on every one of them — as are the venvs,
-# binaries and model weights the unit refers to. Without this gate each
-# of those hosts started its own copy.
+# ⚠ NO HOST GATE, and its removal is deliberate (2026-09-07).
 #
-# The marker lives on the container rootfs, which is NOT either shared
-# mount, so it exists on this host and nowhere else. Deliberately a file
-# rather than ConditionHost=: a hostname is renameable, and a rename
-# would disable autostart silently with no error anywhere. Create it
-# when installing this unit:
-#     sudo touch /etc/botmanager-host
-# A failed condition makes systemd SKIP the unit quietly — Result is
-# success, not failed — so Restart= does not engage.
-ConditionPathExists=/etc/botmanager-host
+# This unit carried ConditionPathExists=/etc/botmanager-host from 2026-08-30,
+# because /home/doc and /mnt/fast are shared to the parent host and every LXC,
+# so this file AND the default.target.wants/ symlink enabling it were visible
+# on all of them and each started its own copy. nspawn gives this container its
+# OWN /home/doc, so the gate protects nothing here.
+#
+# ⚠⚠ It was worse than merely useless: the marker file got copied into the
+# container rootfs, so the gate PASSED in both places and two whisper servers
+# ran at once against one GPU. Marker deleted, condition dropped.
+#
+# ⛔ Do not "restore" this line. kokorod keeps its gate — it stays in an LXC
+# where the sharing is real.
 
 [Service]
 Type=simple
@@ -83,7 +103,7 @@ ExecStartPre=/usr/bin/test -r /mnt/fast/doc/projects/botmanager/senses/whisper/m
 # downstream. If real speech starts coming back blank, lower -nth first.
 ExecStart=/usr/bin/whisper-server \
     -m /mnt/fast/doc/projects/botmanager/senses/whisper/models/ggml-large-v3-turbo.bin \
-    --host 127.0.0.1 --port 8004 \
+    --host 0.0.0.0 --port 8004 \
     --suppress-nst -nth 0.8
 # ggml 0.21 loads its compute backends as separate .so files and does NOT
 # search /usr/lib/ggml on its own — without this the registry comes up with
