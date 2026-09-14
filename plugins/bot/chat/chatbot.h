@@ -1043,6 +1043,24 @@ bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
 #define CHATBOT_TAGGED_EMOTE_PREFIX        "<me "
 #define CHATBOT_TAGGED_EMOTE_PREFIX_LEN    4
 
+// The same borrow on ordinary speech — "<doc> ..." rather than "<me ..."
+// — where the bracket closes and a transcript row comes out in place of
+// a line. It is stripped rather than framed, and only when the name is
+// one THIS request put in front of the model; `borrowed_speaker_tag_len`
+// in reply.c owns that match. What is left behind can still be a
+// verbatim copy of the line it was lifted from, which
+// `room_echo_blocks_line` refuses separately: the tag and the copy are
+// two failures that happened to arrive together on 2026-09-14, and the
+// tag has also been sighted alone, wearing the bot's own sentence.
+//
+// The floor is on the NORMALIZED length (`anti_repeat_normalize`: lower
+// case, alphanumerics, single spaces), because that is the text the
+// compare runs on. It sits between the two things it has to separate:
+// saying a short line straight back IS the register here — "less clam"
+// normalizes to 9 bytes and is a decade-old channel call-and-response —
+// while the two copies sighted normalized to 23 and 46.
+#define CHATBOT_ROOM_ECHO_MIN_NORM         20
+
 // A model that reached all the way to the wire format wrote the CTCP
 // frame around the verb as well, so the verb is recognised delimited or
 // bare — the IRC driver is equally tolerant of the inbound direction.

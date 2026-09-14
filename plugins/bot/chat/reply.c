@@ -1268,6 +1268,72 @@ anti_repeat_blocks_line(const chatbot_req_t *r, const char *line)
   return(false);
 }
 
+// CV-13's sibling, and the reason it is a separate gate: the anti-repeat
+// slice holds the bot's own recent replies, so a line lifted out of the
+// ROOM passes it untouched at jaccard 0. That is how doc's own sentence
+// came back at him twice on 2026-09-14 — once as the whole of an answer
+// to "hh: what model are you driven by", with the answer sitting in the
+// request's own cue. borrowed_speaker_tag_len has already taken the
+// "<doc> " off by the time this runs; what is left is the copy.
+//
+// ⛔ No direct-address exemption, and that is the deliberate divergence
+// from CV13-DIRECT above. CV-13 forgives a repeat there because a person
+// who asks twice is owed the answer twice; here the directly-addressed
+// turn is exactly where the failure was worst, and parroting the
+// question's neighbour back is never the answer anybody was owed.
+//
+// Exact rather than fuzzy, and floored at CHATBOT_ROOM_ECHO_MIN_NORM,
+// because agreeing with somebody in their own words is ordinary speech
+// and a short line said straight back is this channel's register. The
+// constant carries both bounds.
+static bool
+room_echo_blocks_line(const chatbot_req_t *r, const char *line)
+{
+  char   want[CHATBOT_ANTI_REPEAT_NORM_SZ];
+  size_t wlen;
+
+  if(r == NULL || line == NULL)
+    return(false);
+
+  wlen = anti_repeat_normalize(line, want, sizeof(want));
+
+  if(wlen < CHATBOT_ROOM_ECHO_MIN_NORM)
+    return(false);
+
+  for(size_t i = 0; i < r->n_turns; i++)
+  {
+    char        said[CHATBOT_ANTI_REPEAT_NORM_SZ];
+    const char *text;
+    const char *close;
+
+    if(r->turns[i].is_own)
+      continue;
+
+    // Past the renderer's "<nick> " tag: the comparison is against what
+    // the person actually said, not against how the prompt showed it.
+    text  = r->turns[i].content;
+    close = strchr(text, '>');
+
+    if(close != NULL && close[1] == ' ')
+      text = close + 2;
+
+    anti_repeat_normalize(text, said, sizeof(said));
+
+    if(strcmp(want, said) != 0)
+      continue;
+
+    clam(CLAM_WARN, "chatbot",
+        "bot=%s persona=%s: room echo suppressed"
+        " (verbatim copy of turn %zu/%zu, line=\"%.80s\")",
+        bot_inst_name(r->st->inst), r->personality_name,
+        i, r->n_turns, line);
+
+    return(true);
+  }
+
+  return(false);
+}
+
 // Which of the three emote spellings the model used, if any. The rule
 // itself is documented at CHATBOT_EMOTE_PREFIX; what belongs here is
 // why it is a function: persona_reply.c puts a model's line on the wire
@@ -1305,6 +1371,64 @@ chatbot_emote_prefix_len(const char *line)
         CHATBOT_TAGGED_EMOTE_PREFIX_LEN) == 0
       && line[CHATBOT_TAGGED_EMOTE_PREFIX_LEN] != '\0')
     return(CHATBOT_TAGGED_EMOTE_PREFIX_LEN);
+
+  return(0);
+}
+
+// The other half of that borrow: the bracket closed, so what came out is
+// a transcript ROW rather than an action — "<doc> jesus qwen is awesome
+// at analyzing stock charts :)" reached #cabal on 2026-09-14 in answer to
+// a question whose answer was already in the request. Same cause as the
+// "<me " case above: req_load_history renders every turn the bot did not
+// speak as "<nick> text", so the tag is the only shape a completion has
+// ever seen in front of a line.
+//
+// The name must be one THIS request put in front of the model, which is
+// what keeps the rule off real speech: "<red>Doc, she passed." has no
+// space after the bracket, "<sarcasm> nice" names nobody in the room, and
+// "<me " never closes its bracket at all. Nothing here is a nick lookup —
+// the turns carry the renderer's own output, so the compare is against
+// the exact bytes it wrote. The sender is checked too, because the tail
+// trim lifts their line out of the history whenever a cue quotes it.
+//
+// Returns the length to skip, including the trailing space; 0 to leave
+// the line alone.
+static size_t
+borrowed_speaker_tag_len(const chatbot_req_t *r, const char *line)
+{
+  const char *close;
+  char        tag[METHOD_SENDER_SZ + 3];
+  size_t      taglen;
+  int         n;
+
+  if(r == NULL || line == NULL || line[0] != '<')
+    return(0);
+
+  close = strchr(line, '>');
+
+  // "<nick> " with something after it. A bare "<nick>", or a bracket
+  // that closes onto its own text, is not a row the renderer emits.
+  if(close == NULL || close[1] != ' ' || close[2] == '\0')
+    return(0);
+
+  taglen = (size_t)(close - line) + 2;
+
+  // taglen - 1 spans "<nick>" itself. A turn rendered for a different
+  // speaker cannot match it: the '>' lands inside their name.
+  for(size_t i = 0; i < r->n_turns; i++)
+  {
+    if(r->turns[i].is_own)
+      continue;
+
+    if(strncasecmp(r->turns[i].content, line, taglen - 1) == 0)
+      return(taglen);
+  }
+
+  n = snprintf(tag, sizeof(tag), "<%s>", r->sender);
+
+  if(n > 0 && (size_t)n == taglen - 1
+      && strncasecmp(tag, line, taglen - 1) == 0)
+    return(taglen);
 
   return(0);
 }
@@ -1441,8 +1565,32 @@ line_is_skip_sentinel(const char *line)
 static void
 send_reply_line(chatbot_req_t *r, const char *line)
 {
+  char   clean[METHOD_TEXT_SZ];
+  size_t tag;
 
   if(line == NULL || line[0] == '\0') return;
+
+  // Prompt leakage, ahead of every gate below — the mirror of why the
+  // colour translate runs after them. A gate has to match what the model
+  // MEANT to say, and a borrowed "<doc> " reads as content to all of
+  // them: the SKIP sentinel compare, the anti-repeat trigrams, the slash
+  // probe and the emote prefixes each see a line that starts with
+  // somebody else's name. Stripping first is also what lets the room-echo
+  // gate below see the copy underneath the tag.
+  tag = borrowed_speaker_tag_len(r, line);
+
+  if(tag != 0)
+  {
+    clam(CLAM_WARN, "chatbot",
+        "bot=%s persona=%s: stripped borrowed speaker tag \"%.*s\"",
+        bot_inst_name(r->st->inst), r->personality_name,
+        (int)tag, line);
+
+    strlcpy(clean, line + tag, sizeof(clean));
+    line = clean;
+
+    if(line[0] == '\0') return;
+  }
 
   // The budget, before every gate below. A line the cap refuses never
   // reached the wire, so it must not arm the floor, stamp the anti-repeat
@@ -1474,6 +1622,13 @@ send_reply_line(chatbot_req_t *r, const char *line)
   // suppressed repeat must not count toward the "this turn produced
   // real output" tally the CV-4 fallback consults.
   if(anti_repeat_blocks_line(r, line))
+    return;
+
+  // The room's words rather than our own. Same silent-return contract as
+  // CV-13 above: the helper logs its own WARN, and nonskip_lines_sent
+  // stays un-bumped so a suppressed echo cannot pass for real output to
+  // the CV-4 fallback.
+  if(room_echo_blocks_line(r, line))
     return;
 
   // CV-5 — "/me catches it", or the bare CTCP verb some models reach

@@ -222,7 +222,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 
 | Context | Source | Description |
 |---|---|---|
-| `chatbot` | plugins/bot/chat/chatbot.c · plugins/bot/chat/volunteer.c · plugins/bot/chat/baseprompt.c · plugins/bot/chat/personality.c | conversational observe/classify trace + volunteer-to-speak path + the base-prompt loader's refusals |
+| `chatbot` | plugins/bot/chat/chatbot.c · plugins/bot/chat/reply.c · plugins/bot/chat/volunteer.c · plugins/bot/chat/baseprompt.c · plugins/bot/chat/personality.c | conversational observe/classify trace + volunteer-to-speak path + the base-prompt loader's refusals + `send_reply_line`'s wire gates (line budget, SKIP, CV-13, borrowed speaker tag, room echo) |
 | `deauth` | plugins/bot/chat/dispatch.c | temp-MFA drop for the caller's hostmask |
 | `deferred` | plugins/bot/chat/deferred.c | the deferred spine — schedule, claim, delivery and fire-time permission refusals for `chat_deferred` (`DEFERRED_CTX`) |
 | `dossier` | plugins/bot/chat/dossier.c | dossier subsystem |
