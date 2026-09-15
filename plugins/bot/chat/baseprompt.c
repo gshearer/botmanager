@@ -32,7 +32,7 @@ static const struct
   { "context-guard",     NULL              },
   { "policy-reminder",   NULL              },
   { "situation",         NULL              },
-  { "direct-address",    NULL              },
+  { "direct-address",    "$SENDER"         },
   { "action-at-bot",     "$SENDER $EMOTE"  },
   { "commands",          "$CMDSHAPE"       },
   { "room-written",      NULL              },
