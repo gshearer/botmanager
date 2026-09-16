@@ -893,8 +893,14 @@ bool chatbot_label_is_zip(const char *label);
 // nl_bridge_off is true only for the interpret cue's second submit —
 // it suppresses the COMMANDS prompt block and the bridge itself so an
 // interpreted exchange cannot chain another command.
+// fallback is the plain line to speak if the turn produces nothing —
+// NULL or empty on a conversational submit, where silence is a valid
+// answer. Only a cue voicing an already-committed fact supplies one,
+// and only when it can vouch for the line as it stands: see
+// chatbot_req_t.fallback.
 void chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
-    bool was_addressed, bool is_direct_address, bool nl_bridge_off);
+    bool was_addressed, bool is_direct_address, bool nl_bridge_off,
+    const char *fallback);
 
 // Image-vision sibling of chatbot_reply_submit. Seeds the vision
 // fields (image_b64 ownership transfers in from the caller; mime is
@@ -1264,6 +1270,18 @@ typedef struct
   // the COMMANDS block is never rendered and reply_nl_bridge disarms:
   // one ask → one command → one reply, no chaining, no loops.
   bool            nl_bridge_off;
+
+  // The plain truth to speak if this turn yields no line at all — an
+  // empty completion, a transport failure, or output every gate
+  // suppressed. Only the internal-cue submitters set it, because only
+  // they speak for something the bot has ALREADY done: a command that
+  // ran, a reminder that came due. Empty on a conversational turn,
+  // where saying nothing is a legitimate answer and no committed fact
+  // is waiting on the model to find its voice.
+  // It reaches the wire through method_send rather than
+  // send_reply_line, for the reason CV-4's line does: this is our
+  // sentence, not the model's, and none of those gates is about us.
+  char            fallback[METHOD_TEXT_SZ];
 
   // Streaming coalescer: accumulate deltas, flush per-line via
   // method_send. done_cb sends any residual tail.

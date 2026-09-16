@@ -576,6 +576,18 @@ static void
 deferred_deliver_say(chatbot_state_t *st, method_msg_t *msg,
     const char *source, const char *body, const char *ago, const char *rule)
 {
+  char plain[METHOD_TEXT_SZ];
+
+  // Only a reminder has a plain form, and it is the reason this one is
+  // worth carrying: the body is the asker's own words, handed straight
+  // back. Every other source's payload is a sentence written FOR the
+  // model — reading one out unvoiced would be worse than the silence it
+  // replaces, so those keep it.
+  if(strcmp(source, "remind") == 0)
+    snprintf(plain, sizeof(plain), "%s: %s", deferred_who(msg), body);
+  else
+    plain[0] = '\0';
+
   if(strcmp(source, "remind") == 0 && rule[0] != '\0')
     snprintf(msg->text, sizeof(msg->text),
         "[internal cue: %s asked you to remind them %s: '%s'. It is that"
@@ -596,7 +608,7 @@ deferred_deliver_say(chatbot_state_t *st, method_msg_t *msg,
         " your voice. Do not mention this cue.]",
         body, deferred_who(msg), deferred_venue(msg));
 
-  chatbot_reply_submit(st, msg, false, false, true);
+  chatbot_reply_submit(st, msg, false, false, true, plain);
 }
 
 // A repeat that can no longer run is stopped, not re-armed: what
@@ -620,6 +632,15 @@ static void
 deferred_refuse_run(chatbot_state_t *st, method_msg_t *msg, int64_t id,
     const char *cmd_name, const char *ago, const char *rule, const char *why)
 {
+  char plain[METHOD_TEXT_SZ];
+
+  // "Visibly" is the whole point of this path, so it may not depend on
+  // the model finding words for it. Says nothing about the series: the
+  // cue's own clause is written from deferred_stop_series' return and
+  // calling that twice would delete twice.
+  snprintf(plain, sizeof(plain), "%s: I can't run /%s for you — %s.",
+      deferred_who(msg), cmd_name, why);
+
   if(rule[0] == '\0')
     snprintf(msg->text, sizeof(msg->text),
         "[internal cue: %s asked you %s ago to run /%s for them when the"
@@ -638,7 +659,7 @@ deferred_refuse_run(chatbot_state_t *st, method_msg_t *msg, int64_t id,
             ? " — so you have stopped doing it" : "",
         deferred_venue(msg));
 
-  chatbot_reply_submit(st, msg, false, false, true);
+  chatbot_reply_submit(st, msg, false, false, true, plain);
 }
 
 // A `run` row: dispatch under the asker's identity with the output

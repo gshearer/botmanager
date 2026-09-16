@@ -756,7 +756,7 @@ nl_bridge_ask_task(task_t *t)
     // momentarily finished.
     if(!chatbot_hold_disowned(&d->hold))
       chatbot_reply_submit(d->st, &d->msg, d->was_addressed,
-          d->is_direct, true);
+          d->is_direct, true, NULL);
 
     chatbot_hold_unlink(&d->hold);
     mem_free(d);
@@ -1802,11 +1802,60 @@ vision_plain_flatten(const char *src, uint32_t budget, char *dst,
     dst[o] = '\0';
 }
 
+// Speak the submitter's plain line because the turn itself said
+// nothing. Bypasses send_reply_line exactly as CV-4's line does: this
+// sentence is ours and not the model's, so none of that function's
+// gates — the SKIP sentinel, the two anti-repeat rings, the line
+// budget — has anything to say about it.
+static void
+fallback_speak(chatbot_req_t *r)
+{
+  if(r->fallback[0] == '\0')
+    return;
+
+  method_send(r->method, r->reply_target, r->fallback);
+  spoken_append(r, r->fallback, false);
+  r->nonskip_lines_sent++;
+
+  clam(CLAM_WARN, "chatbot",
+      "bot=%s persona=%s: cue turn produced no line — spoke the"
+      " submitter's plain one instead: \"%.64s\"",
+      bot_inst_name(r->st->inst), r->personality_name, r->fallback);
+}
+
+// What reached the wire, which is r->spoken and never resp->content:
+// the bridge's slash-line and a SKIP sentinel are not utterances, and
+// CV-4's line and the fallback above never passed through a response at
+// all. The two readers are the dialogue history and the RECENT REPLIES
+// anti-repeat slice, and both want the bot's own voice.
+// A caption is not a turn in the conversation, and the plain path never
+// resolved a dossier to file one against — see chatbot_req_t.
+static void
+log_exchange_out(chatbot_req_t *r)
+{
+  mem_msg_t log = {0};
+
+  if(r->spoken[0] == '\0' || r->vision_plain)
+    return;
+
+  log.ns_id        = (int)r->ns_id;
+  log.user_id_or_0 = r->user_id;
+  log.dossier_id   = r->dossier_id;
+  snprintf(log.bot_name, sizeof(log.bot_name),
+      "%s", bot_inst_name(r->st->inst));
+  snprintf(log.method,  sizeof(log.method),
+      "%s", method_inst_kind(r->method));
+  snprintf(log.channel, sizeof(log.channel), "%s", r->channel);
+  log.kind = MEM_MSG_EXCHANGE_OUT;
+  strlcpy(log.text, r->spoken, sizeof log.text);
+
+  memory_log_message(&log);
+}
+
 static void
 llm_done(const llm_chat_response_t *resp)
 {
   chatbot_req_t *r = resp->user_data;
-  mem_msg_t log = {0};
 
   if(r == NULL) return;
 
@@ -1823,11 +1872,25 @@ llm_done(const llm_chat_response_t *resp)
 
   inflight_bump(r->st, -1);
 
+  // No usable turn came back — a transport failure, or the 200 with
+  // completion_tokens=0 that the engine warns about separately. Either
+  // way there is nothing of the model's to send, so a cue speaks its
+  // own plain line rather than swallowing a fact the bot has already
+  // committed to. A conversational turn carries no fallback and stays
+  // silent, which is what it should do.
   if(!resp->ok || resp->content == NULL || resp->content[0] == '\0')
   {
     clam(CLAM_WARN, "chatbot",
         "chat request failed (http=%ld err=%s)",
         resp->http_status, resp->error ? resp->error : "(null)");
+
+    if(r->fallback[0] != '\0')
+    {
+      fallback_speak(r);
+      log_exchange_out(r);
+      chatbot_inflight_record_reply(r->st, r->reply_target, time(NULL));
+    }
+
     req_free(r);
     return;
   }
@@ -1910,8 +1973,14 @@ llm_done(const llm_chat_response_t *resp)
   // it has no persona contract to violate and it was never told what
   // SKIP means — so a model that emitted the word would otherwise have
   // the bot say "nothing to say" at a picture nobody asked about.
+  // ⚠ A cue that brought its own plain line is exempt, and the reason is
+  // measured: on 2026-08-24 an interpret cue re-voicing /wiki answered
+  // SKIP and this fallback told the channel "couldn't tell you." over
+  // `Carmen — composer: Georges Bizet`, already in hand. Canned regret
+  // is the right answer only when there is nothing better to say.
   if(r->is_direct_address &&
      !r->vision_plain &&
+     r->fallback[0] == '\0' &&
      r->nonskip_lines_sent == 0 &&
      r->skip_sentinels_seen > 0)
   {
@@ -1951,30 +2020,15 @@ llm_done(const llm_chat_response_t *resp)
           r->skip_sentinels_seen);
   }
 
-  // Log as EXCHANGE_OUT so future RAG pulls can reference own replies
-  // (gated by memory.embed_own_replies at the memory layer). What goes
-  // in is r->spoken -- the lines that reached the channel -- and a turn
-  // that spoke none logs none: a slash-line the bridge consumed and a
-  // SKIP the sentinel swallowed are not utterances, and the only live
-  // reader of these rows is the recent-own-replies anti-repeat slice,
-  // which acts on them as if they were.
-  // A caption is not a turn in the conversation, and the plain path never
-  // resolved a dossier to file one against — see chatbot_req_t.
-  if(r->spoken[0] != '\0' && !r->vision_plain)
-  {
-    log.ns_id        = (int)r->ns_id;
-    log.user_id_or_0 = r->user_id;
-    log.dossier_id   = r->dossier_id;
-    snprintf(log.bot_name, sizeof(log.bot_name),
-        "%s", bot_inst_name(r->st->inst));
-    snprintf(log.method,  sizeof(log.method),
-        "%s", method_inst_kind(r->method));
-    snprintf(log.channel, sizeof(log.channel), "%s", r->channel);
-    log.kind = MEM_MSG_EXCHANGE_OUT;
-    strlcpy(log.text, r->spoken, sizeof log.text);
+  // The turn completed and still reached the channel with nothing: every
+  // line a SKIP, a slash line the disarmed bridge suppressed, or a copy
+  // one of the anti-repeat gates refused. CV-4 above answers the
+  // addressed conversational turn; this answers the cue, which holds a
+  // fact and has no persona licence to go quiet over it.
+  if(r->nonskip_lines_sent == 0)
+    fallback_speak(r);
 
-    memory_log_message(&log);
-  }
+  log_exchange_out(r);
 
   chatbot_inflight_record_reply(r->st, r->reply_target, time(NULL));
 
@@ -3824,7 +3878,8 @@ req_load_history(chatbot_req_t *r, const char *botname)
 //      EXCHANGE_OUT, and runs the NL-command bridge if enabled.
 void
 chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
-    bool was_addressed, bool is_direct_address, bool nl_bridge_off)
+    bool was_addressed, bool is_direct_address, bool nl_bridge_off,
+    const char *fallback)
 {
   uint32_t top_k;
   uint32_t rr_cap;
@@ -3853,6 +3908,9 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   r->is_direct_address = is_direct_address;
   r->is_action_at_bot  = msg->is_action && was_addressed;
   r->nl_bridge_off     = nl_bridge_off;
+
+  if(fallback != NULL)
+    strlcpy(r->fallback, fallback, sizeof(r->fallback));
 
   strlcpy(r->sender,          msg->sender,   sizeof(r->sender));
   strlcpy(r->sender_metadata, msg->metadata, sizeof(r->sender_metadata));

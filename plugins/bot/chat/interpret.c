@@ -471,7 +471,14 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   msg.timestamp     = time(NULL);
   msg.reply_sink_id = 0;   // the cue's own reply must never re-capture
 
-  chatbot_reply_submit(st, &msg, was_addressed, is_direct, true);
+  // The command's own one-line ack is the plain answer if the persona
+  // turn yields nothing — "noted — I'll remind you on Wed Sep 16 at
+  // 9:00 PM EDT." is the whole truth and the module already holds it.
+  // ⭑ Only at one line: a multi-line capture is a rendered block, and
+  // putting one on the wire unvoiced is the bare tool dump this module
+  // exists to prevent.
+  chatbot_reply_submit(st, &msg, was_addressed, is_direct, true,
+      lines == 1 ? capture : NULL);
 }
 
 uint64_t
