@@ -340,19 +340,24 @@ recording still transcribed as "Amen." Gate at the ear, not here.
 pacman -S sherpa-onnx cargs           # BOTH — see below
 ```
 
-⚠⚠ **`cargs` is not optional, and nothing declares it.** sherpa-onnx's
+⚠⚠ **`cargs` is not optional, and sherpa-onnx does not declare it.**
 `sherpa-onnx.pc` puts `-lcargs` in `Libs:` unconditionally — its own comment
 says the flag is there only for one of their C examples — while the package
-does **not** list `cargs` in `Depends On`. `kokorod.c` never calls cargs, but
-pkg-config hands the flag to the linker anyway, so without the package the
-target fails at the *link* step with `cannot find /usr/lib/libcargs.so`.
+does **not** list `cargs` in `Depends On`. `kokorod.c` never calls cargs;
+pkg-config hands the flag to the linker anyway. **`senses/kokorod/meson.build`
+guards on cargs the same way it guards on sherpa-onnx**, so a host with one and
+not the other configures green, says *"cargs not found — skipping kokorod"* and
+declares no kokorod target. ⛔ That protects the tree's build, not the robot:
+you still have no voice, and `ninja -C build senses/kokorod/kokorod` answers
+*unknown target* rather than a link error.
 
-⭑ **What makes this expensive is that nothing downstream says so.** `ninja`
-leaves the stale object file and no binary; the unit then fails `203/EXEC` and
-`Restart=` loops on it forever, so the only symptom anyone sees is a silent
-robot. Bit us 2026-09-12 after the sherpa-onnx 1.13.7 upgrade — the restart
-counter had reached 3823. **Diagnose a mute robot at the unit first:**
-`systemctl --user status kokorod`, then `ninja -C build senses/kokorod/kokorod`.
+⭑ **What made this expensive is that nothing downstream said so.** Before the
+guard the whole tree's `ninja` died at kokorod's *link* step with `cannot find
+/usr/lib/libcargs.so`, leaving the stale object file and no binary; the unit
+then fails `203/EXEC` and `Restart=` loops on it forever, so the only symptom
+anyone sees is a silent robot. Bit us 2026-09-12 after the sherpa-onnx 1.13.7
+upgrade — the restart counter had reached 3823. **Diagnose a mute robot at the
+unit first:** `systemctl --user status kokorod`.
 
 ⚠ **Fetch `kokoro-multi-lang-v1_0`, NOT `v1_1`.** v1.1 is the **Mandarin**
 model — its entire English voice set is `af_maple af_sol bf_vale`, and it has
@@ -362,7 +367,7 @@ trap. Get it from the sherpa-onnx TTS model releases and unpack to
 `voices.bin`, `tokens.txt`, `espeak-ng-data/`, `lexicon-us-en.txt`).
 
 ```sh
-ninja -C build                          # kokorod is meson-guarded on sherpa-onnx
+ninja -C build                          # kokorod is guarded on sherpa-onnx + cargs
 install -Dm644 senses/kokorod/kokorod.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now kokorod
