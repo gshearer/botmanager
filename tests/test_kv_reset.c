@@ -61,6 +61,17 @@ rec_ping(void *handle)
   return(SUCCESS);
 }
 
+// db_init refuses a driver without ping and reset (503b426), and until
+// board #108 this suite skipped on exactly that — every case below
+// unreached, and meson reporting SKIP rather than a failure. The recorder
+// never loses its server, so there is nothing to redial.
+static bool
+rec_reset(void *handle)
+{
+  (void)handle;
+  return(SUCCESS);
+}
+
 static bool
 rec_query(void *handle, const char *sql, db_result_t *result)
 {
@@ -96,7 +107,7 @@ static const db_driver_t rec_driver = {
   .connect      = rec_connect,
   .disconnect   = rec_disconnect,
   .ping         = rec_ping,
-  .reset        = NULL,
+  .reset        = rec_reset,
   .query        = rec_query,
   .query_stream = NULL,
   .query_params = NULL,
