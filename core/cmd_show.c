@@ -569,10 +569,11 @@ cmd_show_resolve(const cmd_ctx_t *ctx)
 
 // /show identities <botname> — the bot's namespace's temporary MFAs.
 // Permanent-pattern identities are stateless and per-message; only the
-// !identify-minted exact-match entries have anything to list.
+// !identify-minted entries, each bound to a method key, have anything
+// to list.
 
 static void
-show_identity_cb(const char *username, const char *metadata,
+show_identity_cb(const char *username, const char *key,
     time_t created, time_t last_seen, void *data)
 {
   show_iter_state_t *st = data;
@@ -595,7 +596,7 @@ show_identity_cb(const char *username, const char *metadata,
 
   snprintf(line, sizeof(line),
       "  " CLR_BOLD "%-20s" CLR_RESET " %-40s %-10s %s",
-      username, metadata, age_dur, idle_dur);
+      username, key, age_dur, idle_dur);
   cmd_reply(st->ctx, line);
   st->count++;
 }
@@ -628,7 +629,7 @@ cmd_show_identities(const cmd_ctx_t *ctx)
       CLR_BOLD "%s" CLR_RESET ":", ns->name);
   cmd_reply(ctx, hdr);
   cmd_reply_table_head(ctx, "  " CLR_BOLD
-      "USERNAME             METADATA                                 "
+      "USERNAME             IDENTITY                                 "
       "AGE        IDLE" CLR_RESET);
 
   userns_tmfa_iterate(ns, show_identity_cb, &st);

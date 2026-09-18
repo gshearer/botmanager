@@ -241,46 +241,89 @@ bool userns_user_get_cd(const userns_t *ns, const char *username,
 bool userns_user_set_cd(const userns_t *ns, const char *username,
     const char *cd_name);
 
-// Temporary MFAs — exact-match identities minted by !identify.
+// Temporary MFAs — the logins minted by !identify.
 //
-// Unlike permanent user_mfa patterns (globs, stateless, no expiry),
-// a temporary MFA is the identifying sender's full metadata string
-// matched byte-for-byte, refreshed by any observed matching line and
-// expired LAZILY: the first resolve past `timeout` deletes the entry
-// and reports TMFA_EXPIRED exactly once so the caller can notify;
-// every later resolve is TMFA_NONE. Rows persist in user_mfa_temp
-// and reload with the namespace, so identities survive restarts.
+// Unlike permanent user_mfa patterns (globs, stateless, no expiry), a
+// temporary MFA is bound to the identifying sender's KEY: the part of
+// their metadata that stays the same for as long as they are the same
+// session on that method (IRC: user@host, so a nick change keeps it).
+// method_identity_key() derives it; every call below takes the key,
+// never raw metadata. An entry also records the bot and method kind
+// that minted it, and its idle window is that bot's
+// bot.<bot>.<kind>.identtimeout, read live (0 = never expires).
+//
+// Its clock is reset three ways: a resolve (the sender acted as the
+// user), userns_tmfa_seen (the method saw the sender do anything), and
+// the sweep (the sender still shares a group chat with the bot). None
+// of the three revives an entry already past its window — presence
+// vouches for continuity only while sweeps come often enough to see
+// it. A resolve past the window deletes the entry and reports
+// TMFA_EXPIRED once so the caller can notify; the sweep deletes
+// silently. Rows persist in user_mfa_temp and reload with the
+// namespace.
 
 // Obligation: success is TMFA_OK == 1, not 0, so a two-state test of
 // this reports a match as a failure. Switch on it. TMFA_EXPIRED carries
 // the notify-once obligation described above; TMFA_NONE carries none.
 typedef enum
 {
-  TMFA_NONE,                  // no entry matches this metadata
+  TMFA_NONE,                  // no entry matches this key
   TMFA_OK,                    // matched and refreshed; user_out filled
   TMFA_EXPIRED                // matched, idled out, deleted; user_out filled
 } tmfa_result_t;
 
 // Upsert a temp MFA for the user (re-identify refreshes the stamp).
 // Capped at USERNS_TMFA_MAX entries per user; the stalest is evicted.
-bool userns_tmfa_add(userns_t *ns, const char *username,
-    const char *metadata);
+bool userns_tmfa_add(userns_t *ns, const char *username, const char *bot,
+    const char *kind, const char *key);
 
-// The per-message hot path: exact metadata match against the cache
-// only — no DB query on hit. timeout == 0 means the entry never
-// expires. user_out receives the username for OK and EXPIRED.
-tmfa_result_t userns_tmfa_resolve(userns_t *ns, const char *metadata,
-    uint32_t timeout, char *user_out, size_t user_sz);
+// The per-message hot path: cache only, no DB query on hit. user_out
+// receives the username for OK and EXPIRED.
+tmfa_result_t userns_tmfa_resolve(userns_t *ns, const char *kind,
+    const char *key, char *user_out, size_t user_sz);
 
-// metadata == NULL removes every entry the user holds.
+// The method saw this key act. Refreshes every entry still inside its
+// window and deletes none, so the resolve that follows a user's own
+// line is still the one that tells them they expired.
+void userns_tmfa_seen(userns_t *ns, const char *kind, const char *key);
+
+// The key left the method entirely (IRC QUIT): every entry bound to it
+// ends. returns: number of entries removed
+uint32_t userns_tmfa_drop(userns_t *ns, const char *kind, const char *key);
+
+// key == NULL removes every entry the user holds.
 // returns: number of entries removed
 uint32_t userns_tmfa_del(const userns_t *ns, const char *username,
-    const char *metadata);
+    const char *key);
 
 typedef void (*userns_tmfa_iter_cb_t)(const char *username,
-    const char *metadata, time_t created, time_t last_seen, void *data);
+    const char *key, time_t created, time_t last_seen, void *data);
 
 void userns_tmfa_iterate(const userns_t *ns, userns_tmfa_iter_cb_t cb,
+    void *data);
+
+// What the sweep learns about one entry from the bot that minted it.
+// ORPHAN (that bot no longer exists) ends the entry whatever its idle
+// time, because nothing is left to read its window from.
+typedef enum
+{
+  TMFA_ABSENT = 0,            // shares no group chat with the minting bot
+  TMFA_PRESENT,               // still in a group chat with it
+  TMFA_ORPHAN                 // the minting bot is gone
+} tmfa_presence_t;
+
+// Called with no userns lock held; may call into method drivers.
+typedef tmfa_presence_t (*userns_tmfa_presence_cb_t)(const char *bot,
+    const char *kind, const char *key, void *data);
+
+// True at most once per USERNS_TMFA_SWEEP_SEC per namespace — the
+// caller that gets true owes one userns_tmfa_sweep().
+bool userns_tmfa_sweep_due(userns_t *ns);
+
+// Expire every entry past its window or orphaned; refresh every entry
+// inside it whose key `presence` reports PRESENT. Deletes and DB
+// writes happen here, so run it on a worker, not a socket thread.
+void userns_tmfa_sweep(userns_t *ns, userns_tmfa_presence_cb_t presence,
     void *data);
 
 // Unlike userns_mfa_match() which searches all users, this checks only
@@ -399,12 +442,17 @@ void userns_cache_ensure(userns_t *ns);
 // counts are tiny (USERNS_TMFA_MAX per user), exact-match scan only.
 #define USERNS_TMFA_MAX          8    // temp MFAs per user; stalest evicted
 #define USERNS_TMFA_PERSIST_SEC  60   // min seconds between last_seen writes
+#define USERNS_TMFA_SWEEP_SEC    300  // min seconds between sweeps
+#define USERNS_TMFA_BOT_SZ       64   // == BOT_NAME_SZ
+#define USERNS_TMFA_KIND_SZ      64   // == METHOD_NAME_SZ
 
 typedef struct tmfa_entry
 {
   uint32_t           user_id;
   char               username[USERNS_USER_SZ];
-  char               metadata[USERNS_MFA_PATTERN_SZ];
+  char               key[USERNS_MFA_PATTERN_SZ];
+  char               bot[USERNS_TMFA_BOT_SZ];     // minting bot
+  char               kind[USERNS_TMFA_KIND_SZ];   // minting method kind
   time_t             created;
   time_t             last_seen;
   time_t             persisted_at;    // last_seen value last written to DB
@@ -416,6 +464,7 @@ typedef struct
   tmfa_entry_t     *entries;
   uint32_t          count;
   pthread_rwlock_t  lock;
+  int64_t           last_sweep;       // __atomic; claimed by userns_tmfa_sweep_due
 } tmfa_cache_t;
 
 void userns_tmfa_ensure(userns_t *ns);    // create + populate from DB

@@ -123,6 +123,17 @@ bool bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
     const char *sender, const char *metadata,
     char *user_out, size_t user_sz);
 
+// A method driver's report that it witnessed the sender behind
+// `metadata` do something (seen) or leave the network (gone — IRC
+// QUIT). Seen refreshes that sender's !identify login while it is
+// still inside its window; gone ends it. Either may start the
+// namespace's presence sweep on a worker, so both are cheap enough
+// to call for every line. Call with no driver lock held.
+void bot_identity_seen(bot_inst_t *inst, method_inst_t *method,
+    const char *metadata);
+void bot_identity_gone(bot_inst_t *inst, method_inst_t *method,
+    const char *metadata);
+
 // Attempt user discovery from an MFA string. If the bot has user
 // discovery enabled (bot.<name>.userdiscovery != 0), a user namespace
 // bound, and the MFA string does not match any existing user, auto-

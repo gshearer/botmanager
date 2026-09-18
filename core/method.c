@@ -768,6 +768,39 @@ method_get_context(method_inst_t *inst, const char *sender,
   return(inst->driver->get_context(inst->handle, sender, ctx, ctx_sz));
 }
 
+bool
+method_identity_key(const method_inst_t *inst, const char *metadata,
+    char *key, size_t key_sz)
+{
+  if(inst == NULL || metadata == NULL || metadata[0] == '\0' ||
+     key == NULL || key_sz == 0)
+    return(FAIL);
+
+  if(inst->driver->identity_key != NULL)
+    return(inst->driver->identity_key(metadata, key, key_sz));
+
+  return(strlcpy(key, metadata, key_sz) < key_sz ? SUCCESS : FAIL);
+}
+
+bool
+method_identity_present(method_inst_t *inst, const char *key)
+{
+  void *handle;
+
+  if(inst == NULL || key == NULL || key[0] == '\0' ||
+     inst->driver->identity_present == NULL)
+    return(false);
+
+  // A retired instance holds no handle (method_unregister); that is a
+  // roster nobody can vouch for, so it answers absent.
+  handle = inst->handle;
+
+  if(handle == NULL)
+    return(false);
+
+  return(inst->driver->identity_present(handle, key));
+}
+
 // Type registry iteration
 
 void

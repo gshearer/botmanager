@@ -225,6 +225,20 @@ typedef struct
   bool (*get_context)(void *handle, const char *sender,
       char *ctx, size_t ctx_sz);
 
+  // The part of a sender's metadata an !identify login binds to: what
+  // stays the same for as long as they are the same session here (IRC:
+  // "user@host" out of "nick!user@host", so a nick change keeps the
+  // login). FAIL when the metadata carries no such part, which refuses
+  // the login rather than binding it to something weaker. Optional —
+  // NULL binds the login to the whole metadata string.
+  bool (*identity_key)(const char *metadata, char *key, size_t key_sz);
+
+  // True when a sender with this identity_key shares a group chat with
+  // the bot right now, answered from live membership like get_context.
+  // It keeps an idle login alive, so a stale roster keeps the WRONG
+  // one alive: answer false when unsure. Optional — NULL is never.
+  bool (*identity_present)(void *handle, const char *key);
+
   // List members of a channel. If not implemented (NULL), the channel
   // has no member tracking. `cb` may call back into this driver — asking
   // about a member is the usual reason to enumerate them — so snapshot
@@ -396,6 +410,16 @@ method_cap_t method_inst_caps(const method_inst_t *inst);
 // callers read it as anonymous.
 bool method_get_context(method_inst_t *inst, const char *sender,
     char *ctx, size_t ctx_sz);
+
+// A sender's identity key for !identify logins (driver identity_key(),
+// or the whole metadata when the driver has none). FAIL on empty or
+// truncated input, or when the driver refuses the metadata.
+bool method_identity_key(const method_inst_t *inst, const char *metadata,
+    char *key, size_t key_sz);
+
+// Whether the sender behind `key` still shares a group chat with the
+// bot. false when the driver cannot tell.
+bool method_identity_present(method_inst_t *inst, const char *key);
 
 typedef void (*method_type_iter_cb_t)(const char *name, method_type_t bit,
     const char *desc, void *data);

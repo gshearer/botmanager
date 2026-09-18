@@ -21,6 +21,7 @@ cmd_identify(const cmd_ctx_t *ctx)
   const char *mfa_str;
   userns_auth_t result;
   const char *pass;
+  char key[USERNS_MFA_PATTERN_SZ];
 
   // Already identified (temp MFA or permanent pattern)?
   if(ctx->username != NULL)
@@ -40,14 +41,17 @@ cmd_identify(const cmd_ctx_t *ctx)
   username = ctx->parsed->argv[0];
   pass = ctx->parsed->argv[1];
 
-  // A temporary MFA is the sender's exact metadata; a method that
-  // carries none cannot mint one.
+  // A temporary MFA is bound to the method's identity key for the
+  // sender (IRC: their user@host); a method that yields none cannot
+  // mint one.
   mfa_str = ctx->msg->metadata;
 
-  if(mfa_str == NULL || mfa_str[0] == '\0')
+  if(mfa_str == NULL || mfa_str[0] == '\0' ||
+     method_identity_key(ctx->msg->inst, mfa_str, key, sizeof(key))
+       != SUCCESS)
   {
     clam(CLAM_WARN, "identify",
-        "no method metadata for '%s' (sender: %s)",
+        "no identity key in method metadata for '%s' (sender: %s)",
         username, ctx->msg->sender);
     cmd_reply(ctx, "This method carries no identity metadata; "
         "identify is unavailable here.");
@@ -63,7 +67,8 @@ cmd_identify(const cmd_ctx_t *ctx)
   switch(result)
   {
     case USERNS_AUTH_OK:
-      if(userns_tmfa_add(ns, username, mfa_str) != SUCCESS)
+      if(userns_tmfa_add(ns, username, bot_inst_name(ctx->bot),
+          method_inst_kind(ctx->msg->inst), key) != SUCCESS)
       {
         clam(CLAM_WARN, "identify",
             "auth ok but temp MFA mint failed for '%s' from '%s'",
@@ -74,8 +79,9 @@ cmd_identify(const cmd_ctx_t *ctx)
 
       clam(CLAM_INFO, "identify",
           "'%s' authenticated from '%s'", username, mfa_str);
-      cmd_reply(ctx, "Identified. This hostmask is now you, "
-          "refreshed by anything you say, until it idles out.");
+      cmd_reply(ctx, "Identified. This connection is now you — "
+          "a nick change keeps it; it lasts while you are active or "
+          "in a channel with me, and ends when you quit.");
       break;
     case USERNS_AUTH_ERR:
       clam(CLAM_WARN, "identify",
@@ -96,6 +102,7 @@ static void
 cmd_deauth(const cmd_ctx_t *ctx)
 {
   userns_t *ns;
+  char key[USERNS_MFA_PATTERN_SZ];
 
   if(ctx->username == NULL)
   {
@@ -105,13 +112,15 @@ cmd_deauth(const cmd_ctx_t *ctx)
 
   ns = bot_get_userns(ctx->bot);
 
-  if(ns != NULL && ctx->msg->metadata[0] != '\0' &&
-     userns_tmfa_del(ns, ctx->username, ctx->msg->metadata) > 0)
+  if(ns != NULL &&
+     method_identity_key(ctx->msg->inst, ctx->msg->metadata, key,
+       sizeof(key)) == SUCCESS &&
+     userns_tmfa_del(ns, ctx->username, key) > 0)
   {
     clam(CLAM_INFO, "deauth",
         "'%s' dropped temporary MFA (sender: %s)",
         ctx->username, ctx->msg->sender);
-    cmd_reply(ctx, "Identity dropped for this hostmask.");
+    cmd_reply(ctx, "Identity dropped for this connection.");
   }
 
   else
@@ -133,6 +142,8 @@ cmd_register_user(const cmd_ctx_t *ctx)
   userns_auth_t probe;
   const char *password;
   userns_auth_t result;
+  char key[USERNS_MFA_PATTERN_SZ];
+
   // Must not already be authenticated.
   if(ctx->username != NULL)
   {
@@ -211,13 +222,16 @@ cmd_register_user(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Auto-identify: mint a temp MFA from the caller's metadata. Their
+  // Auto-identify: mint a temp MFA from the caller's identity key. Their
   // permanent pattern already matched (that is what found the account),
   // so this matters only when autoidentify is off for the user.
   result = userns_auth(ns, matched, password, mfa_str);
 
   if(result == USERNS_AUTH_OK &&
-     userns_tmfa_add(ns, matched, mfa_str) == SUCCESS)
+     method_identity_key(ctx->msg->inst, mfa_str, key, sizeof(key))
+       == SUCCESS &&
+     userns_tmfa_add(ns, matched, bot_inst_name(ctx->bot),
+       method_inst_kind(ctx->msg->inst), key) == SUCCESS)
   {
     clam(CLAM_INFO, "register",
         "'%s' registered and authenticated from '%s'", matched, mfa_str);

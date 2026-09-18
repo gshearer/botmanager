@@ -239,6 +239,32 @@ irc_user_userhost(irc_state_t *st, const char *nick,
   return(FAIL);
 }
 
+bool
+irc_userhost_present(irc_state_t *st, const char *userhost)
+{
+  bool found = false;
+
+  if(userhost == NULL || userhost[0] == '\0')
+    return(false);
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  for(irc_channel_t *ch = st->channels; ch != NULL && !found; ch = ch->next)
+  {
+    for(irc_member_t *m = ch->members; m != NULL; m = m->next)
+    {
+      if(m->userhost[0] != '\0' && strcasecmp(m->userhost, userhost) == 0)
+      {
+        found = true;
+        break;
+      }
+    }
+  }
+
+  pthread_mutex_unlock(&st->chan_mutex);
+  return(found);
+}
+
 // Remove a channel entirely (when the bot parts/is kicked).
 void
 irc_chan_remove(irc_state_t *st, const char *channel)

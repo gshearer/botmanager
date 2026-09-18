@@ -245,6 +245,16 @@ create_core_tables(void)
       "last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
       "UNIQUE(user_id, metadata))",
 
+    // The bot and method kind that minted a temporary MFA: its idle
+    // window is that bot's identtimeout, and the sweep asks that bot
+    // whether the key is still present. A row without them predates
+    // keys, matches nothing, and the first sweep ends it as orphaned.
+    "ALTER TABLE user_mfa_temp ADD COLUMN IF NOT EXISTS "
+      "bot_name VARCHAR(64) NOT NULL DEFAULT ''",
+
+    "ALTER TABLE user_mfa_temp ADD COLUMN IF NOT EXISTS "
+      "method_kind VARCHAR(64) NOT NULL DEFAULT ''",
+
     NULL
   };
 

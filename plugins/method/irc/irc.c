@@ -1574,6 +1574,31 @@ irc_handle_error(irc_state_t *st, const irc_parsed_msg_t *p)
   st->connected = false;
 }
 
+// Report a user's line to the identity layer: anything they do keeps
+// their !identify login alive, and a QUIT — they left the network —
+// ends it. A server's line carries no user@host and is not reported.
+static void
+irc_witness(irc_state_t *st, const irc_parsed_msg_t *p)
+{
+  char        botname[METHOD_NAME_SZ];
+  bot_inst_t *bot;
+
+  if(p->user[0] == '\0' || p->host[0] == '\0' || st->inst == NULL)
+    return;
+
+  irc_botname_from_inst(st->inst_name, botname, sizeof(botname));
+  bot = bot_find(botname);
+
+  if(bot == NULL)
+    return;
+
+  if(strcmp(p->command, "QUIT") == 0)
+    bot_identity_gone(bot, st->inst, p->prefix);
+
+  else
+    bot_identity_seen(bot, st->inst, p->prefix);
+}
+
 static void
 irc_handle_line(irc_state_t *st, const char *line)
 {
@@ -1586,6 +1611,8 @@ irc_handle_line(irc_state_t *st, const char *line)
   // parser has already said which field did not fit.
   if(irc_parse_line(line, &p) != SUCCESS)
     return;
+
+  irc_witness(st, &p);
 
   for(i = 0; irc_cmd_table[i].cmd != NULL; i++)
   {
@@ -1969,6 +1996,28 @@ irc_get_context(void *handle, const char *sender,
   irc_state_t *st = handle;
 
   return(irc_user_userhost(st, sender, ctx, ctx_sz));
+}
+
+// An !identify login binds to the user@host of "nick!user@host", so a
+// nick change keeps it. A prefix without both halves is a server's,
+// and no login binds to one.
+static bool
+irc_identity_key(const char *metadata, char *key, size_t key_sz)
+{
+  const char *bang = strchr(metadata, '!');
+
+  if(bang == NULL || bang[1] == '\0' || strchr(bang + 1, '@') == NULL)
+    return(FAIL);
+
+  return(strlcpy(key, bang + 1, key_sz) < key_sz ? SUCCESS : FAIL);
+}
+
+static bool
+irc_identity_present(void *handle, const char *key)
+{
+  irc_state_t *st = handle;
+
+  return(irc_userhost_present(st, key));
 }
 
 // List members of an IRC channel, invoking cb for each nick.

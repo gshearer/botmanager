@@ -413,6 +413,11 @@ void irc_user_seen(irc_state_t *st, const char *nick, const char *userhost);
 bool irc_user_userhost(irc_state_t *st, const char *nick,
     char *out, size_t out_sz);
 
+// True when a shared channel holds a member whose user@host is
+// `userhost` — the presence half of an !identify login. Same member
+// lists, so a roster emptied by a lost connection answers false.
+bool irc_userhost_present(irc_state_t *st, const char *userhost);
+
 // Mode/admin helpers (defined in irc_channel.c).
 uint8_t irc_mode_to_flag(char mode);
 void    irc_apply_chan_admin(irc_state_t *st, const char *channel);
@@ -445,6 +450,9 @@ static bool irc_send(void *handle, const char *target, const char *text);
 static bool irc_send_emote(void *handle, const char *target, const char *text);
 static bool irc_get_context(void *handle, const char *sender,
     char *ctx, size_t ctx_sz);
+static bool irc_identity_key(const char *metadata, char *key,
+    size_t key_sz);
+static bool irc_identity_present(void *handle, const char *key);
 static void irc_list_channel(void *handle, const char *channel,
     method_chan_member_cb_t cb, void *data);
 static void irc_list_joined_channels(void *handle,
@@ -485,6 +493,8 @@ static const method_driver_t irc_driver = {
   .send          = irc_send,
   .send_emote    = irc_send_emote,
   .get_context   = irc_get_context,
+  .identity_key  = irc_identity_key,
+  .identity_present = irc_identity_present,
   .list_channel  = irc_list_channel,
   .list_joined_channels = irc_list_joined_channels,
   .get_self      = irc_get_self,

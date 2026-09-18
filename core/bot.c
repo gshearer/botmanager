@@ -1562,13 +1562,112 @@ bot_clear_userns(const char *ns_name)
 
 // Identity
 
+// The sweep's question, asked of the bot that minted a login through
+// the method kind it was minted on.
+static tmfa_presence_t
+bot_identity_presence(const char *bot, const char *kind, const char *key,
+    void *data)
+{
+  bot_inst_t    *inst;
+  method_inst_t *method;
+  bool           present;
+
+  (void)data;
+
+  inst = bot_find(bot);
+
+  if(inst == NULL)
+    return(TMFA_ORPHAN);
+
+  method = bot_resolve_method(inst, kind);
+
+  if(method == NULL)
+    return(TMFA_ABSENT);
+
+  present = method_identity_present(method, key);
+  method_release(method);
+
+  return(present ? TMFA_PRESENT : TMFA_ABSENT);
+}
+
+// The task carries the namespace id, never its address: a namespace
+// deleted between the claim and the run is simply not found.
+static void
+bot_identity_sweep_task(task_t *t)
+{
+  userns_t *ns;
+
+  t->state = TASK_ENDED;
+
+  ns = userns_find_id((uint32_t)(uintptr_t)t->data);
+
+  if(ns != NULL)
+    userns_tmfa_sweep(ns, bot_identity_presence, NULL);
+}
+
+// Activity is the sweep's clock: whoever sees a line after the
+// interval claims the sweep, and a worker runs it — it asks drivers
+// and writes to postgres, neither of which a socket thread may wait on.
+static void
+bot_identity_sweep_maybe(userns_t *ns)
+{
+  if(!userns_tmfa_sweep_due(ns))
+    return;
+
+  if(task_add("identify-sweep", TASK_ANY, 150, bot_identity_sweep_task,
+      (void *)(uintptr_t)ns->id) == NULL)
+    clam(CLAM_WARN, "bot", "identify sweep for '%s' not queued", ns->name);
+}
+
+void
+bot_identity_seen(bot_inst_t *inst, method_inst_t *method,
+    const char *metadata)
+{
+  userns_t *ns;
+  char      key[USERNS_MFA_PATTERN_SZ];
+
+  if(inst == NULL || method == NULL)
+    return;
+
+  ns = bot_get_userns(inst);
+
+  if(ns == NULL)
+    return;
+
+  if(method_identity_key(method, metadata, key, sizeof(key)) == SUCCESS)
+    userns_tmfa_seen(ns, method_inst_kind(method), key);
+
+  bot_identity_sweep_maybe(ns);
+}
+
+void
+bot_identity_gone(bot_inst_t *inst, method_inst_t *method,
+    const char *metadata)
+{
+  userns_t *ns;
+  char      key[USERNS_MFA_PATTERN_SZ];
+
+  if(inst == NULL || method == NULL)
+    return;
+
+  ns = bot_get_userns(inst);
+
+  if(ns == NULL)
+    return;
+
+  if(method_identity_key(method, metadata, key, sizeof(key)) == SUCCESS)
+    (void)userns_tmfa_drop(ns, method_inst_kind(method), key);
+
+  bot_identity_sweep_maybe(ns);
+}
+
 // Stateless per-message identity resolution. Two checks against the
-// message's own metadata, in order: an exact temporary-MFA match
-// (minted by !identify; lazy expiry — the first resolve past the idle
-// window deletes the entry, and the one-time "identity expired" notice
-// rides this call), then a permanent MFA pattern match gated on the
-// user's autoidentify flag. No cache of the result exists anywhere:
-// every message answers for itself.
+// message's own metadata, in order: a temporary-MFA match on the
+// method's identity key (minted by !identify; the first resolve past
+// the idle window deletes the entry, and the one-time "identity
+// expired" notice rides this call), then a permanent MFA pattern
+// match gated on the user's autoidentify flag. No cache of the result
+// exists anywhere: every message answers for itself.
 //
 // metadata may be NULL/empty; the method's context map is consulted
 // for the sender in that case (third-party lookups by nick).
@@ -1579,9 +1678,9 @@ bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
 {
   userns_t   *ns;
   char        meta[METHOD_META_SZ];
+  char        key[USERNS_MFA_PATTERN_SZ];
   char        user[USERNS_USER_SZ];
   const char *matched;
-  uint32_t    timeout = 0;
 
   if(user_out != NULL && user_sz > 0)
     user_out[0] = '\0';
@@ -1618,31 +1717,30 @@ bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
   if(meta[0] == '\0')
     return(false);
 
-  // Idle window: the method's identtimeout, 0 = temporary identities
-  // never expire. No method, no key — and no expiry either.
+  bot_identity_sweep_maybe(ns);
+
+  // A temporary login is bound to a method's key, so a resolve with no
+  // method has none to match.
+  if(method != NULL &&
+     method_identity_key(method, meta, key, sizeof(key)) == SUCCESS)
   {
-    const char *kind = (method != NULL) ? method_inst_kind(method) : NULL;
+    switch(userns_tmfa_resolve(ns, method_inst_kind(method), key,
+        user, sizeof(user)))
+    {
+      case TMFA_OK:
+        strlcpy(user_out, user, user_sz);
+        return(true);
 
-    if(kind != NULL)
-      timeout = (uint32_t)kv_get_bot_method_uint(inst->name, kind,
-          "identtimeout");
-  }
+      case TMFA_EXPIRED:
+        if(sender != NULL && sender[0] != '\0')
+          method_send(method, sender,
+              "Your identity has expired. "
+              "Use identify to re-authenticate.");
+        break;
 
-  switch(userns_tmfa_resolve(ns, meta, timeout, user, sizeof(user)))
-  {
-    case TMFA_OK:
-      snprintf(user_out, user_sz, "%s", user);
-      return(true);
-
-    case TMFA_EXPIRED:
-      if(method != NULL && sender != NULL && sender[0] != '\0')
-        method_send(method, sender,
-            "Your identity has expired. "
-            "Use identify to re-authenticate.");
-      break;
-
-    case TMFA_NONE:
-      break;
+      case TMFA_NONE:
+        break;
+    }
   }
 
   matched = userns_mfa_match(ns, meta);
