@@ -177,14 +177,13 @@ cmd_bot_refresh_prompts(const cmd_ctx_t *ctx)
   cmd_reply(ctx, buf);
 }
 
-// NL hint for /hush. The chat plugin's NL bridge forwards the
-// LLM-emitted slash line directly; any future translation from bare
-// "hush <nick>" into the parent-scoped "/bot <name> hush <duration>"
-// happens on the chat plugin side, not via a sponsor callback.
+// NL hint for /hush. The verb is registered under bot/<name> and the
+// bridge dispatches it through dispatch_text, which pins <name> to the
+// bot hearing the line — so it can only ever hush ITSELF, and the model
+// is taught exactly the one argument the handler reads. A <nick> slot
+// here once put "self" in the duration position and every NL hush
+// answered "bad duration".
 static const cmd_nl_slot_t chat_hush_slots[] = {
-  { .name  = "nick",
-    .type  = CMD_NL_ARG_NICK,
-    .flags = CMD_NL_SLOT_REQUIRED },
   { .name  = "duration",
     .type  = CMD_NL_ARG_DURATION,
     .flags = CMD_NL_SLOT_REQUIRED },
@@ -192,15 +191,14 @@ static const cmd_nl_slot_t chat_hush_slots[] = {
 
 static const cmd_nl_example_t chat_hush_examples[] = {
   { .utterance  = "hush yourself for 5 minutes",
-    .invocation = "/hush self 5m" },
-  { .utterance  = "shut lessclam up for an hour",
-    .invocation = "/hush lessclam 1h" },
+    .invocation = "/hush 5m" },
+  { .utterance  = "be quiet for an hour",
+    .invocation = "/hush 1h" },
 };
 
 static const cmd_nl_t chat_hush_nl = {
-  .when          = "Someone asks you (or a specific nick) to be silent"
-                   " for a duration.",
-  .syntax        = "/hush <nick|self> <duration>",
+  .when          = "Someone asks you to be silent for a duration.",
+  .syntax        = "/hush <duration>",
   .slots         = chat_hush_slots,
   .slot_count    = (uint8_t)(sizeof(chat_hush_slots)
                              / sizeof(chat_hush_slots[0])),
