@@ -1562,6 +1562,47 @@ line_is_skip_sentinel(const char *line)
   return(strcasecmp(probe + lo, "SKIP") == 0);
 }
 
+// Is this whole line one markup tag and nothing else — "<action>",
+// "</action>", "<result>"? Such a line is the frame a completion wrapped
+// around its reply, not something a person types: board #103 put
+// "<action>" and "</action>" on the wire either side of a real /me on
+// 2026-09-11, and "<attempt_completion>" / "<result>" reached #botman as
+// speech on 2026-08-27. The line between them is untouched — a /me
+// inside the frame still goes out as the emote it is.
+//
+// The name must start with a letter, which keeps "<3" and "<-- this"
+// speech. A tag with anything else on its line is left alone: "<red>hi"
+// is colour markup, and "</sarcasm> ok fine" is a person talking.
+static bool
+line_is_bare_markup_tag(const char *line)
+{
+  const char *p = line;
+  const char *name;
+
+  while(isspace((unsigned char)*p)) p++;
+
+  if(*p++ != '<')
+    return(false);
+
+  if(*p == '/')
+    p++;
+
+  if(!isalpha((unsigned char)*p))
+    return(false);
+
+  name = p;
+
+  while(isalnum((unsigned char)*p) || *p == '_' || *p == '-' || *p == ':')
+    p++;
+
+  if(p == name || *p++ != '>')
+    return(false);
+
+  while(isspace((unsigned char)*p)) p++;
+
+  return(*p == '\0');
+}
+
 static void
 send_reply_line(chatbot_req_t *r, const char *line)
 {
@@ -1590,6 +1631,18 @@ send_reply_line(chatbot_req_t *r, const char *line)
     line = clean;
 
     if(line[0] == '\0') return;
+  }
+
+  // A wrapper tag on a line of its own, ahead of the budget for the same
+  // reason the budget runs ahead of everything else: a line that never
+  // reaches the wire must not spend a slot the real line inside the
+  // frame needs.
+  if(line_is_bare_markup_tag(line))
+  {
+    clam(CLAM_WARN, "chatbot",
+        "bot=%s persona=%s: dropped bare markup tag line \"%.40s\"",
+        bot_inst_name(r->st->inst), r->personality_name, line);
+    return;
   }
 
   // The budget, before every gate below. A line the cap refuses never
