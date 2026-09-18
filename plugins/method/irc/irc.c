@@ -2308,11 +2308,18 @@ irc_init_channels(void)
   uint32_t     restored = 0;
 
   // Keys are "bot.<botname>.irc.chan.<channel>.<property>", so the two
-  // segments the group needs are 2 and 5, and DISTINCT collapses however
-  // many properties each channel carries down to the one pair.
+  // segments the group needs are 2 and 5.
+  //
+  // ⚠ Only a channel with an AUTOJOIN row is a configured one. Other
+  // plugins park per-channel knobs under the same prefix and register them
+  // lazily on the first line heard there (urlgrabber.*, image_vision.*),
+  // so a channel the bot was merely `irc join`ed to for one test left rows
+  // behind. Matching any row restored the whole group for it, the group
+  // persisted autojoin=true, and the transient join became permanent —
+  // board #109: botman autojoined 77 channels and hit the server's 405.
   if(db_query("SELECT DISTINCT split_part(key, '.', 2) AS bot, "
       "split_part(key, '.', 5) AS chan FROM kv "
-      "WHERE key LIKE 'bot.%.irc.chan.%'", r) != SUCCESS)
+      "WHERE key LIKE 'bot.%.irc.chan.%.autojoin'", r) != SUCCESS)
   {
     // Indistinguishable from "no channels are configured" unless it says
     // so, and every bot then autojoins nothing for the whole run.
