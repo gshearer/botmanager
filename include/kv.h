@@ -190,6 +190,35 @@ bool kv_get_val_str(const char *key, char *buf, size_t bufsz);
 // Key must already be registered. cb NULL clears.
 bool kv_set_cb(const char *key, kv_cb_t cb, void *cb_data);
 
+// A value an operator may not store, refused while they are still there
+// to be told. kv_cb_t cannot do this: it fires after the write, and it
+// has nobody to reply to. Board #104 is why — a typo'd image model sat
+// in plugin.imagine.default for six days, and the only thing that knew
+// was `show imagine`.
+//
+// Asked by `set kv` and `set bot` before kv_set, and by nothing else:
+// never kv_load (a persisted row may name something registered later in
+// boot), never `--clear` or `--delete` (both are ways OUT of a bad
+// value). So it is an operator-surface check, not a type — a plugin's
+// own kv_set is not stopped by it.
+//
+// Return true to accept. On false, write one line into `why` saying what
+// is wrong with `val`; the setter sees it verbatim after the key. Runs
+// with kv_mutex released, so it may read KV and take its own locks.
+typedef bool (*kv_check_cb_t)(const char *key, const char *val, char *why,
+    size_t why_sz, void *data);
+
+#define KV_CHECK_WHY_SZ 160
+
+// Key must already be registered. check NULL clears. SUCCESS or FAIL.
+bool kv_set_check(const char *key, kv_check_cb_t check, void *check_data);
+
+// Would the key's check accept `val`? True for a key with no check, and
+// for a key that does not exist — refusing an unknown key is kv_set's
+// job, in its own words. `why` is written only on false.
+bool kv_check_value(const char *key, const char *val, char *why,
+    size_t why_sz);
+
 // --- per-bot keys ------------------------------------------------------
 //
 // One bot instance's settings live under a composed key, and the
@@ -427,6 +456,8 @@ typedef struct kv_entry
   kv_val_t         def;      // the declared default, parsed once at registration
   kv_cb_t          cb;
   void            *cb_data;
+  kv_check_cb_t    check;    // set-time refusal, NULL for none (kv_set_check)
+  void            *check_data;
   const char      *help;     // human-readable help (static, may be NULL)
   const void      *owner_pc; // registration call site; identifies the owning object
   bool             dirty;

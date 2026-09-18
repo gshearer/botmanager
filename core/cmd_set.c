@@ -166,6 +166,38 @@ set_kv_delete(const cmd_ctx_t *ctx, const char *key)
   cmd_reply(ctx, buf);
 }
 
+// The assignment both `set kv` and `set bot` end in, so the owner's
+// set-time check (kv_check_value, board #104) cannot be on one door and
+// missing from the other.
+static void
+set_kv_assign(const cmd_ctx_t *ctx, const char *key, const char *val)
+{
+  char why[KV_CHECK_WHY_SZ];
+  char buf[KV_KEY_SZ + KV_STR_SZ + KV_CHECK_WHY_SZ + 32];
+
+  if(!kv_check_value(key, val, why, sizeof(why)))
+  {
+    snprintf(buf, sizeof(buf), "refused %s: %s", key, why);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  if(kv_set(key, val) == SUCCESS)
+  {
+    snprintf(buf, sizeof(buf), "%s = %s", key, val);
+    cmd_reply(ctx, buf);
+    kv_flush();
+    return;
+  }
+
+  if(!kv_exists(key))
+    snprintf(buf, sizeof(buf), "unknown key: %s", key);
+  else
+    snprintf(buf, sizeof(buf), "invalid value for %s", key);
+
+  cmd_reply(ctx, buf);
+}
+
 static void
 cmd_set_kv(const cmd_ctx_t *ctx)
 {
@@ -211,26 +243,7 @@ cmd_set_kv(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(kv_set(key, rest) == SUCCESS)
-  {
-    char buf[KV_KEY_SZ + KV_STR_SZ + 8];
-
-    snprintf(buf, sizeof(buf), "%s = %s", key, rest);
-    cmd_reply(ctx, buf);
-    kv_flush();
-  }
-
-  else
-  {
-    char buf[KV_KEY_SZ + 64];
-
-    if(!kv_exists(key))
-      snprintf(buf, sizeof(buf), "unknown key: %s", key);
-    else
-      snprintf(buf, sizeof(buf), "invalid value for %s", key);
-
-    cmd_reply(ctx, buf);
-  }
+  set_kv_assign(ctx, key, rest);
 }
 
 // /set bot <bot> [<method>] <key> <value>
@@ -525,16 +538,7 @@ cmd_set_bot(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(kv_set(p.key, p.value) != SUCCESS)
-  {
-    snprintf(buf, sizeof(buf), "invalid value for %s", p.key);
-    cmd_reply(ctx, buf);
-    return;
-  }
-
-  snprintf(buf, sizeof(buf), "%s = %s", p.key, p.value);
-  cmd_reply(ctx, buf);
-  kv_flush();
+  set_kv_assign(ctx, p.key, p.value);
 }
 
 // Registration

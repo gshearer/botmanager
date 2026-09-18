@@ -535,6 +535,8 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
   e->def      = val;   // what the declaration said, kept for kv_get_uint_or_default
   e->cb       = cb;
   e->cb_data  = cb_data;
+  e->check      = NULL;
+  e->check_data = NULL;
   e->help     = help_i;
   e->owner_pc = owner_pc;
   e->dirty    = true;   // new entries need DB persistence
@@ -1143,6 +1145,76 @@ kv_set_cb(const char *key, kv_cb_t cb, void *cb_data)
   return(SUCCESS);
 }
 
+// Set or replace the set-time check on an existing KV entry. The pointer
+// lives in the owner's mapping and goes with the entry: kv_reclaim_owned
+// drops both at unload, which is why there is no separate release.
+// returns: SUCCESS or FAIL (key not found)
+bool
+kv_set_check(const char *key, kv_check_cb_t check, void *check_data)
+{
+  kv_entry_t *e;
+
+  if(key == NULL)
+    return(FAIL);
+
+  pthread_mutex_lock(&kv_mutex);
+
+  e = find_locked(key);
+
+  if(e == NULL)
+  {
+    pthread_mutex_unlock(&kv_mutex);
+    return(FAIL);
+  }
+
+  e->check      = check;
+  e->check_data = check_data;
+
+  pthread_mutex_unlock(&kv_mutex);
+  return(SUCCESS);
+}
+
+// Snapshot under the lock and call with it released — the change
+// callback's discipline (apply_val), for the same reasons: the check may
+// read KV, and e->key must not be handed across the unlock.
+bool
+kv_check_value(const char *key, const char *val, char *why, size_t why_sz)
+{
+  char           ekey[KV_KEY_SZ];
+  kv_entry_t    *e;
+  kv_check_cb_t  check;
+  void          *check_data;
+
+  if(key == NULL || val == NULL || why == NULL || why_sz == 0)
+    return(true);
+
+  pthread_mutex_lock(&kv_mutex);
+
+  e = find_locked(key);
+
+  if(e == NULL || e->check == NULL)
+  {
+    pthread_mutex_unlock(&kv_mutex);
+    return(true);
+  }
+
+  check      = e->check;
+  check_data = e->check_data;
+  strlcpy(ekey, e->key, sizeof(ekey));
+
+  pthread_mutex_unlock(&kv_mutex);
+
+  why[0] = '\0';
+
+  if(check(ekey, val, why, why_sz, check_data))
+    return(true);
+
+  if(why[0] == '\0')
+    strlcpy(why, "refused by its owner", why_sz);
+
+  return(false);
+}
+
 // Per-bot keys — the one place the "bot.<name>[.<kind>].<suffix>"
 // grammar is written for reading. Its write side is
 // bot_register_driver_kv() / bot_register_method_kv() in core/bot.c,
@@ -1373,6 +1445,8 @@ kv_audit_iterate(kv_audit_cb_t cb, void *data)
     {
       cb(e->key, "cb",      fn_addr(&e->cb), data);
       cb(e->key, "cb_data", e->cb_data,      data);
+      cb(e->key, "check",   fn_addr(&e->check), data);
+      cb(e->key, "check_data", e->check_data, data);
       cb(e->key, "help",    e->help,         data);
     }
 

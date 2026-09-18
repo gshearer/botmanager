@@ -108,6 +108,30 @@ static const plugin_kv_entry_t ask_kv_schema[] = {
 // cookie (register / unregister match on it).
 static const char ask_kv_cookie;
 
+// `set kv` refuses a default that names no registered chat model, the same
+// check imagine makes for its own (board #104). Empty passes: it inherits.
+static bool
+ask_default_check(const char *key, const char *val, char *why,
+    size_t why_sz, void *data)
+{
+  llm_kind_t kind;
+
+  (void)key;
+  (void)data;
+
+  if(val[0] == '\0')
+    return(true);
+
+  // llm_model_kind uses SUCCESS(=false)/FAIL(=true), unlike llm_model_exists.
+  if(llm_model_exists(val) && llm_model_kind(val, &kind) == SUCCESS
+      && kind == LLM_KIND_CHAT)
+    return(true);
+
+  snprintf(why, why_sz, "'%s' is not a registered chat model"
+      " (show llm lists them)", val);
+  return(false);
+}
+
 static void
 ask_kv_bot_cb(const char *botname, void *user)
 {
@@ -127,6 +151,7 @@ ask_kv_bot_cb(const char *botname, void *user)
   snprintf(key, sizeof(key), "bot.%s.ask.default", botname);
   kv_register(key, KV_STR, def, NULL, NULL,
       "Per-bot !ask default model (empty inherits plugin.ask.default)");
+  kv_set_check(key, ask_default_check, NULL);
 
   snprintf(key, sizeof(key), "bot.%s.ask.allow", botname);
   kv_register(key, KV_STR, "*", NULL, NULL,
@@ -181,6 +206,7 @@ ask_kv_proto_cb(const char *botname, const char *protocol, void *user)
   snprintf(key, sizeof(key), "bot.%s.%s.ask.default", botname, protocol);
   kv_register(key, KV_STR, def, NULL, NULL,
       "Per-protocol !ask default model (empty inherits the bot tier)");
+  kv_set_check(key, ask_default_check, NULL);
 
   snprintf(key, sizeof(key), "bot.%s.%s.ask.allow", botname, protocol);
   kv_register(key, KV_STR, "*", NULL, NULL,
@@ -1843,6 +1869,10 @@ ask_cmd_init(void)
   // Grow every bot / bound protocol its own ask.* override tiers. Core
   // back-fills existing bots immediately, so a hot-reload re-attaches the
   // keys. The plugin_desc pointer is the unregister cookie.
+  // The plugin tier came from the descriptor's schema, registered by the
+  // loader before init; the bot and protocol tiers attach in their callbacks.
+  kv_set_check("plugin.ask.default", ask_default_check, NULL);
+
   bot_kv_contributor_register(ask_kv_bot_cb, ask_kv_proto_cb,
       (void *)&ask_kv_cookie);
 

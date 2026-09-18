@@ -76,6 +76,32 @@ static const plugin_kv_entry_t imagine_kv_schema[] = {
 // Stable per-plugin address used as the KV-contributor registration cookie.
 static const char imagine_kv_cookie;
 
+// `set kv` refuses a default that names no registered image model (board
+// #104): 'flux2' sat in plugin.imagine.default for six days behind per-bot
+// overrides, and only `show imagine` knew. Empty passes — it is how the
+// plugin tier ships and how the lower tiers inherit.
+static bool
+imagine_default_check(const char *key, const char *val, char *why,
+    size_t why_sz, void *data)
+{
+  llm_kind_t kind;
+
+  (void)key;
+  (void)data;
+
+  if(val[0] == '\0')
+    return(true);
+
+  // llm_model_kind uses SUCCESS(=false)/FAIL(=true), unlike llm_model_exists.
+  if(llm_model_exists(val) && llm_model_kind(val, &kind) == SUCCESS
+      && kind == LLM_KIND_IMAGE)
+    return(true);
+
+  snprintf(why, why_sz, "'%s' is not a registered image model"
+      " (show llm lists them)", val);
+  return(false);
+}
+
 static void
 imagine_kv_bot_cb(const char *botname, void *user)
 {
@@ -91,6 +117,7 @@ imagine_kv_bot_cb(const char *botname, void *user)
   snprintf(key, sizeof(key), "bot.%s.imagine.default", botname);
   kv_register(key, KV_STR, def, NULL, NULL,
       "Per-bot !imagine default model (empty inherits plugin.imagine.default)");
+  kv_set_check(key, imagine_default_check, NULL);
 
   snprintf(key, sizeof(key), "bot.%s.imagine.allow", botname);
   kv_register(key, KV_STR, "*", NULL, NULL,
@@ -120,6 +147,7 @@ imagine_kv_method_cb(const char *botname, const char *method_kind, void *user)
   snprintf(key, sizeof(key), "bot.%s.%s.imagine.default", botname, method_kind);
   kv_register(key, KV_STR, def, NULL, NULL,
       "Per-method !imagine default model (empty inherits the bot tier)");
+  kv_set_check(key, imagine_default_check, NULL);
 
   snprintf(key, sizeof(key), "bot.%s.%s.imagine.allow", botname, method_kind);
   kv_register(key, KV_STR, "*", NULL, NULL,
@@ -1470,6 +1498,10 @@ imagine_cmd_init(void)
     cmd_unregister_path("show/imagine");
     return(FAIL);
   }
+
+  // The plugin tier came from the descriptor's schema, registered by the
+  // loader before init; the bot and method tiers attach in their callbacks.
+  kv_set_check("plugin.imagine.default", imagine_default_check, NULL);
 
   bot_kv_contributor_register(imagine_kv_bot_cb, imagine_kv_method_cb,
       (void *)&imagine_kv_cookie);
