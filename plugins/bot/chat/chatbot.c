@@ -193,7 +193,8 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     "Concurrent LLM reply cap for this bot", NULL },
   { "behavior.mute_until", KV_UINT32, "0",
     "Epoch seconds until which this bot is muted (0 = not muted)."
-    " Set via /hush, cleared by /unmute or when the deadline passes."
+    " Set via /hush, which only ever mutes the bot running it; clears"
+    " itself when the deadline passes, or set it to 0 to lift it early."
     " Enforced by chatbot_mute_active on the reply, volunteer and soul"
     " paths.", NULL, &behavior_mute_until_nl },
   { "behavior.soul.interval_secs", KV_UINT32, "60",
