@@ -781,6 +781,45 @@ nl_bridge_refuse(const chatbot_req_t *r)
       line != NULL ? line : CHATBOT_NL_DENIED_TEXT);
 }
 
+// The three pure gates a bridged command passes before it may dispatch:
+// it exists, it can be driven by language, and this bot may drive it.
+// One home, because llm_done asks the same question before the bridge
+// runs — whether this turn's command will be answered by a relay turn —
+// and an answer that drifted from the bridge's own would drop a reply's
+// prose over a command that then never ran. cmd_permits is not here: it
+// needs the synthetic message, and a denial speaks for itself anyway.
+typedef enum
+{
+  NL_VET_OK,
+  NL_VET_UNREGISTERED,
+  NL_VET_NOT_NL,
+  NL_VET_NOT_ALLOWED,
+} nl_vet_t;
+
+static nl_vet_t
+nl_bridge_vet(const chatbot_req_t *r, const char *cmd,
+    const cmd_def_t **def_out, const cmd_nl_t **nl_out)
+{
+  const cmd_def_t *def = cmd_find(cmd);
+  const cmd_nl_t  *nl;
+
+  if(def == NULL)
+    return(NL_VET_UNREGISTERED);
+
+  nl = cmd_get_nl(def);
+
+  if(nl == NULL)
+    return(NL_VET_NOT_NL);
+
+  if(!nl_bridge_list_permits(r->nl_bridge_cmds, cmd))
+    return(NL_VET_NOT_ALLOWED);
+
+  if(def_out != NULL) *def_out = def;
+  if(nl_out  != NULL) *nl_out  = nl;
+
+  return(NL_VET_OK);
+}
+
 static void
 reply_nl_bridge(chatbot_req_t *r, const char *text)
 {
@@ -830,30 +869,26 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   // model's whole reply was a guessed phantom command — '/flight' — a
   // silent drop leaves a directly-addressed user with nothing at all.
   // Same deterministic line as the denied path, same reason.
-  def = cmd_find(cmd);
-
-  if(def == NULL)
+  switch(nl_bridge_vet(r, cmd, &def, &nl))
   {
-    clam(CLAM_DEBUG, "nl_bridge", "'/%s' not registered", cmd);
-    nl_bridge_refuse(r);
-    return;
-  }
+    case NL_VET_OK:
+      break;
 
-  nl = cmd_get_nl(def);
+    case NL_VET_UNREGISTERED:
+      clam(CLAM_DEBUG, "nl_bridge", "'/%s' not registered", cmd);
+      nl_bridge_refuse(r);
+      return;
 
-  if(nl == NULL)
-  {
-    clam(CLAM_DEBUG, "nl_bridge", "'/%s' is not NL-capable", cmd);
-    nl_bridge_refuse(r);
-    return;
-  }
+    case NL_VET_NOT_NL:
+      clam(CLAM_DEBUG, "nl_bridge", "'/%s' is not NL-capable", cmd);
+      nl_bridge_refuse(r);
+      return;
 
-  if(!nl_bridge_list_permits(r->nl_bridge_cmds, cmd))
-  {
-    clam(CLAM_DEBUG, "nl_bridge",
-        "'/%s' not on allowlist ('%s')", cmd, r->nl_bridge_cmds);
-    nl_bridge_refuse(r);
-    return;
+    case NL_VET_NOT_ALLOWED:
+      clam(CLAM_DEBUG, "nl_bridge",
+          "'/%s' not on allowlist ('%s')", cmd, r->nl_bridge_cmds);
+      nl_bridge_refuse(r);
+      return;
   }
 
   prefix = cmd_get_prefix(r->st->inst);
@@ -1740,23 +1775,39 @@ send_reply_line(chatbot_req_t *r, const char *line)
   send_line_marked(r, line, false);
 }
 
-// Streaming delta handler: accumulates text and flushes whole lines
-// via method_send as they complete. Runs on the curl worker thread.
-static void
-llm_chunk(llm_request_t *req, const char *delta, size_t delta_len,
-    void *user)
+// Once the reply is complete: does it carry a command the bridge will
+// dispatch and a relay turn will answer? Then that relay is the answer,
+// and every other line the model wrote around the command is either
+// narration of the call ("I need to investigate that further. Let me
+// check the details.") or an answer given before the command ran. Both
+// reached the wire until board #106 — and, once spoken, came back as the
+// bot's own history turn, which the relay copied into its opening.
+//
+// /kv is excluded: it answers from a template on this turn, so the
+// persona's framing around it is the only voice the answer gets.
+static bool
+reply_carries_relayed_cmd(const chatbot_req_t *r, const char *content,
+    char *cmd, size_t cmd_sz)
 {
-  chatbot_req_t *r;
+  char args[1024];
 
-  (void)req;
-  r = user;
-  if(r == NULL || delta == NULL || delta_len == 0) return;
+  if(!chatbot_nl_extract_cmd(content, cmd, cmd_sz, args, sizeof(args)))
+    return(false);
 
-  // The bot went away mid-stream. Drop the delta on the floor rather
-  // than resolve it into a line: every send path from here reads
-  // r->st->inst for its log context. llm_done frees the record.
-  if(chatbot_hold_disowned(&r->hold)) return;
+  if(strcmp(cmd, "kv") == 0)
+    return(false);
 
+  return(nl_bridge_vet(r, cmd, NULL, NULL) == NL_VET_OK);
+}
+
+// Split text into lines and put each through send_reply_line — what
+// llm_chunk does per delta while streaming, and what llm_done does with
+// a held reply in one call. Advances stream_flushed past every line it
+// sends; a final line with no newline stays in stream_buf for llm_done's
+// tail.
+static void
+stream_feed(chatbot_req_t *r, const char *delta, size_t delta_len)
+{
   for(size_t i = 0; i < delta_len; i++)
   {
     char c = delta[i];
@@ -1790,6 +1841,40 @@ llm_chunk(llm_request_t *req, const char *delta, size_t delta_len,
 
     r->stream_buf[r->stream_pos++] = c;
   }
+}
+
+// A reply is held to stream end when the NL bridge could act on it —
+// armed, and not the interpret cue's own turn (nl_bridge_off). The cost is
+// streaming: an armed bot's lines now leave together when the model
+// finishes, not one by one as it writes (operator ruling, board #106).
+static bool
+reply_bridge_armed(const chatbot_req_t *r)
+{
+  return(!r->nl_bridge_off && r->nl_bridge_cmds[0] != '\0');
+}
+
+// Streaming delta handler: accumulates text and flushes whole lines
+// via method_send as they complete. Runs on the curl worker thread.
+static void
+llm_chunk(llm_request_t *req, const char *delta, size_t delta_len,
+    void *user)
+{
+  chatbot_req_t *r;
+
+  (void)req;
+  r = user;
+  if(r == NULL || delta == NULL || delta_len == 0) return;
+
+  // The bot went away mid-stream. Drop the delta on the floor rather
+  // than resolve it into a line: every send path from here reads
+  // r->st->inst for its log context. llm_done frees the record.
+  if(chatbot_hold_disowned(&r->hold)) return;
+
+  // Held for llm_done, which feeds the whole reply through the same
+  // splitter once it knows whether a command is in it (board #106).
+  if(reply_bridge_armed(r)) return;
+
+  stream_feed(r, delta, delta_len);
 }
 
 // Fold a plain-register completion into the one line the channel gets.
@@ -1946,6 +2031,66 @@ llm_done(const llm_chat_response_t *resp)
 
     req_free(r);
     return;
+  }
+
+  // A held reply (reply_bridge_armed) goes out now, all of it, unless it
+  // carries a command a relay turn will answer — then nothing does. The
+  // slash line itself was never going to reach the wire; the rest is what
+  // #106 put there. Counted and named so a persona that keeps narrating
+  // its calls is visible in the log rather than merely quiet. The plain
+  // register is excluded: it never streamed and has its own one-line
+  // flatten below.
+  if(reply_bridge_armed(r) && !r->vision_plain)
+  {
+    char cmd[64];
+
+    if(reply_carries_relayed_cmd(r, resp->content, cmd, sizeof(cmd)))
+    {
+      const char *first     = "";
+      int         first_len = 0;
+      unsigned    lines     = 0;
+      size_t      cmd_len   = strlen(cmd);
+
+      for(const char *p = resp->content; *p != '\0'; )
+      {
+        const char *eol = strchr(p, '\n');
+        const char *end = (eol != NULL) ? eol : p + strlen(p);
+        const char *q   = p;
+        bool        is_cmd;
+
+        while(q < end && (*q == ' ' || *q == '\t' || *q == '\r')) q++;
+
+        is_cmd = q < end && *q == '/'
+            && strncasecmp(q + 1, cmd, cmd_len) == 0
+            && (q + 1 + cmd_len == end || isspace((unsigned char)q[1 + cmd_len]));
+
+        if(q < end && !is_cmd)
+        {
+          if(lines == 0)
+          {
+            first     = q;
+            first_len = (int)((end - q) < 60 ? (end - q) : 60);
+          }
+
+          lines++;
+        }
+
+        if(eol == NULL) break;
+        p = eol + 1;
+      }
+
+      if(lines > 0)
+        clam(CLAM_WARN, "chatbot",
+            "bot=%s persona=%s: /%s is answered by its relay — dropped %u"
+            " line(s) written around it (first: \"%.*s\")",
+            bot_inst_name(r->st->inst), r->personality_name, cmd, lines,
+            first_len, first);
+
+      r->stream_flushed = resp->content_len;
+    }
+
+    else
+      stream_feed(r, resp->content, resp->content_len);
   }
 
   // Send any tail that llm_chunk didn't flush (final line without a
