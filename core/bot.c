@@ -1150,11 +1150,6 @@ bot_create(const bot_driver_t *drv, const char *name)
     kv_register(key, KV_BOOL, "false", NULL, NULL,
         "Auto-start this bot on launch (true/false)");
 
-    snprintf(key, sizeof(key), "bot.%s.maxidleauth", name);
-    kv_register(key, KV_UINT32, "3600", NULL, NULL,
-        "Seconds a temporary identity survives idle before it "
-        "lazily expires (0=never)");
-
     snprintf(key, sizeof(key), "bot.%s.userdiscovery", name);
     kv_register(key, KV_BOOL, "false", NULL, NULL,
         "Allow anonymous users to discover registered usernames (true/false)");
@@ -1393,9 +1388,10 @@ bot_bind_method(bot_inst_t *inst, const char *method_name,
     char key[KV_KEY_SZ];
     snprintf(key, sizeof(key), "bot.%s.%s.identtimeout",
         inst->name, method_kind);
-    kv_register(key, KV_UINT32, "3600", NULL, NULL,
-        "Seconds before identity cache expires for this method "
-        "(0=use maxidleauth)");
+    kv_register(key, KV_UINT32, "14400", NULL, NULL,
+        "Seconds an !identify login survives on this method with no"
+        " message seen from it; any line it sends resets the clock"
+        " (0=never expires)");
   }
 
   pthread_mutex_unlock(&bot_life_mutex);
@@ -1622,17 +1618,14 @@ bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
   if(meta[0] == '\0')
     return(false);
 
-  // Effective idle window: per-method identtimeout wins, then the
-  // bot-level maxidleauth; 0 = temporary identities never expire.
+  // Idle window: the method's identtimeout, 0 = temporary identities
+  // never expire. No method, no key — and no expiry either.
   {
     const char *kind = (method != NULL) ? method_inst_kind(method) : NULL;
 
     if(kind != NULL)
       timeout = (uint32_t)kv_get_bot_method_uint(inst->name, kind,
           "identtimeout");
-
-    if(timeout == 0)
-      timeout = (uint32_t)kv_get_bot_uint(inst->name, "maxidleauth");
   }
 
   switch(userns_tmfa_resolve(ns, meta, timeout, user, sizeof(user)))
