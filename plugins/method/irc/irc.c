@@ -1693,6 +1693,13 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
       st->server_idx++;  // try next server on reconnect
       method_set_state(st->inst, METHOD_ENABLED);
 
+      // Every roster went with the connection. Kept, it would name
+      // whoever left while we were gone for as long as we stay in the
+      // channel — a rejoin only adds — and the member lists answer
+      // get_context() and !identify presence. Rejoin reads autojoin
+      // from KV, not from this table, and its WHO refills it.
+      irc_chan_clear_all(st);
+
       if(!pool_shutting_down() && !st->shutdown)
       {
         clam(CLAM_INFO, "irc",
@@ -1712,6 +1719,9 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
       st->buf_len = 0;
       st->server_idx++;  // try next server on reconnect
       method_set_state(st->inst, METHOD_ENABLED);
+
+      // As on DISCONNECT: the rosters went with the connection.
+      irc_chan_clear_all(st);
 
       if(!pool_shutting_down() && !st->shutdown)
       {
