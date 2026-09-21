@@ -75,6 +75,62 @@ weather_area_compose(const weathergov_alert_t *a, char *out, size_t sz)
     snprintf(out + len, sz - len, " %s", a->state);
 }
 
+// The provider's answer in the view's own spelling. A switch rather
+// than a cast: the two enums agree value for value today and nothing
+// would say so if either gained a member.
+static weather_prox_t
+weather_prox_of(weathergov_prox_t p)
+{
+  switch(p)
+  {
+    case WEATHERGOV_PROX_OVERHEAD: return(WEATHER_PROX_OVERHEAD);
+    case WEATHERGOV_PROX_NEARBY:   return(WEATHER_PROX_NEARBY);
+    case WEATHERGOV_PROX_ZONE:     break;
+  }
+
+  return(WEATHER_PROX_AREA);
+}
+
+// Whether an alert that is NOT overhead has earned a line saying so.
+//
+// ⭑⭑ The thresholds are the SURFACE's, not the service's. weathergov
+// measures the distance and holds no opinion about it; a shared service
+// holding a policy number for consumers that disagree is the shape
+// `SXNG-COUNT-1` was fixed to remove, and `TASKROUTER.md` carries the
+// rule.
+//
+// ⚠ An alert with no bearing to report cannot be disclosed honestly —
+// the line would read as coverage — so it is declined outright rather
+// than shown without its segment.
+static bool
+weather_alert_nearby_shows(const weathergov_alert_t *a)
+{
+  if(a->bearing[0] == '\0')
+    return(false);
+
+  return(a->distance_km
+          <= (double)kv_get_uint("plugin.weather.alert_nearby_km")
+      && (uint64_t)a->severity
+          >= kv_get_uint("plugin.weather.alert_nearby_severity"));
+}
+
+// "5km NE". Under a kilometre the rounded form would read "0km", which
+// says the opposite of what it measures.
+static void
+weather_near_compose(const weathergov_alert_t *a, char *out, size_t sz)
+{
+  out[0] = '\0';
+
+  if(a->proximity != WEATHERGOV_PROX_NEARBY || a->bearing[0] == '\0')
+    return;
+
+  if(a->distance_km < 1.0)
+    snprintf(out, sz, "<1km %s", a->bearing);
+
+  else
+    snprintf(out, sz, "%.0fkm %s", a->distance_km, a->bearing);
+}
+
 void
 weather_view_from_wxg_alerts(const weathergov_alert_set_t *src,
     weather_view_alert_set_t *out)
@@ -91,12 +147,12 @@ weather_view_from_wxg_alerts(const weathergov_alert_set_t *src,
     weather_view_alert_t     *v = &out->alerts[out->count];
 
     // A NEARBY alert covers the county the location is in but not the
-    // location itself. The view has no way to SAY that yet, and a line
-    // that reads as coverage would be worse than the silence — so the
-    // whole class is dropped here, in one place, and `total` below
-    // counts only what survived. The moment the line can say "not
-    // overhead", this is the filter that comes out.
-    if(a->proximity == WEATHERGOV_PROX_NEARBY)
+    // location itself. It earns a line only when it is close enough and
+    // serious enough to be worth one — a county-scoped query sees every
+    // advisory in the county, and promoting all of them would bury the
+    // one that matters under three that do not.
+    if(a->proximity == WEATHERGOV_PROX_NEARBY
+        && !weather_alert_nearby_shows(a))
       continue;
 
     snprintf(v->event,  sizeof(v->event),  "%s", a->event);
@@ -104,7 +160,9 @@ weather_view_from_wxg_alerts(const weathergov_alert_set_t *src,
     snprintf(v->state,  sizeof(v->state),  "%s", a->state);
 
     weather_area_compose(a, v->area, sizeof(v->area));
+    weather_near_compose(a, v->near, sizeof(v->near));
 
+    v->proximity  = weather_prox_of(a->proximity);
     v->severity   = (uint8_t)a->severity;
     v->area_count = a->area_count;
     v->tz_offset  = a->tz_offset;

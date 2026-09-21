@@ -509,9 +509,15 @@ static void
 weather_alert_compose(char *buf, size_t sz, const weather_view_alert_t *a,
     const char *until, const char *impact, bool short_area)
 {
-  const char *clr   = weather_alert_color(a->severity);
-  const char *glyph = (a->severity >= 3) ? "\xe2\x9a\xa0"   // ⚠
-                                         : "\xe2\x9a\x91";  // ⚑
+  const char *clr = weather_alert_color(a->severity);
+
+  // ⚠ means it is over YOU. A not-overhead alert takes ⚑ whatever its
+  // severity, so the glyph carries the one distinction this line exists
+  // to make — and severity still picks the colour, so a tornado warning
+  // five kilometres away is a red ⚑, not a grey one.
+  const char *glyph = (a->severity >= 3
+      && a->proximity != WEATHER_PROX_NEARBY) ? "\xe2\x9a\xa0"   // ⚠
+                                              : "\xe2\x9a\x91";  // ⚑
   char   area[96];
   size_t len;
 
@@ -535,6 +541,18 @@ weather_alert_compose(char *buf, size_t sz, const weather_view_alert_t *a,
       return;
   }
 
+  // Where it is, when it is not here. This segment is what keeps the
+  // line a disclosure rather than a claim, so it goes in before the
+  // time and never sheds.
+  if(a->near[0] != '\0')
+  {
+    len += (size_t)snprintf(buf + len, sz - len,
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " %s", a->near);
+
+    if(len >= sz)
+      return;
+  }
+
   if(until[0] != '\0')
   {
     len += (size_t)snprintf(buf + len, sz - len,
@@ -553,8 +571,12 @@ weather_alert_compose(char *buf, size_t sz, const weather_view_alert_t *a,
 //
 // Compose, measure, and shed from the right until it fits: trailing
 // impact items one at a time, then the area detail down to a count. The
-// event, the time and the glyph are never dropped — a truncated alert
-// must still say what it is and when it lifts.
+// event, the time, the glyph and the proximity are never dropped — a
+// truncated alert must still say what it is and when it lifts.
+//
+// ⚠⚠ The proximity segment is not shed-eligible and must not become so.
+// A NEARBY line that loses it reads as coverage, which is exactly the
+// claim this whole class was added to avoid making.
 static void
 weather_alert_line(char *buf, size_t sz, const weather_view_alert_t *a)
 {

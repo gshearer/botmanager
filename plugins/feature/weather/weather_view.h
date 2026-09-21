@@ -32,6 +32,24 @@
 // counts only what the provider dropped.
 #define WEATHER_ALERT_LINES 8
 
+// Where an alert sits relative to the location that was asked about.
+//
+// The view keeps its own spelling of the provider's answer so a
+// renderer never includes a provider header. AREA is 0, which is what a
+// zeroed view reads as and what an OpenWeather alert means: it makes no
+// claim either way.
+//
+// ⚠⚠ NEARBY is the one value that changes what the line may SAY. An
+// alert that covers your county but not your location must never be
+// rendered as coverage — that is the defect this class exists to close,
+// and re-introducing it costs nothing but a dropped segment.
+typedef enum
+{
+  WEATHER_PROX_AREA = 0,
+  WEATHER_PROX_OVERHEAD,
+  WEATHER_PROX_NEARBY
+} weather_prox_t;
+
 // One active alert, already reduced to what a line needs.
 //
 // `area` is print-ready ("Fairfield, Hocking, Pickaway OH", or
@@ -45,15 +63,25 @@ typedef struct
   char    area  [96];
   char    state [WEATHERGOV_STATE_SZ];
   char    impact[128];
+
+  // Print-ready, "5km NE" or "<1km NE". Empty unless `proximity` is
+  // NEARBY, and a NEARBY alert with no bearing to give never reaches
+  // the view at all.
+  char           near[16];
+  weather_prox_t proximity;
+
   uint8_t severity;    // 0 unknown … 4 extreme; mirrors weathergov_severity_t
   uint8_t area_count;
   time_t  until;       // 0 = unknown
   int32_t tz_offset;
 } weather_view_alert_t;
 
-// `total` is every distinct active alert; `count` is how many are
-// carried below. The renderer prints at most WEATHER_ALERT_LINES of
-// them and reports the remainder against `total`.
+// `total` is how many alerts WOULD have been shown given room — never
+// how many the provider mentioned. `count` is how many fit below, and
+// the renderer prints at most WEATHER_ALERT_LINES of them and reports
+// the remainder against `total`. An alert the adapter declined to show
+// is counted in neither: offering to name it is the overflow line's
+// whole contract.
 typedef struct
 {
   uint8_t              count;
@@ -242,6 +270,10 @@ void        weather_reply_forecast_hourly(const cmd_ctx_t *ctx,
 static void weather_area_bare(const char *part, size_t len, char *out,
                 size_t sz);
 static void weather_area_compose(const weathergov_alert_t *a, char *out,
+                size_t sz);
+static weather_prox_t weather_prox_of(weathergov_prox_t p);
+static bool weather_alert_nearby_shows(const weathergov_alert_t *a);
+static void weather_near_compose(const weathergov_alert_t *a, char *out,
                 size_t sz);
 static void weather_cond_abbrev(const char *src, char *out, size_t sz);
 static void weather_day_from_wxg(const weathergov_period_t *day,

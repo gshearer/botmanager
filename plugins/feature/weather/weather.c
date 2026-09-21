@@ -502,6 +502,25 @@ static const cmd_nl_t weather_weather_nl = {
 
 // Plugin lifecycle
 
+// ⭑⭑ The promotion rule for an alert that covers your county but not
+// your location lives HERE, at the surface that answers the question —
+// never in weathergov. The service measures the distance and holds no
+// opinion about which distances are worth a line; a shared service
+// carrying a policy number for consumers that disagree is the shape
+// `SXNG-COUNT-1` was fixed to remove, and `TASKROUTER.md` owns the rule.
+//
+// ⭑ 10 km is not arbitrary: the two ZIPs this was measured against run
+// 1.9 to 7.8 km from their centroid to their own boundary, so roughly a
+// ZIP-width is the honest reach of any claim made from one coordinate.
+static const plugin_kv_entry_t weather_kv_schema[] = {
+  { "plugin.weather.alert_nearby_km",       KV_UINT32, "10",
+    "How far a nearby (not overhead) alert may be and still earn a line; "
+    "0 = never show one" },
+  { "plugin.weather.alert_nearby_severity", KV_UINT8,  "3",
+    "Minimum severity for that line: 1 minor, 2 moderate, 3 severe, "
+    "4 extreme; 0 = any" },
+};
+
 static const cmd_decl_t weather_decl = {
   .module      = WEATHER_CTX,
   .name        = "weather",
@@ -569,8 +588,9 @@ const plugin_desc_t bm_plugin_desc = {
     { .name = "service_weathergov" },
   },
   .requires_count  = 3,
-  .kv_schema       = NULL,
-  .kv_schema_count = 0,
+  .kv_schema       = weather_kv_schema,
+  .kv_schema_count = (uint8_t)(sizeof(weather_kv_schema)
+                               / sizeof(weather_kv_schema[0])),
   .init            = weather_init,
   .start           = NULL,
   .stop            = NULL,
