@@ -225,6 +225,9 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     "Seconds between weather watch sweeps (min 5). The soul tick still"
     " paces the floor: a sweep fires on the first tick after this"
     " cadence elapses.", NULL },
+  { "behavior.soul.weather.nearby_km", KV_UINT32, "10",
+    "How far a bulletin covering their county but NOT their location may "
+    "be and still be announced; 0 = never announce one" },
   { "behavior.soul.weather.min_severity", KV_STR, "severe",
     "Announcement floor: minor, moderate, severe or extreme. Alerts"
     " graded below it are never claimed or spoken; unrecognized values"

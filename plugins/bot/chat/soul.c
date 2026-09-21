@@ -455,6 +455,37 @@ soul_on_seen(const char *bot_name, const method_msg_t *msg)
 
 typedef struct soul_wx_sweep soul_wx_sweep_t;
 
+// Tolerant resolution: a missing provider idles the watch instead of
+// aborting the daemon the way the api-header shims would. Re-resolved
+// on every call — plugin_dlsym_cached NULLs a registered slot when its
+// target unloads, so a latch here would idle the watch permanently,
+// where re-resolving lets a provider loaded later start serving with
+// no chat reload. That NULL is stored by the unload thread, hence
+// RELEASE on the way in and ACQUIRE on the way out: the caller is
+// handed its own copies and calls through those, never the slots.
+typedef bool (*soul_wx_geo_city_fn_t)(const char *, char *, size_t);
+typedef bool (*soul_wx_geo_zip_fn_t)(const char *, double *, double *,
+    char *, size_t);
+typedef bool (*soul_wx_enabled_fn_t)(void);
+// ⚠ The first parameter scopes the query to the point's county and
+// forecast zone; NULL asks about the coordinate alone, which is what
+// this sweep did before the zone form existed. Giving the watch the
+// wider answer is its own chunk — the claim key would otherwise let a
+// "nearby" announcement swallow the same storm arriving overhead.
+typedef async_rc_t (*soul_wx_point_fn_t)(double, double,
+    weathergov_point_cb_t, void *);
+typedef async_rc_t (*soul_wx_alerts_fn_t)(const weathergov_point_t *, double,
+    double, weathergov_alerts_cb_t, void *);
+
+typedef struct
+{
+  soul_wx_geo_city_fn_t geo_city;
+  soul_wx_geo_zip_fn_t  geo_zip;
+  soul_wx_enabled_fn_t  enabled;
+  soul_wx_point_fn_t    point;
+  soul_wx_alerts_fn_t   alerts;
+} soul_wx_api_t;
+
 // One human watching one coordinate. `label` is how the cue names
 // them; the tuple is what a DM delivery targets and what attributes
 // the exchange to their dossier (the dcfc359 rule: the tuple rides
@@ -475,6 +506,12 @@ typedef struct
   double                     lat;
   double                     lon;
   char                       key[32];  // "%.4f,%.4f" — the dedupe identity
+
+  // Leg 1's answer: the grid, and with it the county and forecast zone
+  // that scope the alert query to an AREA. Resolved once per distinct
+  // coordinate, from a 7-day cache in every sweep but the first.
+  weathergov_point_t         point;
+
   soul_wx_watcher_t          watchers[SOUL_WX_WATCHERS_MAX];
   uint8_t                    n_watchers;
   bool                       got;      // callback delivered a result
@@ -494,6 +531,12 @@ struct soul_wx_sweep
   char             bot_name[BOT_NAME_SZ];
   uint32_t         ns_id;
   uint32_t         pending;
+
+  // Snapshotted at scan time so leg 1's completion can submit leg 2
+  // without re-resolving on a curl worker — the copies-not-slots
+  // discipline the resolver's own comment describes.
+  soul_wx_api_t    wx;
+
   uint8_t          n_points;
   soul_wx_point_t  points[SOUL_WX_POINTS_MAX];
 };
@@ -532,37 +575,11 @@ typedef struct
   uint8_t                   n_carriers;
 } soul_wx_uniq_t;
 
-// Tolerant resolution: a missing provider idles the watch instead of
-// aborting the daemon the way the api-header shims would. Re-resolved
-// on every call — plugin_dlsym_cached NULLs a registered slot when its
-// target unloads, so a latch here would idle the watch permanently,
-// where re-resolving lets a provider loaded later start serving with
-// no chat reload. That NULL is stored by the unload thread, hence
-// RELEASE on the way in and ACQUIRE on the way out: the caller is
-// handed its own copies and calls through those, never the slots.
-typedef bool (*soul_wx_geo_city_fn_t)(const char *, char *, size_t);
-typedef bool (*soul_wx_geo_zip_fn_t)(const char *, double *, double *,
-    char *, size_t);
-typedef bool (*soul_wx_enabled_fn_t)(void);
-// ⚠ The first parameter scopes the query to the point's county and
-// forecast zone; NULL asks about the coordinate alone, which is what
-// this sweep did before the zone form existed. Giving the watch the
-// wider answer is its own chunk — the claim key would otherwise let a
-// "nearby" announcement swallow the same storm arriving overhead.
-typedef bool (*soul_wx_alerts_fn_t)(const weathergov_point_t *, double,
-    double, weathergov_alerts_cb_t, void *);
-
-typedef struct
-{
-  soul_wx_geo_city_fn_t geo_city;
-  soul_wx_geo_zip_fn_t  geo_zip;
-  soul_wx_enabled_fn_t  enabled;
-  soul_wx_alerts_fn_t   alerts;
-} soul_wx_api_t;
 
 static soul_wx_geo_city_fn_t soul_wx_geo_city_fn;
 static soul_wx_geo_zip_fn_t  soul_wx_geo_zip_fn;
 static soul_wx_enabled_fn_t  soul_wx_enabled_fn;
+static soul_wx_point_fn_t    soul_wx_point_fn;
 static soul_wx_alerts_fn_t   soul_wx_alerts_fn;
 
 static bool
@@ -571,6 +588,7 @@ soul_wx_resolve(soul_wx_api_t *api)
   union { void *obj; soul_wx_geo_city_fn_t fn; } uc;
   union { void *obj; soul_wx_geo_zip_fn_t  fn; } uz;
   union { void *obj; soul_wx_enabled_fn_t  fn; } ue;
+  union { void *obj; soul_wx_point_fn_t    fn; } up;
   union { void *obj; soul_wx_alerts_fn_t   fn; } ua;
 
   uc.obj = plugin_dlsym_cached("openweather",
@@ -585,6 +603,10 @@ soul_wx_resolve(soul_wx_api_t *api)
       "weathergov_enabled", (void **)&soul_wx_enabled_fn);
   __atomic_store_n(&soul_wx_enabled_fn, ue.fn, __ATOMIC_RELEASE);
 
+  up.obj = plugin_dlsym_cached("weathergov",
+      "weathergov_point_async", (void **)&soul_wx_point_fn);
+  __atomic_store_n(&soul_wx_point_fn, up.fn, __ATOMIC_RELEASE);
+
   ua.obj = plugin_dlsym_cached("weathergov",
       "weathergov_alerts_async", (void **)&soul_wx_alerts_fn);
   __atomic_store_n(&soul_wx_alerts_fn, ua.fn, __ATOMIC_RELEASE);
@@ -592,10 +614,12 @@ soul_wx_resolve(soul_wx_api_t *api)
   api->geo_city = __atomic_load_n(&soul_wx_geo_city_fn, __ATOMIC_ACQUIRE);
   api->geo_zip  = __atomic_load_n(&soul_wx_geo_zip_fn,  __ATOMIC_ACQUIRE);
   api->enabled  = __atomic_load_n(&soul_wx_enabled_fn,  __ATOMIC_ACQUIRE);
+  api->point    = __atomic_load_n(&soul_wx_point_fn,    __ATOMIC_ACQUIRE);
   api->alerts   = __atomic_load_n(&soul_wx_alerts_fn,   __ATOMIC_ACQUIRE);
 
   return(api->geo_city != NULL && api->geo_zip != NULL
-      && api->enabled != NULL && api->alerts != NULL);
+      && api->enabled != NULL && api->point != NULL
+      && api->alerts != NULL);
 }
 
 static weathergov_severity_t
@@ -656,6 +680,20 @@ soul_wx_fmt_until(time_t ts, int32_t tz_offset, char *dst, size_t cap)
 
   snprintf(dst, cap, "%s %d:%02d %s", day, hr, tm.tm_min,
       tm.tm_hour < 12 ? "AM" : "PM");
+}
+
+// "9km NE" — where a bulletin that covers their county but not their
+// own coordinate actually is. Local to this chore on purpose: the
+// !weather surface states the same fact inside a line with its own
+// width budget, and TASKROUTER.md keeps number formatters per-plugin.
+static void
+soul_wx_near(const weathergov_alert_t *a, char *dst, size_t cap)
+{
+  if(a->distance_km < 1.0)
+    snprintf(dst, cap, "under 1km %s", a->bearing);
+
+  else
+    snprintf(dst, cap, "%.0fkm %s", a->distance_km, a->bearing);
 }
 
 // First sentence of the protective-action prose — instruction when
@@ -861,6 +899,7 @@ soul_wx_announce(chatbot_state_t *st, method_inst_t *method,
     const weathergov_alert_t *a  = &pt->result.alerts.alerts[tgt->alerts[i]];
     char                      until[32];
     char                      clause[160];
+    char                      near[24];
     bool                      first = true;
 
     soul_wx_fmt_until(a->ends != 0 ? a->ends : a->expires, a->tz_offset,
@@ -872,6 +911,19 @@ soul_wx_announce(chatbot_state_t *st, method_inst_t *method,
 
     if(a->impact[0] != '\0')
       soul_wx_append(msg.text, sizeof(msg.text), &off, " (%s)", a->impact);
+
+    // ⛔ The one thing this cue must never let the model do is imply
+    // coverage it cannot claim. weather.gov issues life-safety products
+    // as polygons that name a whole county, so a bulletin can be real,
+    // severe, and still not be over the person it names.
+    if(a->proximity == WEATHERGOV_PROX_NEARBY)
+    {
+      soul_wx_near(a, near, sizeof(near));
+
+      soul_wx_append(msg.text, sizeof(msg.text), &off,
+          " — NOT over them: %s away. Say it is nearby; do not say they"
+          " are in it", near);
+    }
 
     if(clause[0] != '\0')
       soul_wx_append(msg.text, sizeof(msg.text), &off, ". %s", clause);
@@ -941,6 +993,7 @@ soul_wx_batch_task(task_t *t)
   chatbot_state_t       *st       = NULL;
   method_inst_t         *method   = NULL;
   weathergov_severity_t  floor;
+  uint64_t               reach_km;
   uint32_t               held     = 0;
   uint32_t               quiet    = 0;
   time_t                 now      = time(NULL);
@@ -968,7 +1021,9 @@ soul_wx_batch_task(task_t *t)
     // the cue's own wording all read watcher->channel.
     soul_wx_resolve_rooms(sweep, method);
 
-    floor = soul_wx_severity_floor(sweep->bot_name);
+    floor    = soul_wx_severity_floor(sweep->bot_name);
+    reach_km = kv_get_bot_uint(sweep->bot_name,
+        "behavior.soul.weather.nearby_km");
 
     // Pass 1 — collect the sweep's DISTINCT alerts (by CAP id) across
     // every covered point, remembering each carrying point. See
@@ -999,6 +1054,16 @@ soul_wx_batch_task(task_t *t)
         soul_wx_uniq_t           *u = NULL;
 
         if(a->severity < floor)
+          continue;
+
+        // A bulletin covering their county but not where they are is
+        // worth an UNPROMPTED word only while it is close. The reach is
+        // this chore's own: !weather answers a question that was asked
+        // and reads its own knob, this one interrupts a channel, and
+        // neither may read the other's — the two surfaces disagree by
+        // design rather than by accident.
+        if(a->proximity == WEATHERGOV_PROX_NEARBY
+            && (reach_km == 0 || a->distance_km > (double)reach_km))
           continue;
 
         for(uint8_t k = 0; k < n_uniq; k++)
@@ -1183,6 +1248,40 @@ soul_wx_fetch_cb(const weathergov_alert_result_t *res, void *user)
     soul_wx_sweep_finish(pt->sweep);
 }
 
+// Leg 1's completion: take the zone codes and hand straight on to the
+// alerts leg. Same soil as above — do the least possible here.
+//
+// ⚠⚠ On a warm point cache this runs BEFORE the submit call returns,
+// so it is re-entrant with the fan-out loop below. What makes that
+// safe is that it touches only its own point and the sweep's atomic,
+// and that every point still contributes exactly ONE decrement however
+// far down the chain it stops.
+//
+// A point that is not covered simply has no zone to ask about, which
+// is the ordinary non-US answer; its error, if there was a real one,
+// rides the result so the batch task's existing log line still finds
+// it.
+static void
+soul_wx_point_cb(const weathergov_point_result_t *res, void *user)
+{
+  soul_wx_point_t *pt = user;
+
+  if(res->err[0] == '\0' && res->covered)
+  {
+    pt->point = res->point;
+
+    if(pt->sweep->wx.alerts(&pt->point, pt->lat, pt->lon, soul_wx_fetch_cb,
+        pt) == SUCCESS)
+      return;
+  }
+
+  else if(res->err[0] != '\0')
+    strlcpy(pt->result.err, res->err, sizeof(pt->result.err));
+
+  if(__atomic_sub_fetch(&pt->sweep->pending, 1, __ATOMIC_ACQ_REL) == 0)
+    soul_wx_sweep_finish(pt->sweep);
+}
+
 // The chore body: scan, geocode, dedupe, fan out. Runs on the tick's
 // worker thread (TASK_THREAD — the sync geocoders demand a worker,
 // fact 9). Returns true once the sweep is airborne: from that moment
@@ -1195,6 +1294,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   db_result_t     *res;
   soul_wx_api_t    wx;
   uint32_t         rows;
+  uint8_t          n_points;
   char             sql[1024];
 
   (void)st;
@@ -1368,13 +1468,24 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   // callback will never fire. After the first successful submit the
   // sweep may be freed at any moment by the completion path; the
   // atomic is the only field this loop may still touch.
+  sweep->wx      = wx;
   sweep->pending = sweep->n_points;
 
-  for(uint8_t p = 0; p < sweep->n_points; p++)
+  // ⚠⚠ `n` is a COPY on purpose. `pending` can only reach zero on the
+  // last iteration, but when it does the sweep is handed to a task that
+  // may free it before this loop re-tests its condition — and the loop
+  // condition is a read of the sweep like any other.
+  n_points = sweep->n_points;
+
+  for(uint8_t p = 0; p < n_points; p++)
   {
     soul_wx_point_t *pt = &sweep->points[p];
 
-    if(wx.alerts(NULL, pt->lat, pt->lon, soul_wx_fetch_cb, pt) == SUCCESS)
+    // Leg 1 of two: the grid, and the county and forecast zone that
+    // scope leg 2 to the AREA this person is in rather than to the one
+    // coordinate they geocoded to. A warm cache answers from inside
+    // this call, which is why soul_wx_point_cb must be re-entrant here.
+    if(wx.point(pt->lat, pt->lon, soul_wx_point_cb, pt) == SUCCESS)
       continue;
 
     if(__atomic_sub_fetch(&sweep->pending, 1, __ATOMIC_ACQ_REL) == 0)
