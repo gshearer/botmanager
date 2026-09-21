@@ -30,14 +30,18 @@
 // them per cache entry costs four times what the grid triple does.
 #define WXG_POINTS_URL  "https://api.weather.gov/points"
 
-// Alerts take the coordinate directly — no grid, no point lookup, no
-// prior call. ⚠ `?limit=` is rejected by the endpoint (400): the whole
-// active set arrives or nothing does.
+// Alerts take either a raw coordinate (`?point=`) or a zone list
+// (`?zone=`), and the zone form is what lets a caller ask about an AREA
+// — it needs the county and forecast codes a /points lookup carries.
+// ⚠ `?limit=` is rejected by the endpoint (400): the whole active set
+// arrives or nothing does. ⚠ An unknown zone code is also a 400, which
+// this plugin reads as "not covered" and falls through on.
 #define WXG_ALERTS_URL  "https://api.weather.gov/alerts/active"
 
 // Everything keyed on a forecast grid hangs off here: the 14-period
 // forecast (WX-3), the 156-period hourly one and the raw 59-parameter
-// timeseries (neither of which we ask for — root TODO §WX-NOTPLANNED).
+// timeseries. We ask for neither of the last two, by decision —
+// `plugins/feature/weather/AGENTS.md §Two standing decisions`.
 #define WXG_GRID_URL    "https://api.weather.gov/gridpoints"
 
 // An observation is addressed by station, and a station is found by
@@ -49,6 +53,12 @@
 // point-cache key. Longer forms answer 301 with the rounded one, which
 // costs a round trip and a cache key that never matches.
 #define WXG_COORD_SZ    32
+
+// "OHC165,OHZ071" — the county and forecast zone an alert query is
+// scoped by, as both the URL tail and the log label. ⚠ The comma form
+// is the UNION of the two; `&zone=` repeated keeps only the LAST one
+// (measured 2026-09-20) and fails silently.
+#define WXG_ZONES_SZ    20
 
 // A forecast is addressed by grid rather than by coordinate, so
 // "ILN/39,49" is what its log lines and its cache key would name.
@@ -107,6 +117,7 @@ typedef struct wxg_request
   double              lat;
   double              lon;
   char                coord[WXG_COORD_SZ];   // rounded, "%.4f,%.4f"
+  char                zones[WXG_ZONES_SZ];   // "" when asking by coordinate
   char                grid[WXG_GRID_LABEL_SZ]; // "ILN/39,49" — grid requests
   char                units[4];                // "us" | "si" — grid requests
   char                station[WEATHERGOV_STATION_SZ];  // current chain, leg 2
@@ -250,6 +261,8 @@ static bool  wxg_labels_add(wxg_alert_labels_t *seen,
 static void  wxg_alert_set_insert(weathergov_alert_set_t *set,
                  const weathergov_alert_t *a);
 
+static void  wxg_zones_build(const weathergov_point_t *pt, char *out,
+                 size_t sz);
 static void  wxg_alerts_deliver(wxg_request_t *r);
 static void  wxg_alerts_done(const curl_response_t *resp);
 
@@ -291,6 +304,44 @@ static void    wxg_forecast_deliver(wxg_request_t *r);
 static void    wxg_forecast_done(const curl_response_t *resp);
 
 #endif // WXG_FORECAST_TU
+
+// ----------------------------------------------------------------------
+// Alert geometry — weathergov_geo.c
+// ----------------------------------------------------------------------
+//
+// A pure function of its arguments — no KV, no curl, no module state —
+// which is why it is its own translation unit and why `tests/` can
+// compile it directly. It is also the one place in this plugin where
+// being wrong is SILENT: a bad answer here reaches a channel as an
+// alert class nobody flagged, spelled correctly.
+
+// The outer ring of an alert's footprint, or NULL when it carries none.
+// ⚠ NULL is the ZONE case — every county/zone bulletin arrives that way
+// — and is never a parse failure.
+struct json_object *wxg_ring_first(struct json_object *feat);
+
+// Even-odd ray cast, in degrees. `ring` must come from wxg_ring_first:
+// three vertices is the invariant that makes the wrap-around safe.
+bool wxg_point_in_ring(struct json_object *ring, double lon, double lat);
+
+// Kilometres to the nearest edge of `ring`, and the compass direction
+// it lies in. `bearing` is "" when the ring yielded no usable edge.
+void wxg_ring_nearest(struct json_object *ring, double lon, double lat,
+         double *km_out, char *bearing, size_t bearing_sz);
+
+// Classify one alert FEATURE — not its `properties` — against the
+// coordinate that was asked about, filling `proximity`, `distance_km`
+// and `bearing`. The rest of `out` is untouched.
+void wxg_alert_locate(struct json_object *feat, double lat, double lon,
+         weathergov_alert_t *out);
+
+#ifdef WXG_GEO_TU
+
+static bool    wxg_ring_vertex(struct json_object *ring, size_t i,
+                   double *lon, double *lat);
+static uint8_t wxg_compass_idx(double east, double north);
+
+#endif // WXG_GEO_TU
 
 // ----------------------------------------------------------------------
 // Current conditions — weathergov_obs.c
@@ -394,6 +445,11 @@ static void               wxg_unmap_cb(uintptr_t lo, uintptr_t hi,
                               void *data);
 
 // Point resolution.
+// The last path segment of a zone URL — ".../zones/county/OHC165" is
+// handed to us whole and only the code is wanted.
+static void               wxg_ugc_tail(const char *url, char *out,
+                              size_t sz);
+
 static wxg_pointcache_t  *wxg_point_lookup(const char *coord);
 static void               wxg_point_insert(const char *coord, bool covered,
                               const weathergov_point_t *pt);

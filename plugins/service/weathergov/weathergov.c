@@ -317,6 +317,21 @@ wxg_parse_iso8601(const char *s, int32_t *tz_off_out)
 
 // returns: cache entry if found and not expired, NULL otherwise.
 //          expired entries are freed. must be called under lock.
+// "https://api.weather.gov/zones/county/OHC165" -> "OHC165". A code
+// that will not fit is dropped rather than truncated: a short UGC is a
+// DIFFERENT zone, not a shorter one, and "" simply sends the alerts leg
+// back to asking by coordinate.
+static void
+wxg_ugc_tail(const char *url, char *out, size_t sz)
+{
+  const char *tail = strrchr(url, '/');
+
+  tail = (tail != NULL) ? tail + 1 : url;
+
+  if(strlcpy(out, tail, sz) >= sz)
+    out[0] = '\0';
+}
+
 static wxg_pointcache_t *
 wxg_point_lookup(const char *coord)
 {
@@ -403,6 +418,7 @@ wxg_point_parse(struct json_object *root, weathergov_point_t *out)
   struct json_object *astro;
   struct json_object *rel;
   char state[8];
+  char url[128];
 
   props = json_get_obj(root, "properties");
 
@@ -415,6 +431,14 @@ wxg_point_parse(struct json_object *root, weathergov_point_t *out)
     return(FAIL);
 
   json_get_str(props, "timeZone", out->tz, sizeof(out->tz));
+
+  // The zone vocabulary, free with the grid. Absent is not an error —
+  // the alerts leg then asks about the coordinate, as it always did.
+  if(json_get_str(props, "county", url, sizeof(url)))
+    wxg_ugc_tail(url, out->county, sizeof(out->county));
+
+  if(json_get_str(props, "forecastZone", url, sizeof(url)))
+    wxg_ugc_tail(url, out->zone, sizeof(out->zone));
 
   // relativeLocation is a GeoJSON feature: the city and state sit one
   // level down, under its own `properties`.

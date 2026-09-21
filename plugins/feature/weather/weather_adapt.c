@@ -83,13 +83,21 @@ weather_view_from_wxg_alerts(const weathergov_alert_set_t *src,
 
   memset(out, 0, sizeof(*out));
 
-  out->total = src->total;
-
   for(i = 0; i < src->count
-      && i < (uint8_t)(sizeof(out->alerts) / sizeof(out->alerts[0])); i++)
+      && out->count < (uint8_t)(sizeof(out->alerts) / sizeof(out->alerts[0]));
+      i++)
   {
     const weathergov_alert_t *a = &src->alerts[i];
-    weather_view_alert_t     *v = &out->alerts[i];
+    weather_view_alert_t     *v = &out->alerts[out->count];
+
+    // A NEARBY alert covers the county the location is in but not the
+    // location itself. The view has no way to SAY that yet, and a line
+    // that reads as coverage would be worse than the silence — so the
+    // whole class is dropped here, in one place, and `total` below
+    // counts only what survived. The moment the line can say "not
+    // overhead", this is the filter that comes out.
+    if(a->proximity == WEATHERGOV_PROX_NEARBY)
+      continue;
 
     snprintf(v->event,  sizeof(v->event),  "%s", a->event);
     snprintf(v->impact, sizeof(v->impact), "%s", a->impact);
@@ -107,6 +115,12 @@ weather_view_from_wxg_alerts(const weathergov_alert_set_t *src,
 
     out->count++;
   }
+
+  // `total` is what the renderer's overflow line counts against, so it
+  // means "alerts we would have shown given room" — never "alerts the
+  // provider mentioned". It can only differ from `count` once more than
+  // WEATHER_ALERT_LINES of them apply at once.
+  out->total = out->count;
 }
 
 // OpenWeather carries the product name and nothing else — no area, no
@@ -223,7 +237,7 @@ weather_cond_abbrev(const char *src, char *out, size_t sz)
 //
 // `kelvin` is 273.15 when the operator asked for absolute temperatures
 // and 0 otherwise — weather.gov has no Kelvin option, so the conversion
-// is ours (root TODO §WX-DESIGN §5).
+// is ours.
 static void
 weather_day_from_wxg(const weathergov_period_t *day,
     const weathergov_period_t *night, double kelvin, weather_view_day_t *out)

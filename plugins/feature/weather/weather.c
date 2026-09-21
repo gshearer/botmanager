@@ -201,7 +201,7 @@ weather_dispatch_openweather(weather_req_t *r)
 // weather.gov negotiates units server-side, in two flavours where our
 // own knob has three. There is no Kelvin upstream at all, so "standard"
 // asks for Celsius and the adapter adds the 273.15 — the one unit
-// conversion this feature owns (root TODO §WX-DESIGN §5).
+// conversion this feature owns.
 static const char *
 weather_units_wxg(const char *kv)
 {
@@ -275,20 +275,22 @@ weather_current_done(const weathergov_current_result_t *res, void *user)
   mem_free(r);
 }
 
-// Leg B, and the fork: the forecast grid this coordinate sits in. Alerts
-// took raw coordinates, but every gridpoint URL is built from the
-// office/x/y triple, so both views need this one lookup first — from the
-// point cache in every case but the first (7 days, and a grid does not
-// move).
+// Leg A of the chain, and weather.gov's verdict on whether this
+// coordinate is American at all: the forecast grid it sits in, plus the
+// county and forecast zone that arrive with it.
 //
-// The point is kept rather than consumed: it carries the sunrise and
-// sunset the current view prints, at no further cost.
+// It runs FIRST because the alerts leg is scoped by those two codes — a
+// query about an AREA has to name which area, and a bare coordinate
+// cannot. On a warm cache it costs nothing: a grid does not move, the
+// entry lives seven days, and an out-of-coverage answer is cached too.
+//
+// The point is kept rather than consumed: every gridpoint URL is built
+// from the office/x/y triple, and it carries the sunrise and sunset the
+// current view prints, at no further cost.
 static void
 weather_point_done(const weathergov_point_result_t *res, void *user)
 {
   weather_req_t *r = (weather_req_t *)user;
-  const char *units = weather_units_wxg(openweather_units_kv_value());
-  bool submitted;
 
   if(res->err[0] != '\0' || !res->covered)
   {
@@ -301,45 +303,46 @@ weather_point_done(const weathergov_point_result_t *res, void *user)
 
   r->point = res->point;
 
-  // Only ASYNC_FAILED_UNDELIVERED leaves the request ours to hand on to
-  // openweather — never a reply and never a free.
-  if(r->kind == WEATHER_REQ_CURRENT)
-    submitted = (weathergov_current_async(&res->point, units,
-        weather_current_done, r) != ASYNC_FAILED_UNDELIVERED);
-  else
-    submitted = (weathergov_forecast_async(&res->point, units,
-        weather_forecast_done, r) != ASYNC_FAILED_UNDELIVERED);
+  clam(CLAM_DEBUG, WEATHER_CTX, "route %s: us=yes zone=%s/%s", r->loc.zip,
+      r->point.county[0] != '\0' ? r->point.county : "-",
+      r->point.zone[0] != '\0' ? r->point.zone : "-");
 
-  if(submitted)
+  // A FAIL here means the callback did NOT fire, so the request is
+  // still ours to hand on — never a reply and never a free.
+  if(weathergov_alerts_async(&r->point, r->loc.lat, r->loc.lon,
+      weather_alerts_done, r) != ASYNC_FAILED_UNDELIVERED)
     return;
 
-  clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the "
-      "conditions leg", r->loc.zip);
+  clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the alerts "
+      "leg", r->loc.zip);
 
   weather_dispatch_openweather(r);
 }
 
-// Leg A of the chain: weather.gov's alerts, and with them its verdict
-// on whether this coordinate is American at all. Runs on the curl multi
-// worker, and hands straight on to leg B — openweather, for the
-// conditions — without a join, because both completions land on that
-// same single thread and a concurrent fetch would only be theatre.
+// Leg B: every alert covering the area leg A named. Runs on the curl
+// multi worker and hands straight on to the conditions leg without a
+// join, because both completions land on that same single thread and a
+// concurrent fetch would only be theatre.
 //
-// EVERY failure here is soft. Timeout, non-2xx, unparseable, uncovered:
-// all of them leave `have_alerts` false and openweather's own alert
-// path switched on, which is exactly the behaviour that shipped before
-// weather.gov existed. An outage must degrade !weather, never break it.
+// EVERY failure here is soft. Timeout, non-2xx, unparseable, a zone the
+// endpoint will not take: all of them leave `have_alerts` false and
+// openweather's own alert path switched on, which is exactly the
+// behaviour that shipped before weather.gov existed. An outage must
+// degrade !weather, never break it.
 static void
 weather_alerts_done(const weathergov_alert_result_t *res, void *user)
 {
   weather_req_t *r = (weather_req_t *)user;
+  const char *units = weather_units_wxg(openweather_units_kv_value());
+  bool submitted;
 
   if(res->err[0] != '\0')
     clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov unavailable (%s)",
         r->loc.zip, res->err);
 
   else if(!res->covered)
-    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: us=no", r->loc.zip);
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: the alerts endpoint refused "
+        "the area", r->loc.zip);
 
   else
   {
@@ -348,25 +351,32 @@ weather_alerts_done(const weathergov_alert_result_t *res, void *user)
     weather_view_from_wxg_alerts(&res->alerts, &r->alerts);
     r->have_alerts = true;
 
-    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: us=yes alerts=%u (%u carried)",
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: alerts=%u (%u carried)",
         r->loc.zip, res->alerts.total, res->alerts.count);
   }
 
-  // A covered coordinate is the only thing that earns the legs below:
-  // the current and daily views are the two weather.gov answers better
-  // than OpenWeather in every column that matters, and `have_alerts` is
-  // already the coverage verdict — there is no second coverage test.
-  // Everything else — the hourly view, and every failure downstream of
-  // here — goes to openweather.
+  // ⛔ Holding no alert set, openweather must answer the WHOLE request:
+  // it is the only leg that would then fetch alerts at all, and a
+  // weather.gov conditions answer with an empty set would render a
+  // storm as a quiet sky. The hourly view is openweather's by decision
+  // either way.
   if(r->have_alerts && (r->kind == WEATHER_REQ_FORECAST_DAILY
       || r->kind == WEATHER_REQ_CURRENT))
   {
-    if(weathergov_point_async(r->loc.lat, r->loc.lon,
-        weather_point_done, r) != ASYNC_FAILED_UNDELIVERED)
+    // Only ASYNC_FAILED_UNDELIVERED leaves the request ours to hand on
+    // to openweather — never a reply and never a free.
+    if(r->kind == WEATHER_REQ_CURRENT)
+      submitted = (weathergov_current_async(&r->point, units,
+          weather_current_done, r) != ASYNC_FAILED_UNDELIVERED);
+    else
+      submitted = (weathergov_forecast_async(&r->point, units,
+          weather_forecast_done, r) != ASYNC_FAILED_UNDELIVERED);
+
+    if(submitted)
       return;
 
-    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the point "
-        "leg", r->loc.zip);
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the "
+        "conditions leg", r->loc.zip);
   }
 
   weather_dispatch_openweather(r);
@@ -437,13 +447,16 @@ weather_cmd_weather(const cmd_ctx_t *ctx)
     clam(CLAM_DEBUG, WEATHER_CTX, "route %s (%.4f,%.4f): asking weathergov",
         loc.zip, loc.lat, loc.lon);
 
-    // A FAIL here means the callback did NOT fire, so the request is
-    // still ours to hand on — never a reply and never a free.
-    if(weathergov_alerts_async(loc.lat, loc.lon,
-        weather_alerts_done, r) != ASYNC_FAILED_UNDELIVERED)
+    // ⚠⚠ On a warm point cache this callback fires BEFORE the call
+    // returns, so `r` may already be freed by the time it does — which
+    // is why nothing after it reads `r`. A FAIL means the callback did
+    // NOT fire, and the request is then still ours to hand on: never a
+    // reply and never a free.
+    if(weathergov_point_async(loc.lat, loc.lon,
+        weather_point_done, r) != ASYNC_FAILED_UNDELIVERED)
       return;
 
-    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the alerts "
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the point "
         "leg", loc.zip);
   }
 

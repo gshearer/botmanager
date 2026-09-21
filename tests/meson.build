@@ -462,6 +462,19 @@ test_gemini_ws_channels = executable('test_gemini_ws_channels',
   dependencies : core_deps,
 )
 
+# The alert geometry is a pure function of its arguments — no KV, no
+# curl, no module state — which is the whole reason it is its own
+# translation unit, and it is the one layer in that plugin whose wrong
+# answer reaches a channel without a log line.
+test_wxg_geo = executable('test_wxg_geo',
+  'test_wxg_geo.c',
+  '../plugins/service/weathergov/weathergov_geo.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/service/weathergov')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps + [m_dep],
+)
+
 test_coinbase_ws_channels = executable('test_coinbase_ws_channels',
   'test_coinbase_ws_channels.c',
   '../plugins/service/coinbase/coinbase_ws_channels.c',
@@ -631,6 +644,7 @@ test('kraken_ws_channels', test_kraken_ws_channels)
 test('wikimedia_parse', test_wikimedia_parse)
 test('gemini_ws_channels', test_gemini_ws_channels)
 test('coinbase_ws_channels', test_coinbase_ws_channels)
+test('wxg_geo', test_wxg_geo)
 test('exchange_ws_gen', test_exchange_ws_gen)
 test('exchange_watch', test_exchange_watch)
 test('exchange_vt_race', test_exchange_vt_race)

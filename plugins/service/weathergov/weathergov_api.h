@@ -36,6 +36,7 @@
 #define WEATHERGOV_GRID_SZ      8    // "ILN"
 #define WEATHERGOV_PLACE_SZ     64   // "Olde West Chester, OH"
 #define WEATHERGOV_TZ_SZ        48   // "America/New_York"
+#define WEATHERGOV_UGC_SZ       8    // UGC zone code, "OHC165" — 6 + NUL
 
 #define WEATHERGOV_ID_SZ        200  // urn:oid:… measured 96
 #define WEATHERGOV_EVENT_SZ     64   // "Severe Thunderstorm Warning" = 27
@@ -65,6 +66,15 @@ typedef struct
   char    grid_id[WEATHERGOV_GRID_SZ];   // "ILN"
   int32_t grid_x;
   int32_t grid_y;
+
+  // The two UGC codes this coordinate sits in: its county zone and its
+  // public forecast zone. They are what lets an alert query name an
+  // AREA instead of this one point. Either may be "" when the response
+  // omits it, and that is not an error — it means the alerts leg asks
+  // by coordinate, exactly as it did before they existed.
+  char    county[WEATHERGOV_UGC_SZ];     // "OHC165"
+  char    zone[WEATHERGOV_UGC_SZ];       // "OHZ071"
+
   char    place[WEATHERGOV_PLACE_SZ];    // "Olde West Chester, OH"
   char    tz[WEATHERGOV_TZ_SZ];          // IANA name, informational only
   int32_t tz_offset;                     // seconds east of UTC
@@ -131,6 +141,28 @@ typedef enum
   WEATHERGOV_CRT_POSSIBLE, WEATHERGOV_CRT_LIKELY, WEATHERGOV_CRT_OBSERVED
 } weathergov_certainty_t;
 
+// Where an alert sits relative to the coordinate that was asked about.
+//
+// ⚠⚠ weather.gov answers at two resolutions in one response and the
+// difference is invisible in the payload: a zone product (Flood Watch,
+// Beach Hazards Statement) carries no geometry and covers its whole UGC
+// list, while a storm-based product (Tornado / Severe Thunderstorm
+// Warning, Flood Advisory, Special Weather Statement) carries a polygon
+// and covers only what is inside it — even though its `areaDesc` and
+// `geocode.UGC` still name the whole county.
+//
+// ZONE is 0 so a zeroed alert reads as the answer a coordinate query
+// always gave. NEARBY exists only because a query can now name an area:
+// it means the bulletin covers your county but its polygon excludes
+// your coordinate, and it is precisely the class a coordinate query
+// never returned at all.
+typedef enum
+{
+  WEATHERGOV_PROX_ZONE = 0,
+  WEATHERGOV_PROX_OVERHEAD,
+  WEATHERGOV_PROX_NEARBY
+} weathergov_prox_t;
+
 // One active alert.
 //
 // `impact` is assembled here rather than by the caller because it is a
@@ -157,6 +189,9 @@ typedef struct
   weathergov_severity_t   severity;
   weathergov_urgency_t    urgency;
   weathergov_certainty_t  certainty;
+  weathergov_prox_t       proximity;
+  double                  distance_km;  // nearest polygon edge; 0 unless NEARBY
+  char                    bearing[4];   // "NE"; "" unless NEARBY
   time_t                  onset;
   time_t                  ends;      // 0 when null upstream — fall back to expires
   time_t                  expires;
@@ -293,7 +328,7 @@ typedef struct
 // One caller needs both halves of "right now" — what was measured and
 // what the office says about the rest of the day — so they arrive
 // together rather than as two callbacks a consumer would have to join
-// (root TODO §WX-DESIGN §6: chains, never joins).
+// legs of one request, never two callbacks a consumer has to join.
 //
 // The forecast half is enrichment and degrades on its own: `count == 0`
 // costs the caller its high/low and its prose line, nothing more.
@@ -327,11 +362,18 @@ typedef void (*weathergov_current_cb_t)(
 async_rc_t weathergov_point_async(double lat, double lon,
     weathergov_point_cb_t cb, void *user);
 
-// Every active alert for a coordinate, in one round trip. Needs no
-// point lookup, no grid and no prior call — the endpoint takes raw
-// coordinates and its own non-2xx is the coverage answer.
-async_rc_t weathergov_alerts_async(double lat, double lon,
-    weathergov_alerts_cb_t cb, void *user);
+// Every active alert for a place, in one round trip.
+//
+// `pt` scopes the query to an AREA: given a point carrying either UGC
+// code, the request asks for every alert covering that county or
+// forecast zone, and each answer is then classified against `lat`/`lon`
+// locally (`weathergov_prox_t`). A NULL `pt`, or one carrying neither
+// code, asks about the coordinate alone — which returns a storm-based
+// product only when the polygon contains that exact point.
+//
+// `pt` is borrowed for the duration of the call only.
+async_rc_t weathergov_alerts_async(const weathergov_point_t *pt,
+    double lat, double lon, weathergov_alerts_cb_t cb, void *user);
 
 // The 14-period forecast for an already-resolved grid. `pt` is borrowed
 // for the duration of the call only — the grid triple is copied into the
@@ -402,10 +444,11 @@ weathergov_point_async(double lat, double lon,
 }
 
 static inline async_rc_t
-weathergov_alerts_async(double lat, double lon,
+weathergov_alerts_async(const weathergov_point_t *pt, double lat, double lon,
     weathergov_alerts_cb_t cb, void *user)
 {
-  typedef async_rc_t (*fn_t)(double, double, weathergov_alerts_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const weathergov_point_t *, double, double,
+      weathergov_alerts_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -423,7 +466,7 @@ weathergov_alerts_async(double lat, double lon,
     fn = u.fn;
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
-  return(fn(lat, lon, cb, user));
+  return(fn(pt, lat, lon, cb, user));
 }
 
 static inline async_rc_t

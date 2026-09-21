@@ -538,6 +538,30 @@ wxg_alert_set_insert(weathergov_alert_set_t *set, const weathergov_alert_t *a)
 // Transfer
 // ----------------------------------------------------------------------
 
+// The zone list an alert query is scoped by, or "" when the point has
+// no codes to give.
+//
+// ⚠⚠ The COMMA form is the union of both zones. `?zone=A&zone=B` also
+// answers 200 and keeps only B — measured 2026-09-20 — so the repeated
+// form silently drops a whole county and reads as a quiet sky.
+static void
+wxg_zones_build(const weathergov_point_t *pt, char *out, size_t sz)
+{
+  out[0] = '\0';
+
+  if(pt == NULL)
+    return;
+
+  if(pt->county[0] != '\0' && pt->zone[0] != '\0')
+    snprintf(out, sz, "%s,%s", pt->county, pt->zone);
+
+  else if(pt->county[0] != '\0')
+    strlcpy(out, pt->county, sz);
+
+  else if(pt->zone[0] != '\0')
+    strlcpy(out, pt->zone, sz);
+}
+
 static void
 wxg_alerts_deliver(wxg_request_t *r)
 {
@@ -626,6 +650,10 @@ wxg_alerts_done(const curl_response_t *resp)
     if(alert.event[0] == '\0')
       continue;
 
+    // ⚠ `geometry` hangs off the FEATURE, not off `properties` — the
+    // one field in this response that does.
+    wxg_alert_locate(feat, r->lat, r->lon, &alert);
+
     // Superseded by a later bulletin in this same response, or a
     // repeat of one already kept.
     if(wxg_refs_contains(&refs, alert.id) || !wxg_labels_add(&seen, &alert))
@@ -640,7 +668,8 @@ wxg_alerts_done(const curl_response_t *resp)
   json_object_put(root);
 
   clam(CLAM_DEBUG2, WXG_CTX, "alerts %s: %d feature(s) -> %u distinct, "
-      "%u carried", r->coord, n, res->alerts.total, res->alerts.count);
+      "%u carried", r->zones[0] != '\0' ? r->zones : r->coord, n,
+      res->alerts.total, res->alerts.count);
 
   wxg_alerts_deliver(r);
 }
@@ -650,7 +679,7 @@ wxg_alerts_done(const curl_response_t *resp)
 // ----------------------------------------------------------------------
 
 async_rc_t
-weathergov_alerts_async(double lat, double lon,
+weathergov_alerts_async(const weathergov_point_t *pt, double lat, double lon,
     weathergov_alerts_cb_t cb, void *user)
 {
   char url[WXG_URL_SZ];
@@ -669,6 +698,7 @@ weathergov_alerts_async(double lat, double lon,
   // Rounded to four places like every other weather.gov URL tail: the
   // full-precision form answers 301 to exactly this string.
   snprintf(r->coord, sizeof(r->coord), "%.4f,%.4f", lat, lon);
+  wxg_zones_build(pt, r->zones, sizeof(r->zones));
   wxg_ua(r->ua, sizeof(r->ua));
 
   // File it before anything can be submitted, never after: a completion
@@ -679,7 +709,16 @@ weathergov_alerts_async(double lat, double lon,
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  snprintf(url, sizeof(url), "%s?point=%s", WXG_ALERTS_URL, r->coord);
+  // Asking by zone is asking about an AREA: it returns every product
+  // covering that county or forecast zone, including the storm-based
+  // ones whose polygon excludes this exact coordinate — which is the
+  // whole point, and which wxg_alert_locate then labels. With no zone
+  // to name, this is the coordinate query it always was.
+  if(r->zones[0] != '\0')
+    snprintf(url, sizeof(url), "%s?zone=%s", WXG_ALERTS_URL, r->zones);
+
+  else
+    snprintf(url, sizeof(url), "%s?point=%s", WXG_ALERTS_URL, r->coord);
 
   if(wxg_http_get(url, r, wxg_alerts_done) != SUCCESS)
   {

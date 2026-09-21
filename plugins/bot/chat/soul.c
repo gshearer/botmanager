@@ -544,8 +544,13 @@ typedef bool (*soul_wx_geo_city_fn_t)(const char *, char *, size_t);
 typedef bool (*soul_wx_geo_zip_fn_t)(const char *, double *, double *,
     char *, size_t);
 typedef bool (*soul_wx_enabled_fn_t)(void);
-typedef bool (*soul_wx_alerts_fn_t)(double, double,
-    weathergov_alerts_cb_t, void *);
+// ⚠ The first parameter scopes the query to the point's county and
+// forecast zone; NULL asks about the coordinate alone, which is what
+// this sweep did before the zone form existed. Giving the watch the
+// wider answer is its own chunk — the claim key would otherwise let a
+// "nearby" announcement swallow the same storm arriving overhead.
+typedef bool (*soul_wx_alerts_fn_t)(const weathergov_point_t *, double,
+    double, weathergov_alerts_cb_t, void *);
 
 typedef struct
 {
@@ -1369,7 +1374,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   {
     soul_wx_point_t *pt = &sweep->points[p];
 
-    if(wx.alerts(pt->lat, pt->lon, soul_wx_fetch_cb, pt) == SUCCESS)
+    if(wx.alerts(NULL, pt->lat, pt->lon, soul_wx_fetch_cb, pt) == SUCCESS)
       continue;
 
     if(__atomic_sub_fetch(&sweep->pending, 1, __ATOMIC_ACQ_REL) == 0)
