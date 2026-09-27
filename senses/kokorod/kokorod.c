@@ -62,11 +62,15 @@ kokorod_usage(const char *argv0)
     "  --data-dir DIR    espeak-ng-data directory\n"
     "  --lexicon FILE    lexicon file(s), comma separated\n"
     "  --lang LANG       language hint, e.g. en\n"
-    "  --port N          listen port on 127.0.0.1        (default %d)\n"
+    "  --bind ADDR       IPv4 listen address             (default %s)\n"
+    "  --port N          listen port                     (default %d)\n"
     "  --threads N       synthesis threads               (default %d)\n"
+    "  --provider NAME   onnxruntime execution provider, e.g. cuda\n"
+    "                                                    (default %s)\n"
     "\n"
     "Serves POST /v1/audio/speech and GET /health.\n",
-    argv0, KOKOROD_PORT_DEFAULT, KOKOROD_THREADS_DEFAULT);
+    argv0, KOKOROD_BIND_DEFAULT, KOKOROD_PORT_DEFAULT, KOKOROD_THREADS_DEFAULT,
+    KOKOROD_PROVIDER_DEFAULT);
 }
 
 static bool
@@ -76,6 +80,8 @@ kokorod_parse_args(int argc, char **argv, kokorod_cfg_t *cfg)
 
   memset(cfg, 0, sizeof(*cfg));
   cfg->port = KOKOROD_PORT_DEFAULT;
+  cfg->bind = KOKOROD_BIND_DEFAULT;
+  cfg->provider = KOKOROD_PROVIDER_DEFAULT;
   cfg->threads = KOKOROD_THREADS_DEFAULT;
 
   while(i < argc)
@@ -97,6 +103,8 @@ kokorod_parse_args(int argc, char **argv, kokorod_cfg_t *cfg)
     else if(strcmp(arg, "--data-dir") == 0)  cfg->data_dir = val;
     else if(strcmp(arg, "--lexicon") == 0)   cfg->lexicon = val;
     else if(strcmp(arg, "--lang") == 0)      cfg->lang = val;
+    else if(strcmp(arg, "--bind") == 0)      cfg->bind = val;
+    else if(strcmp(arg, "--provider") == 0)  cfg->provider = val;
     else if(strcmp(arg, "--port") == 0)      cfg->port = (uint16_t)strtoul(val, NULL, 10);
     else if(strcmp(arg, "--threads") == 0)   cfg->threads = (int32_t)strtol(val, NULL, 10);
 
@@ -453,7 +461,7 @@ kokorod_wav_build(const SherpaOnnxGeneratedAudio *audio, size_t *out_len)
 }
 
 static int
-kokorod_listen(uint16_t port)
+kokorod_listen(const char *bind_addr, uint16_t port)
 {
   struct sockaddr_in addr;
   int fd;
@@ -475,7 +483,13 @@ kokorod_listen(uint16_t port)
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  if(inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1)
+  {
+    fprintf(stderr, "kokorod: --bind %s is not an IPv4 address\n", bind_addr);
+    close(fd);
+    return(-1);
+  }
 
   if(bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0)
   {
@@ -803,7 +817,7 @@ main(int argc, char **argv)
   tts_cfg.model.kokoro.lang = cfg.lang;
   tts_cfg.model.kokoro.length_scale = 1.0f;
   tts_cfg.model.num_threads = cfg.threads;
-  tts_cfg.model.provider = "cpu";
+  tts_cfg.model.provider = cfg.provider;
   tts_cfg.max_num_sentences = 1;
 
   if((tts = SherpaOnnxCreateOfflineTts(&tts_cfg)) == NULL)
@@ -826,14 +840,16 @@ main(int argc, char **argv)
     return(EXIT_FAILURE);
   }
 
-  if((listen_fd = kokorod_listen(cfg.port)) < 0)
+  if((listen_fd = kokorod_listen(cfg.bind, cfg.port)) < 0)
   {
     SherpaOnnxDestroyOfflineTts(tts);
     return(EXIT_FAILURE);
   }
 
-  fprintf(stderr, "kokorod: listening on 127.0.0.1:%u — %d voices, %d threads, %d Hz\n",
-    cfg.port, speakers, cfg.threads, SherpaOnnxOfflineTtsSampleRate(tts));
+  fprintf(stderr, "kokorod: listening on %s:%u — %d voices, %d threads, "
+                  "provider %s, %d Hz\n",
+    cfg.bind, cfg.port, speakers, cfg.threads, cfg.provider,
+    SherpaOnnxOfflineTtsSampleRate(tts));
 
   while(kokorod_stop == 0)
   {

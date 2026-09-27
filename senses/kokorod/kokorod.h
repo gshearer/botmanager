@@ -20,6 +20,8 @@ int main(int, char **);
 #define KOKOROD_THREADS_DEFAULT 4
 #define KOKOROD_VOICE_DEFAULT   "af_heart"
 #define KOKOROD_SPEED_DEFAULT   1.0
+#define KOKOROD_BIND_DEFAULT    "127.0.0.1"
+#define KOKOROD_PROVIDER_DEFAULT "cpu"
 
 #define KOKOROD_TEXT_MAX        4096
 #define KOKOROD_REQUEST_MAX     (64u * 1024u)
@@ -46,6 +48,8 @@ int main(int, char **);
 typedef struct
 {
   uint16_t    port;
+  const char *bind;
+  const char *provider;
   const char *model;
   const char *voices;
   const char *tokens;
@@ -78,7 +82,7 @@ static uint8_t *kokorod_wav_build(const SherpaOnnxGeneratedAudio *, size_t *);
 static void  kokorod_wav_put32(uint8_t *, uint32_t);
 static void  kokorod_wav_put16(uint8_t *, uint16_t);
 
-static int   kokorod_listen(uint16_t);
+static int   kokorod_listen(const char *, uint16_t);
 static bool  kokorod_send_all(int, const void *, size_t);
 static void  kokorod_respond(int, int, const char *, const char *, const void *, size_t);
 static void  kokorod_respond_text(int, int, const char *, const char *);

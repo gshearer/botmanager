@@ -7,8 +7,11 @@
 #   systemctl --user enable --now kokorod
 #
 # A systemd *user* unit, like its whisper sibling. Unlike whisper this is
-# pure CPU — Kokoro synthesizes at roughly RTF 0.13 on four threads, so the
-# 4090 stays entirely whisper's. Loopback only: the sole consumer is the
+# pure CPU — Kokoro synthesizes at roughly RTF 0.09 on eight threads, so the
+# 4090 stays entirely whisper's. Measured 2026-09-27 on `lab`: a 2.4 s line
+# takes 0.33 s on 4 threads, 0.24 on 8 and 16; past 8 buys almost nothing.
+# ⚠ onnxruntime-cuda (Arch 1.29.0-3) aborts building Kokoro's execution plan
+# on the CUDA provider, so --provider cuda is not a working option today. Loopback only: the sole consumer is the
 # botman daemon on this host, which uploads the finished WAV to the robot.
 #
 # Port map for the initiative: robot daemon 8000, earbridge 8090 (on the
@@ -54,7 +57,7 @@ ExecStart=/mnt/fast/doc/projects/botmanager/build/senses/kokorod/kokorod \
     --tokens   /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/tokens.txt \
     --data-dir /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/espeak-ng-data \
     --lexicon  /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/lexicon-us-en.txt \
-    --lang en --port 8003 --threads 4
+    --lang en --port 8003 --threads 8
 Restart=on-failure
 RestartSec=5
 SyslogIdentifier=kokorod
