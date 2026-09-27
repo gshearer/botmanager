@@ -2274,8 +2274,7 @@ help_arg_form(const cmd_def_t *c, const char *parent_path)
 // unregistered the moment the lock is dropped. So every cell a row can
 // draw is copied here, the description included: that one is a
 // registrant's static string, and the registrant may be a plugin on its
-// way out. `args` is empty when the row has no second line; the index
-// never fills it.
+// way out. `args` is empty when the row has no second line.
 typedef struct
 {
   char name[CMD_NAME_SZ];
@@ -2291,6 +2290,38 @@ help_row_cmp(const void *a, const void *b)
   const help_row_t *rb = b;
 
   return(strcasecmp(ra->name, rb->name));
+}
+
+// Draw a snapshot as the grid: one row per command, and under it, when
+// the command takes anything, the form it is typed in. The children
+// table and `help --long` both draw this, so a root reads the way a
+// child does.
+static void
+help_draw_grid(const cmd_ctx_t *ctx, const help_row_t *rows, uint32_t n)
+{
+  uint32_t i;
+
+  cmd_reply_table_head(ctx, CMD_HELP_HEAD);
+
+  for(i = 0; i < n; i++)
+  {
+    char line[512];
+
+    snprintf(line, sizeof(line), CMD_HELP_ROW,
+        rows[i].name, rows[i].abbrev, rows[i].desc);
+    cmd_reply(ctx, line);
+
+    // The row says what the verb does; this says how to type it. It is
+    // a second LINE rather than a fourth column because the grid above
+    // already runs past DISPLAY_COLS on its longest descriptions, so
+    // there is no width left to spend.
+    if(rows[i].args[0] != '\0')
+    {
+      snprintf(line, sizeof(line),
+          CMD_HELP_ARGS_INDENT CLR_GRAY "%s" CLR_RESET, rows[i].args);
+      cmd_reply(ctx, line);
+    }
+  }
 }
 
 // Print child table for a command. Returns number of children shown.
@@ -2309,7 +2340,6 @@ help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
   help_row_t *rows;
   uint32_t    cap = 0;
   uint32_t    n   = 0;
-  uint32_t    i;
 
   pthread_mutex_lock(&cmd_mutex);
 
@@ -2363,29 +2393,7 @@ help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
   }
 
   qsort(rows, n, sizeof(*rows), help_row_cmp);
-
-  cmd_reply_table_head(ctx, CMD_HELP_HEAD);
-
-  for(i = 0; i < n; i++)
-  {
-    char line[512];
-
-    snprintf(line, sizeof(line), CMD_HELP_ROW,
-        rows[i].name, rows[i].abbrev, rows[i].desc);
-    cmd_reply(ctx, line);
-
-    // The row says what the verb does; this says how to type it. It is
-    // a second LINE rather than a fourth column because the grid above
-    // already runs past DISPLAY_COLS on its longest descriptions, so
-    // there is no width left to spend.
-    if(rows[i].args[0] != '\0')
-    {
-      snprintf(line, sizeof(line),
-          CMD_HELP_ARGS_INDENT CLR_GRAY "%s" CLR_RESET, rows[i].args);
-      cmd_reply(ctx, line);
-    }
-  }
-
+  help_draw_grid(ctx, rows, n);
   mem_free(rows);
 
   return(n);
@@ -2465,7 +2473,8 @@ cmd_help_kv(const cmd_ctx_t *ctx, const char *name)
 // alphabetical listing, in either of two shapes.
 //
 // The long shape is the grid above, one command per line with its
-// description. That is a fine reference on a terminal and a flood on
+// description and, under a command that takes anything, the form it is
+// typed in (featreq #111). That is a fine reference on a terminal and a flood on
 // IRC, where sixty lines answer "what can you do?" one message at a
 // time; so the default shape is the names alone, packed into as many
 // columns as DISPLAY_COLS affords, and `--long` asks for the other.
@@ -2505,6 +2514,8 @@ help_collect_roots(const cmd_ctx_t *ctx, help_row_t **out)
 
   for(cmd_def_t *d = cmd_list; d != NULL && n < cap; d = d->next)
   {
+    const char *dargs;
+
     if(d->parent != NULL || !help_check_access(ctx, d))
       continue;
 
@@ -2513,7 +2524,18 @@ help_collect_roots(const cmd_ctx_t *ctx, help_row_t **out)
         sizeof(rows[n].abbrev));
     display_fit((d->description != NULL) ? d->description : "",
         CMD_HELP_DESC_COLS, rows[n].desc, sizeof(rows[n].desc), "…");
-    rows[n].args[0] = '\0';
+
+    // Only the long shape draws it, but the names-only shape is the
+    // same snapshot and the fit is cheap beside a reply per line.
+    dargs = help_arg_form(d, NULL);
+
+    if(dargs != NULL)
+      display_fit(dargs, CMD_HELP_ARGS_COLS, rows[n].args,
+          sizeof(rows[n].args), "…");
+
+    else
+      rows[n].args[0] = '\0';
+
     n++;
   }
 
@@ -2587,24 +2609,6 @@ help_index_columns(const cmd_ctx_t *ctx, const help_row_t *rows,
 }
 
 static void
-help_index_described(const cmd_ctx_t *ctx, const help_row_t *rows,
-    uint32_t n)
-{
-  uint32_t i;
-
-  cmd_reply_table_head(ctx, CMD_HELP_HEAD);
-
-  for(i = 0; i < n; i++)
-  {
-    char line[512];
-
-    snprintf(line, sizeof(line), CMD_HELP_ROW,
-        rows[i].name, rows[i].abbrev, rows[i].desc);
-    cmd_reply(ctx, line);
-  }
-}
-
-static void
 help_show_index(const cmd_ctx_t *ctx, bool verbose)
 {
   help_row_t *rows;
@@ -2621,7 +2625,7 @@ help_show_index(const cmd_ctx_t *ctx, bool verbose)
   }
 
   if(verbose)
-    help_index_described(ctx, rows, n);
+    help_draw_grid(ctx, rows, n);
 
   else
     help_index_columns(ctx, rows, n);
@@ -2666,7 +2670,8 @@ help_take_verbose(const char *args)
 //
 // Usage:
 //   /help              -- list all root commands, names only
-//   /help --long       -- that list with abbreviations and descriptions
+//   /help --long       -- that list with abbreviations, descriptions
+//                         and argument forms
 //   /help <command>    -- show usage and subcommands
 //   /help -v <cmd>     -- verbose help (description + help_long)
 //   /help kv <key>     -- show help for a KV configuration key
@@ -3478,7 +3483,7 @@ static const cmd_decl_t help_decl = {
   .usage       = "help [-v|--long] [command ...] | help kv <key>",
   .description = "Command reference",
   .help_long   = "Lists all commands available on this bot instance.\n"
-                 "Use help --long for that list with descriptions.\n"
+                 "Use help --long for that list with descriptions and arguments.\n"
                  "Use help <command> to see usage and subcommands.\n"
                  "Use help -v <command> for verbose help.\n"
                  "Use help kv <key> for configuration key help.",
