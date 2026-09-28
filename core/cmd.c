@@ -2292,6 +2292,65 @@ help_row_cmp(const void *a, const void *b)
   return(strcasecmp(ra->name, rb->name));
 }
 
+#define CMD_HELP_INDEX_INDENT  "  "
+
+// Gutter between two name cells. Two columns is the narrowest gap that
+// still reads as a gap when the names either side fill their cell.
+#define CMD_HELP_INDEX_GAP  2
+
+// Names only, in columns. The fill is row-major: on IRC each row is a
+// separate message that can arrive on its own, so the alphabet has to
+// read in the order the messages do, which is what rules out ls's
+// down-then-across.
+static void
+help_index_columns(const cmd_ctx_t *ctx, const help_row_t *rows,
+    uint32_t n)
+{
+  const int avail = DISPLAY_COLS - (int)(sizeof CMD_HELP_INDEX_INDENT - 1);
+  int       width = 0;
+  int       cols;
+  uint32_t  i;
+
+  for(i = 0; i < n; i++)
+  {
+    int len = (int)strlen(rows[i].name);
+
+    if(len > width)
+      width = len;
+  }
+
+  width += CMD_HELP_INDEX_GAP;
+  cols   = (width <= avail) ? avail / width : 1;
+
+  for(i = 0; i < n; i += (uint32_t)cols)
+  {
+    uint32_t end = i + (uint32_t)cols;
+    uint32_t j;
+    char     line[512];
+
+    if(end > n)
+      end = n;
+
+    strlcpy(line, CMD_HELP_INDEX_INDENT, sizeof(line));
+
+    for(j = i; j < end; j++)
+    {
+      char cell[CMD_NAME_SZ + 16];
+
+      snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, rows[j].name);
+
+      // The last cell of a row has nothing to line up against, and
+      // padding it would send trailing spaces down the wire.
+      if(j + 1 < end)
+        display_align_left(cell, sizeof(cell), width);
+
+      display_cat(line, sizeof(line), cell);
+    }
+
+    cmd_reply(ctx, line);
+  }
+}
+
 // Draw a snapshot as the grid: one row per command, and under it, when
 // the command takes anything, the form it is typed in. The children
 // table and `help --long` both draw this, so a root reads the way a
@@ -2326,6 +2385,11 @@ help_draw_grid(const cmd_ctx_t *ctx, const help_row_t *rows, uint32_t n)
 
 // Print child table for a command. Returns number of children shown.
 //
+// Names in columns by default, like the root index and for the same
+// reason: `help show` was sixty lines on IRC, one message each. The
+// described grid with argument lines is `verbose` — `help --long
+// <command>`.
+//
 // Alphabetical, like the root index: a child is prepended to its
 // parent's sibling chain at registration, so walking that chain hands
 // out reverse registration order — `plugin` listed reload before load
@@ -2335,7 +2399,7 @@ help_draw_grid(const cmd_ctx_t *ctx, const help_row_t *rows, uint32_t n)
 // afterwards.
 static uint32_t
 help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
-    const char *parent_path)
+    const char *parent_path, bool verbose)
 {
   help_row_t *rows;
   uint32_t    cap = 0;
@@ -2393,7 +2457,13 @@ help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
   }
 
   qsort(rows, n, sizeof(*rows), help_row_cmp);
-  help_draw_grid(ctx, rows, n);
+
+  if(verbose)
+    help_draw_grid(ctx, rows, n);
+
+  else
+    help_index_columns(ctx, rows, n);
+
   mem_free(rows);
 
   return(n);
@@ -2474,16 +2544,11 @@ cmd_help_kv(const cmd_ctx_t *ctx, const char *name)
 //
 // The long shape is the grid above, one command per line with its
 // description and, under a command that takes anything, the form it is
-// typed in (featreq #111). That is a fine reference on a terminal and a flood on
-// IRC, where sixty lines answer "what can you do?" one message at a
-// time; so the default shape is the names alone, packed into as many
-// columns as DISPLAY_COLS affords, and `--long` asks for the other.
-
-#define CMD_HELP_INDEX_INDENT  "  "
-
-// Gutter between two name cells. Two columns is the narrowest gap that
-// still reads as a gap when the names either side fill their cell.
-#define CMD_HELP_INDEX_GAP  2
+// typed in (featreq #111). That is a fine reference on a terminal and a
+// flood on IRC, where sixty lines answer "what can you do?" one message
+// at a time; so the default shape is the names alone, packed into as
+// many columns as DISPLAY_COLS affords, and `--long` asks for the
+// other. `help <command>` lists its subcommands the same two ways.
 
 // Snapshot every root command the caller may see, alphabetically.
 //
@@ -2553,59 +2618,6 @@ help_collect_roots(const cmd_ctx_t *ctx, help_row_t **out)
   *out = rows;
 
   return(n);
-}
-
-// Names only, in columns. The fill is row-major: on IRC each row is a
-// separate message that can arrive on its own, so the alphabet has to
-// read in the order the messages do, which is what rules out ls's
-// down-then-across.
-static void
-help_index_columns(const cmd_ctx_t *ctx, const help_row_t *rows,
-    uint32_t n)
-{
-  const int avail = DISPLAY_COLS - (int)(sizeof CMD_HELP_INDEX_INDENT - 1);
-  int       width = 0;
-  int       cols;
-  uint32_t  i;
-
-  for(i = 0; i < n; i++)
-  {
-    int len = (int)strlen(rows[i].name);
-
-    if(len > width)
-      width = len;
-  }
-
-  width += CMD_HELP_INDEX_GAP;
-  cols   = (width <= avail) ? avail / width : 1;
-
-  for(i = 0; i < n; i += (uint32_t)cols)
-  {
-    uint32_t end = i + (uint32_t)cols;
-    uint32_t j;
-    char     line[512];
-
-    if(end > n)
-      end = n;
-
-    strlcpy(line, CMD_HELP_INDEX_INDENT, sizeof(line));
-
-    for(j = i; j < end; j++)
-    {
-      char cell[CMD_NAME_SZ + 16];
-
-      snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, rows[j].name);
-
-      // The last cell of a row has nothing to line up against, and
-      // padding it would send trailing spaces down the wire.
-      if(j + 1 < end)
-        display_align_left(cell, sizeof(cell), width);
-
-      display_cat(line, sizeof(line), cell);
-    }
-
-    cmd_reply(ctx, line);
-  }
 }
 
 static void
@@ -2855,6 +2867,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
   if(has_children)
   {
     char shdr[CMD_USAGE_SZ + 32];
+    char hint[CMD_USAGE_SZ + 96];
     char count_buf[32];
     uint32_t child_count;
 
@@ -2863,10 +2876,18 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
     snprintf(shdr, sizeof(shdr), "subcommands of %s:", cmd_path);
     cmd_reply(ctx, shdr);
 
-    child_count = help_show_children(ctx, d, cmd_path);
+    child_count = help_show_children(ctx, d, cmd_path, verbose);
 
     snprintf(count_buf, sizeof(count_buf), "%u subcommand(s)", child_count);
     cmd_reply(ctx, count_buf);
+
+    if(!verbose && child_count > 0)
+    {
+      snprintf(hint, sizeof(hint), CLR_GRAY "Use " CLR_RESET
+          "help --long %s" CLR_GRAY " for descriptions and arguments."
+          CLR_RESET, cmd_path);
+      cmd_reply(ctx, hint);
+    }
   }
 }
 
