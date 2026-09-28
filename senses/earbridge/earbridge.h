@@ -13,12 +13,18 @@
 // SECURITY POSTURE: there is no authentication. The robot sits on an isolated
 // VLAN and the only client is botman. Anything that changes either of those
 // facts must add auth here first — this daemon will hand a recording of the
-// room to whoever asks.
+// room, or a photograph of it, to whoever asks.
 //
 // It never opens hw:0,0. Capture goes through the dsnoop PCM the robot daemon
 // also uses, so both read the microphone concurrently and /api/media/release
 // is never called — face tracking and DoA keep working throughout. Recording
 // from the default PCM instead would steal the dsnoop slave and break them.
+//
+// It is also the robot's eye, on the same terms: frames come from the robot
+// daemon's camera IPC socket, the unixfd branch it shares with its own local
+// consumers, so face tracking keeps running and nothing is released. The
+// JPEG is made by gst-launch-1.0 as a CHILD process — GStreamer never enters
+// this address space, so a camera fault costs one 503, never the ear.
 
 int main(int, char **);
 
@@ -27,6 +33,7 @@ int main(int, char **);
 #include <alsa/asoundlib.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sys/types.h>
 
 #define EB_PCM_DEVICE       "reachymini_audio_src"
 #define EB_RATE             16000
@@ -72,6 +79,19 @@ int main(int, char **);
 #define EB_CLIENT_TIMEOUT   35
 #define EB_VAD_TIMEOUT      2
 
+// The eye. A frame takes ~0.2 s end to end (measured 2026-09-28, 1280x720),
+// so the timeout is a hung pipeline, not a slow one. The largest mode the
+// camera offers, 3840x2592, encodes to ~2 MB.
+#define EB_CAMERA_SOCKET_DEFAULT "/tmp/reachymini_camera_socket"
+#define EB_GST_LAUNCH            "/usr/bin/gst-launch-1.0"
+#define EB_JPEG_QUALITY          85
+#define EB_FRAME_TIMEOUT_MS      3000
+#define EB_FRAME_MAX             (3u * 1024u * 1024u)
+
+// Accepted connections a worker lane holds before refusing with a 503: a
+// caller would rather hear "busy" now than an answer seconds stale.
+#define EB_LANE_DEPTH            4
+
 typedef enum
 {
   EB_TAKE_CH0 = 0,
@@ -91,6 +111,7 @@ typedef struct
   uint32_t   poll_hz;
   float      floor_db;
   eb_take_t  take;
+  char       camera_socket[108];   // sizeof sun_path
 } eb_cfg_t;
 
 // One finalized utterance. wav is allocated once at startup to the maximum
@@ -119,7 +140,36 @@ typedef struct
   atomic_ullong alsa_reopened;
   atomic_ullong vad_polls;
   atomic_ullong vad_failures;
+  atomic_ullong frames;
+  atomic_ullong frame_failures;   // camera or pipeline, not a busy queue
+  atomic_ullong lane_busy;        // refused: a worker lane already full
 } eb_stats_t;
+
+// One accepted connection a worker lane will answer. `after` and `wait_ms`
+// are the /utt query; the frame lane ignores them.
+typedef struct
+{
+  int      fd;
+  uint32_t after;
+  uint32_t wait_ms;
+} eb_job_t;
+
+// A lane is one worker thread answering its route's connections in order.
+// The accept loop only reads a request line and files it, because the two
+// slow routes are slow on purpose: a long-poll parks for seconds waiting
+// for speech, and a frame asked for meanwhile must not wait behind it.
+// Each route keeps one worker, so the send buffer /utt fills stays
+// single-user and one capture never races another for the camera.
+typedef struct
+{
+  eb_job_t        jobs[EB_LANE_DEPTH];
+  uint32_t        head;
+  uint32_t        count;
+  pthread_mutex_t mtx;
+  pthread_cond_t  cv;
+} eb_lane_t;
+
+extern char **environ;
 
 static void  eb_usage(const char *);
 static bool  eb_parse_args(int, char **, eb_cfg_t *);
@@ -145,10 +195,19 @@ static void *eb_vad_thread(void *);
 
 static int   eb_listen(uint16_t);
 static bool  eb_send_all(int, const void *, size_t);
-static void  eb_serve(int, const eb_cfg_t *);
+static bool  eb_serve(int, const eb_cfg_t *);
 static void  eb_handle_utt(int, uint32_t, uint32_t);
 static void  eb_handle_health(int, const eb_cfg_t *);
 static bool  eb_query_uint(const char *, const char *, uint32_t *);
+
+static void  eb_refuse_busy(int);
+static bool  eb_lane_push(eb_lane_t *, const eb_job_t *);
+static bool  eb_lane_pop(eb_lane_t *, eb_job_t *);
+static void  eb_lane_wake(eb_lane_t *);
+static void *eb_utt_thread(void *);
+static void *eb_frame_thread(void *);
+static bool  eb_frame_capture(const eb_cfg_t *, uint8_t *, size_t *);
+static void  eb_handle_frame(int, const eb_cfg_t *);
 
 #endif // EARBRIDGE_INTERNAL
 #endif // EARBRIDGE_H

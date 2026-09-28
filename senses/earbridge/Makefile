@@ -11,7 +11,10 @@
 # Deploy with ../earbridge/deploy.sh from the botman host, which copies these
 # sources over and runs this Makefile remotely.
 
-# gnu11 + _DEFAULT_SOURCE, and the pair is the point: glibc gates
+# gnu11 + _GNU_SOURCE (was _DEFAULT_SOURCE, which it implies). The eye's
+# child needs pipe2(O_CLOEXEC) and posix_spawn_file_actions_addclosefrom_np
+# so gst-launch inherits no socket or PCM of ours, and both are GNU. The
+# reasoning below still holds for the _DEFAULT_SOURCE half: glibc gates
 # strlcpy/strlcat behind __USE_MISC, where gcc's implicit-declaration
 # error suggests strncpy — the one function the house standard bans.
 # Measured: -std=gnu11 alone does NOT reach them while an explicit
@@ -21,7 +24,7 @@
 # it. C11 stays out of it entirely: the ALSA alloca macro this once
 # dodged is already sidestepped via snd_pcm_hw_params_malloc.
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11 -D_DEFAULT_SOURCE
+CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11 -D_GNU_SOURCE
 LDLIBS  := -lasound -lpthread -lm
 
 earbridge: earbridge.c earbridge.h

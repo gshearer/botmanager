@@ -8,15 +8,19 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -30,13 +34,27 @@ static uint32_t        eb_seq;
 static atomic_bool  eb_vad_speech;
 static _Atomic float eb_vad_angle;
 
-static volatile sig_atomic_t eb_stop;
+// Set by the signal handler and read by every thread. A lock-free C11
+// atomic, not volatile sig_atomic_t: that type is safe between a handler and
+// the thread it interrupted, and says nothing about the other five (TSan
+// flagged the VAD thread's read, 2026-09-28).
+static atomic_int eb_stop;
 static eb_stats_t eb_stats;
 
 // Sized from --max-s at startup and reused; see eb_slot_t on why nothing
 // here is allocated per utterance.
 static size_t   eb_wav_max;
 static uint8_t *eb_send_buf;
+
+static eb_lane_t eb_utt_lane = {
+  .mtx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER
+};
+static eb_lane_t eb_frame_lane = {
+  .mtx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER
+};
+
+// The one buffer a frame is encoded into; the frame lane is its only user.
+static uint8_t *eb_frame_buf;
 
 static void
 eb_usage(const char *argv0)
@@ -55,12 +73,15 @@ eb_usage(const char *argv0)
     "  --floor-db N      discard utterances quieter,  (default %.0f)\n"
     "                    measured as the loudest %d ms window in dBFS;\n"
     "                    -90 or below passes everything\n"
+    "  --camera PATH     camera IPC socket            (default %s)\n"
     "\n"
-    "Serves GET /utt?after=<seq>&wait=<ms> and GET /health.\n"
-    "Captures via the shared dsnoop PCM: the robot daemon keeps the mic.\n",
+    "Serves GET /utt?after=<seq>&wait=<ms>, GET /frame.jpg and GET /health.\n"
+    "Captures via the shared dsnoop PCM and the daemon's camera socket:\n"
+    "the robot daemon keeps the mic and the camera.\n",
     argv0, EB_DAEMON_DEFAULT, EB_PORT_DEFAULT, EB_PRE_MS_DEFAULT,
     EB_HANG_MS_DEFAULT, EB_MIN_MS_DEFAULT, EB_MAX_S_DEFAULT,
-    EB_POLL_HZ_DEFAULT, (double)EB_FLOOR_DB_DEFAULT, EB_FLOOR_WIN_MS);
+    EB_POLL_HZ_DEFAULT, (double)EB_FLOOR_DB_DEFAULT, EB_FLOOR_WIN_MS,
+    EB_CAMERA_SOCKET_DEFAULT);
 }
 
 static bool
@@ -110,6 +131,8 @@ eb_parse_args(int argc, char **argv, eb_cfg_t *cfg)
   cfg->poll_hz = EB_POLL_HZ_DEFAULT;
   cfg->floor_db = EB_FLOOR_DB_DEFAULT;
   cfg->take = EB_TAKE_CH0;
+  strlcpy(cfg->camera_socket, EB_CAMERA_SOCKET_DEFAULT,
+      sizeof(cfg->camera_socket));
 
   if(!eb_parse_daemon_url(EB_DAEMON_DEFAULT, cfg))
     return(false);
@@ -141,6 +164,16 @@ eb_parse_args(int argc, char **argv, eb_cfg_t *cfg)
     else if(strcmp(arg, "--max-s") == 0)    cfg->max_s = (uint32_t)strtoul(val, NULL, 10);
     else if(strcmp(arg, "--poll-hz") == 0)  cfg->poll_hz = (uint32_t)strtoul(val, NULL, 10);
     else if(strcmp(arg, "--floor-db") == 0) cfg->floor_db = strtof(val, NULL);
+
+    else if(strcmp(arg, "--camera") == 0)
+    {
+      if(strlcpy(cfg->camera_socket, val, sizeof(cfg->camera_socket))
+          >= sizeof(cfg->camera_socket))
+      {
+        fprintf(stderr, "earbridge: --camera path is too long for a socket\n");
+        return(false);
+      }
+    }
 
     else if(strcmp(arg, "--take") == 0)
     {
@@ -891,6 +924,7 @@ eb_handle_health(int fd, const eb_cfg_t *cfg)
     "\"quiet_discards\":%llu,"
     "\"clipped\":%llu,\"alsa_recovered\":%llu,\"alsa_reopened\":%llu,"
     "\"vad_polls\":%llu,\"vad_failures\":%llu,"
+    "\"frames\":%llu,\"frame_failures\":%llu,\"lane_busy\":%llu,"
     "\"take\":\"%s\",\"pre_ms\":%u,\"hang_ms\":%u,\"min_ms\":%u,\"max_s\":%u,"
     "\"floor_db\":%.1f}\n",
     seq,
@@ -905,6 +939,9 @@ eb_handle_health(int fd, const eb_cfg_t *cfg)
     (unsigned long long)atomic_load(&eb_stats.alsa_reopened),
     (unsigned long long)atomic_load(&eb_stats.vad_polls),
     (unsigned long long)atomic_load(&eb_stats.vad_failures),
+    (unsigned long long)atomic_load(&eb_stats.frames),
+    (unsigned long long)atomic_load(&eb_stats.frame_failures),
+    (unsigned long long)atomic_load(&eb_stats.lane_busy),
     (cfg->take == EB_TAKE_CH0) ? "ch0" : ((cfg->take == EB_TAKE_CH1) ? "ch1" : "mix"),
     cfg->pre_ms, cfg->hang_ms, cfg->min_ms, cfg->max_s,
     (double)cfg->floor_db);
@@ -923,13 +960,13 @@ eb_handle_health(int fd, const eb_cfg_t *cfg)
     (void)eb_send_all(fd, body, (size_t)n);
 }
 
-static void
+// True when `fd` was handed to a worker lane, which closes it; the accept
+// loop closes every other one.
+static bool
 eb_serve(int fd, const eb_cfg_t *cfg)
 {
   char buf[EB_REQUEST_MAX];
   size_t used = 0;
-  uint32_t after = 0;
-  uint32_t wait_ms = 0;
 
   while(used < sizeof(buf) - 1)
   {
@@ -940,7 +977,7 @@ eb_serve(int fd, const eb_cfg_t *cfg)
       if(errno == EINTR)
         continue;
 
-      return;
+      return(false);
     }
 
     if(n == 0)
@@ -957,26 +994,303 @@ eb_serve(int fd, const eb_cfg_t *cfg)
 
   if(strncmp(buf, "GET /utt", 8) == 0)
   {
-    (void)eb_query_uint(buf, "after", &after);
-    (void)eb_query_uint(buf, "wait", &wait_ms);
-    eb_handle_utt(fd, after, wait_ms);
-    return;
+    eb_job_t job = { .fd = fd, .after = 0, .wait_ms = 0 };
+
+    (void)eb_query_uint(buf, "after", &job.after);
+    (void)eb_query_uint(buf, "wait", &job.wait_ms);
+
+    if(eb_lane_push(&eb_utt_lane, &job))
+      return(true);
+
+    eb_refuse_busy(fd);
+    return(false);
+  }
+
+  if(strncmp(buf, "GET /frame.jpg", 14) == 0)
+  {
+    const eb_job_t job = { .fd = fd, .after = 0, .wait_ms = 0 };
+
+    if(eb_lane_push(&eb_frame_lane, &job))
+      return(true);
+
+    eb_refuse_busy(fd);
+    return(false);
   }
 
   if(strncmp(buf, "GET /health", 11) == 0)
   {
     eb_handle_health(fd, cfg);
-    return;
+    return(false);
   }
 
   {
     const char *nf =
       "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n"
-      "Content-Length: 52\r\nConnection: close\r\n\r\n"
-      "{\"error\":\"try GET /utt?after=N&wait=MS or /health\"}\n";
+      "Content-Length: 64\r\nConnection: close\r\n\r\n"
+      "{\"error\":\"try GET /utt?after=N&wait=MS, /frame.jpg or /health\"}\n";
 
     (void)eb_send_all(fd, nf, strlen(nf));
   }
+
+  return(false);
+}
+
+// ----------------------------------------------------------------------
+// The eye
+// ----------------------------------------------------------------------
+
+static void
+eb_refuse_busy(int fd)
+{
+  const char *busy =
+    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+    "Content-Length: 17\r\nConnection: close\r\n\r\n"
+    "{\"error\":\"busy\"}\n";
+
+  atomic_fetch_add(&eb_stats.lane_busy, 1);
+  (void)eb_send_all(fd, busy, strlen(busy));
+}
+
+// Accept loop. False when the lane is full; `job->fd` is still the
+// caller's to answer and close.
+static bool
+eb_lane_push(eb_lane_t *lane, const eb_job_t *job)
+{
+  bool queued = false;
+
+  pthread_mutex_lock(&lane->mtx);
+
+  if(lane->count < EB_LANE_DEPTH)
+  {
+    lane->jobs[(lane->head + lane->count) % EB_LANE_DEPTH] = *job;
+    lane->count++;
+    queued = true;
+    pthread_cond_signal(&lane->cv);
+  }
+
+  pthread_mutex_unlock(&lane->mtx);
+
+  return(queued);
+}
+
+// Worker thread. Blocks for the next job; false once shutting down, after
+// closing whatever was still queued — nobody waits out a capture or a
+// long-poll on the way down.
+static bool
+eb_lane_pop(eb_lane_t *lane, eb_job_t *job)
+{
+  pthread_mutex_lock(&lane->mtx);
+
+  while(lane->count == 0 && eb_stop == 0)
+    pthread_cond_wait(&lane->cv, &lane->mtx);
+
+  if(eb_stop != 0)
+  {
+    while(lane->count > 0)
+    {
+      close(lane->jobs[lane->head].fd);
+      lane->head = (lane->head + 1) % EB_LANE_DEPTH;
+      lane->count--;
+    }
+
+    pthread_mutex_unlock(&lane->mtx);
+    return(false);
+  }
+
+  *job = lane->jobs[lane->head];
+  lane->head = (lane->head + 1) % EB_LANE_DEPTH;
+  lane->count--;
+
+  pthread_mutex_unlock(&lane->mtx);
+
+  return(true);
+}
+
+static void
+eb_lane_wake(eb_lane_t *lane)
+{
+  pthread_mutex_lock(&lane->mtx);
+  pthread_cond_broadcast(&lane->cv);
+  pthread_mutex_unlock(&lane->mtx);
+}
+
+static void *
+eb_utt_thread(void *arg)
+{
+  eb_job_t job;
+
+  (void)arg;
+
+  while(eb_lane_pop(&eb_utt_lane, &job))
+  {
+    eb_handle_utt(job.fd, job.after, job.wait_ms);
+    close(job.fd);
+  }
+
+  return(NULL);
+}
+
+static void *
+eb_frame_thread(void *arg)
+{
+  const eb_cfg_t *cfg = arg;
+  eb_job_t        job;
+
+  while(eb_lane_pop(&eb_frame_lane, &job))
+  {
+    eb_handle_frame(job.fd, cfg);
+    close(job.fd);
+  }
+
+  return(NULL);
+}
+
+// One JPEG into `buf` (EB_FRAME_MAX bytes), made by a gst-launch child
+// reading the daemon's camera socket and writing to our pipe. The child
+// inherits nothing of ours past stdio, and is killed if it outlives
+// EB_FRAME_TIMEOUT_MS — a pipeline that never produces a buffer blocks
+// forever, and the camera is a device we do not control.
+static bool
+eb_frame_capture(const eb_cfg_t *cfg, uint8_t *buf, size_t *len)
+{
+  char                       sock_arg[sizeof(cfg->camera_socket) + 16];
+  char                       quality_arg[16];
+  char                      *argv[] = {
+    "gst-launch-1.0", "-q", "unixfdsrc", sock_arg, "num-buffers=1",
+    "!", "videoconvert", "!", "jpegenc", quality_arg,
+    "!", "fdsink", "fd=1", NULL
+  };
+  posix_spawn_file_actions_t fa;
+  struct timespec            deadline;
+  int                        pipefd[2];
+  pid_t                      pid;
+  size_t                     used = 0;
+  bool                       eof = false;
+  int                        status = 0;
+  int                        rc;
+
+  snprintf(sock_arg, sizeof(sock_arg), "socket-path=%s", cfg->camera_socket);
+  snprintf(quality_arg, sizeof(quality_arg), "quality=%d", EB_JPEG_QUALITY);
+
+  if(pipe2(pipefd, O_CLOEXEC) != 0)
+    return(false);
+
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null",
+      O_WRONLY, 0);
+  posix_spawn_file_actions_addclosefrom_np(&fa, STDERR_FILENO + 1);
+
+  rc = posix_spawn(&pid, EB_GST_LAUNCH, &fa, NULL, argv, environ);
+
+  posix_spawn_file_actions_destroy(&fa);
+  close(pipefd[1]);
+
+  if(rc != 0)
+  {
+    close(pipefd[0]);
+    fprintf(stderr, "earbridge: cannot run %s: %s\n", EB_GST_LAUNCH,
+        strerror(rc));
+    return(false);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec  += EB_FRAME_TIMEOUT_MS / 1000;
+  deadline.tv_nsec += (long)(EB_FRAME_TIMEOUT_MS % 1000) * 1000000L;
+
+  if(deadline.tv_nsec >= 1000000000L)
+  {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+
+  while(!eof && used < EB_FRAME_MAX && eb_stop == 0)
+  {
+    struct pollfd   pfd = { .fd = pipefd[0], .events = POLLIN };
+    struct timespec now;
+    long            left_ms;
+    ssize_t         n;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    left_ms = (deadline.tv_sec - now.tv_sec) * 1000L
+            + (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+
+    if(left_ms <= 0)
+      break;
+
+    rc = poll(&pfd, 1, (int)left_ms);
+
+    if(rc < 0 && errno == EINTR)
+      continue;
+
+    if(rc <= 0)
+      break;
+
+    n = read(pipefd[0], buf + used, EB_FRAME_MAX - used);
+
+    if(n < 0 && errno == EINTR)
+      continue;
+
+    if(n < 0)
+      break;
+
+    if(n == 0)
+      eof = true;
+
+    used += (size_t)n;
+  }
+
+  close(pipefd[0]);
+
+  // Anything short of a clean end of stream means the child is still
+  // there, or about to be; it is ours to reap either way.
+  if(!eof)
+    kill(pid, SIGKILL);
+
+  while(waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    ;
+
+  if(!eof || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    return(false);
+
+  // A JPEG starts with an SOI marker; anything else is not a frame.
+  if(used < 3 || buf[0] != 0xff || buf[1] != 0xd8 || buf[2] != 0xff)
+    return(false);
+
+  *len = used;
+  return(true);
+}
+
+static void
+eb_handle_frame(int fd, const eb_cfg_t *cfg)
+{
+  const char *fail =
+    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+    "Content-Length: 21\r\nConnection: close\r\n\r\n"
+    "{\"error\":\"no frame\"}\n";
+  char   head[192];
+  size_t len;
+  int    h;
+
+  if(!eb_frame_capture(cfg, eb_frame_buf, &len))
+  {
+    atomic_fetch_add(&eb_stats.frame_failures, 1);
+    (void)eb_send_all(fd, fail, strlen(fail));
+    return;
+  }
+
+  atomic_fetch_add(&eb_stats.frames, 1);
+
+  h = snprintf(head, sizeof(head),
+    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n"
+    "Content-Length: %zu\r\nCache-Control: no-store\r\n"
+    "Connection: close\r\n\r\n", len);
+
+  if(h < 0 || (size_t)h >= sizeof(head))
+    return;
+
+  if(eb_send_all(fd, head, (size_t)h))
+    (void)eb_send_all(fd, eb_frame_buf, len);
 }
 
 int
@@ -986,6 +1300,8 @@ main(int argc, char **argv)
   pthread_condattr_t cattr;
   pthread_t capture_tid;
   pthread_t vad_tid;
+  pthread_t frame_tid;
+  pthread_t utt_tid;
   int listen_fd;
   size_t i;
 
@@ -1012,6 +1328,12 @@ main(int argc, char **argv)
   if((eb_send_buf = malloc(eb_wav_max)) == NULL)
   {
     fprintf(stderr, "earbridge: out of memory allocating the send buffer\n");
+    return(EXIT_FAILURE);
+  }
+
+  if((eb_frame_buf = malloc(EB_FRAME_MAX)) == NULL)
+  {
+    fprintf(stderr, "earbridge: out of memory allocating the frame buffer\n");
     return(EXIT_FAILURE);
   }
 
@@ -1052,6 +1374,34 @@ main(int argc, char **argv)
     return(EXIT_FAILURE);
   }
 
+  if(pthread_create(&frame_tid, NULL, eb_frame_thread, &cfg) != 0)
+  {
+    perror("earbridge: pthread_create(frame)");
+    eb_stop = 1;
+    pthread_mutex_lock(&eb_mtx);
+    pthread_cond_broadcast(&eb_cv);
+    pthread_mutex_unlock(&eb_mtx);
+    pthread_join(capture_tid, NULL);
+    pthread_join(vad_tid, NULL);
+    close(listen_fd);
+    return(EXIT_FAILURE);
+  }
+
+  if(pthread_create(&utt_tid, NULL, eb_utt_thread, NULL) != 0)
+  {
+    perror("earbridge: pthread_create(utt)");
+    eb_stop = 1;
+    pthread_mutex_lock(&eb_mtx);
+    pthread_cond_broadcast(&eb_cv);
+    pthread_mutex_unlock(&eb_mtx);
+    eb_lane_wake(&eb_frame_lane);
+    pthread_join(frame_tid, NULL);
+    pthread_join(capture_tid, NULL);
+    pthread_join(vad_tid, NULL);
+    close(listen_fd);
+    return(EXIT_FAILURE);
+  }
+
   fprintf(stderr, "earbridge: listening on 0.0.0.0:%u — take=%s, vad via %s:%u, "
                   "pre=%ums hang=%ums min=%ums max=%us floor=%.1fdBFS\n",
     cfg.port,
@@ -1080,8 +1430,8 @@ main(int argc, char **argv)
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    eb_serve(fd, &cfg);
-    close(fd);
+    if(!eb_serve(fd, &cfg))
+      close(fd);
   }
 
   fprintf(stderr, "earbridge: shutting down\n");
@@ -1092,8 +1442,15 @@ main(int argc, char **argv)
   pthread_cond_broadcast(&eb_cv);
   pthread_mutex_unlock(&eb_mtx);
 
+  eb_lane_wake(&eb_utt_lane);
+  eb_lane_wake(&eb_frame_lane);
+
+  pthread_join(utt_tid, NULL);
+  pthread_join(frame_tid, NULL);
   pthread_join(capture_tid, NULL);
   pthread_join(vad_tid, NULL);
+
+  free(eb_frame_buf);
 
   for(i = 0; i < EB_SLOTS; i++)
     free(eb_slots[i].wav);
