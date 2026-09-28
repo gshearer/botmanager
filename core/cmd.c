@@ -2639,7 +2639,7 @@ help_show_index(const cmd_ctx_t *ctx, bool verbose)
         CLR_GRAY " for detailed information." CLR_RESET
       : CLR_GRAY "Use " CLR_RESET "help <command>"
         CLR_GRAY " for detail, or " CLR_RESET "help --long"
-        CLR_GRAY " for descriptions." CLR_RESET);
+        CLR_GRAY " for descriptions and arguments." CLR_RESET);
 
   mem_free(rows);
 }
