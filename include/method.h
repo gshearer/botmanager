@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "async.h"
 #include "colors.h"
 
 #define METHOD_NAME_SZ     64
@@ -54,6 +55,7 @@ typedef uint32_t method_cap_t;
 #define METHOD_CAP_EMOTE   ((method_cap_t)1U << 0)  // third-person action (IRC CTCP ACTION, Discord italics, etc.)
 #define METHOD_CAP_EJECT   ((method_cap_t)1U << 1)  // can remove a participant from a room
 #define METHOD_CAP_SPOKEN  ((method_cap_t)1U << 2)  // replies are read aloud (TTS); fixed-width or columnar output is unusable, so data-bearing command output must be rephrased as prose
+#define METHOD_CAP_SIGHT   ((method_cap_t)1U << 3)  // can capture a still image of what the bot sees (method_capture_async)
 
 // Discriminator for the kind of event a method_msg_t carries. The
 // default (zero) is a normal chat/DM line. Other kinds describe
@@ -184,6 +186,19 @@ typedef enum
   METHOD_EJECT_SERVER = 2,  // off the platform entirely (IRC KILL)
 } method_eject_t;
 
+// One still image being captured for a consumer. Opaque: core owns it
+// from method_capture_async() until the driver hands it back through
+// method_capture_done(), which it does exactly once.
+typedef struct method_capture method_capture_t;
+
+// Delivered exactly once for every capture that went airborne, on a
+// thread of the driver's choosing and under no lock of core's. `image`
+// is NULL when nothing was captured; otherwise it is `image_len` bytes
+// of `mime`, valid only for the length of the call. The bytes came off a
+// device this process does not control — validate them before use.
+typedef void (*method_image_cb_t)(void *data, const void *image,
+    size_t image_len, const char *mime);
+
 // Functions a method plugin must implement — how a bot meets humans.
 // Stored in plugin_desc_t.ext for PLUGIN_METHOD plugins (IRC, voice,
 // Slack, etc.).
@@ -275,6 +290,13 @@ typedef struct
   // Optional — NULL means the driver can never eject.
   bool (*eject)(void *handle, const char *channel, const char *target,
       method_eject_t force, const char *reason);
+
+  // Begin capturing one still image of what the bot can see. true: the
+  // driver took `cap` and finishes it with method_capture_done() exactly
+  // once, from any thread, possibly before this returns. false: it did
+  // not, and nothing will fire. Optional — NULL means the bot has no eyes
+  // on this method. Advertise METHOD_CAP_SIGHT alongside it.
+  bool (*capture)(void *handle, method_capture_t *cap);
 } method_driver_t;
 
 typedef struct
@@ -350,6 +372,21 @@ method_eject_t method_eject_probe(method_inst_t *inst, const char *channel,
 // issued. Does not wait for the platform to confirm the removal.
 bool method_eject(method_inst_t *inst, const char *channel,
     const char *target, method_eject_t force, const char *reason);
+
+// Ask the method for one still image. ASYNC_AIRBORNE: `cb` fires exactly
+// once, with the image or with NULL. ASYNC_FAILED_UNDELIVERED: the method
+// has no eyes, is going away, or refused — nothing fired and `data` is
+// still the caller's. Never ASYNC_FAILED_DELIVERED.
+//
+// A consumer unloaded while its capture is airborne is not called back:
+// the capture completes and delivers to nobody, and `data` is leaked,
+// because only the consumer knew how to free it.
+async_rc_t method_capture_async(method_inst_t *inst, method_image_cb_t cb,
+    void *data);
+
+// A driver's one exit for a capture it accepted. `image` NULL on failure.
+void method_capture_done(method_capture_t *cap, const void *image,
+    size_t image_len, const char *mime);
 
 method_state_t method_get_state(const method_inst_t *inst);
 
@@ -462,6 +499,7 @@ void method_exit(void);
 #include "common.h"
 #include "clam.h"
 #include "alloc.h"
+#include "plugin.h"
 #include "sig.h"
 
 #define METHOD_SUB_NAME_SZ  64
@@ -518,6 +556,25 @@ static bool             method_ready = false;
 
 static method_sub_t    *method_sub_freelist = NULL;
 static uint32_t         method_sub_free_count = 0;
+
+// An airborne capture. `inst` is held for the capture's whole life;
+// `cb` is nulled, under method_capture_mutex, when the consumer's mapping
+// is about to be unloaded.
+struct method_capture
+{
+  struct method_capture *next;
+  method_inst_t         *inst;
+  method_image_cb_t      cb;
+  void                  *data;
+};
+
+// Every airborne capture, so the unmap listener can find the ones whose
+// consumer is leaving. Static-initialised: a driver may capture before
+// method_init() has run its first line.
+static pthread_mutex_t   method_capture_mutex = PTHREAD_MUTEX_INITIALIZER;
+static method_capture_t *method_capture_head  = NULL;
+
+static void method_capture_unmap_cb(uintptr_t lo, uintptr_t hi, void *data);
 
 #endif // METHOD_INTERNAL
 

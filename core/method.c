@@ -424,6 +424,131 @@ method_eject(method_inst_t *inst, const char *channel, const char *target,
   return(rc);
 }
 
+// Capture — the one optional driver call whose callback belongs to another
+// plugin. A consumer's `cb` rides the capture from here until the driver
+// finishes it, which can be seconds and can cross that consumer's unload,
+// so core files every airborne capture and keeps the pointer safe for all
+// of them rather than asking each driver to.
+
+async_rc_t
+method_capture_async(method_inst_t *inst, method_image_cb_t cb, void *data)
+{
+  method_capture_t *cap;
+
+  if(inst == NULL || cb == NULL || inst->driver == NULL
+      || inst->driver->capture == NULL || inst->handle == NULL)
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  cap = mem_alloc("method", "capture", sizeof(*cap));
+  cap->inst = inst;
+  cap->cb   = cb;
+  cap->data = data;
+  method_hold(inst);
+
+  pthread_mutex_lock(&method_capture_mutex);
+  cap->next           = method_capture_head;
+  method_capture_head = cap;
+  pthread_mutex_unlock(&method_capture_mutex);
+
+  if(inst->driver->capture(inst->handle, cap))
+    return(ASYNC_AIRBORNE);
+
+  // Refused, so by contract the driver never touched `cap` and it is
+  // still on the list exactly as filed.
+  pthread_mutex_lock(&method_capture_mutex);
+
+  for(method_capture_t **pp = &method_capture_head; *pp != NULL;
+      pp = &(*pp)->next)
+  {
+    if(*pp != cap)
+      continue;
+
+    *pp = cap->next;
+    break;
+  }
+
+  pthread_mutex_unlock(&method_capture_mutex);
+
+  method_release(inst);
+  mem_free(cap);
+  return(ASYNC_FAILED_UNDELIVERED);
+}
+
+void
+method_capture_done(method_capture_t *cap, const void *image,
+    size_t image_len, const char *mime)
+{
+  method_inst_t     *inst = cap->inst;
+  method_image_cb_t  cb;
+  void              *data;
+
+  // The callback is read in the same critical section the unmap sweep
+  // would null it in — read it afterwards and the two interleave.
+  pthread_mutex_lock(&method_capture_mutex);
+
+  for(method_capture_t **pp = &method_capture_head; *pp != NULL;
+      pp = &(*pp)->next)
+  {
+    if(*pp != cap)
+      continue;
+
+    *pp = cap->next;
+    break;
+  }
+
+  cb   = cap->cb;
+  data = cap->data;
+
+  pthread_mutex_unlock(&method_capture_mutex);
+
+  mem_free(cap);
+
+  if(image == NULL || image_len == 0 || mime == NULL)
+  {
+    image     = NULL;
+    image_len = 0;
+    mime      = NULL;
+  }
+
+  if(cb != NULL)
+    cb(data, image, image_len, mime);
+
+  method_release(inst);
+}
+
+// A mapping is about to be unloaded. Any capture whose consumer lives in
+// it completes and delivers to nobody; its `data` is leaked, since only
+// the consumer knew how to free it and the consumer is what is leaving.
+// The residual window is reachyapi_unmap_cb's: a completion that already
+// read `cb` is a few instructions from calling it.
+static void
+method_capture_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  uint32_t orphaned = 0;
+
+  (void)data;
+
+  pthread_mutex_lock(&method_capture_mutex);
+
+  for(method_capture_t *c = method_capture_head; c != NULL; c = c->next)
+  {
+    const uintptr_t cb = (uintptr_t)fn_addr(&c->cb);
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    c->cb   = NULL;
+    c->data = NULL;
+    orphaned++;
+  }
+
+  pthread_mutex_unlock(&method_capture_mutex);
+
+  if(orphaned > 0)
+    clam(CLAM_WARN, "method_capture", "%u capture(s) lost their consumer to an "
+        "unload; they will complete and deliver nothing", orphaned);
+}
+
 // State management
 
 method_state_t
@@ -969,6 +1094,7 @@ void
 method_init(void)
 {
   pthread_mutex_init(&method_mutex, NULL);
+  plugin_unmap_notify_register(method_capture_unmap_cb, NULL);
   method_ready = true;
 
   clam(CLAM_INFO, "method_init", "method subsystem initialized");
@@ -988,6 +1114,7 @@ method_exit(void)
       method_count, method_sub_free_count);
 
   method_ready = false;
+  plugin_unmap_notify_unregister(method_capture_unmap_cb);
 
   // Unregister all instances. Walk the list carefully since
   // method_unregister modifies it, so we always remove the head.
