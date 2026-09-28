@@ -913,9 +913,23 @@ void chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
 // the answer has to match the gate that admitted it. True follows the
 // text path all the way; false branches early to a plain caption that
 // shares nothing below the request but the two-block user turn.
+//
+// `sink`, when given, takes the plain caption instead of the channel: it
+// fires exactly once — with the caption, or with NULL when there is none
+// — from whichever thread finishes the request, and it forces the plain
+// register, since a voiced reply has no single line to hand back. It may
+// fire during a teardown; a sink holding its own record checks that
+// record's hold before touching anything the bot owned.
+typedef void (*chatbot_vision_sink_t)(void *data, const char *caption);
+
 void chatbot_reply_submit_vision(chatbot_state_t *st,
     const method_msg_t *msg, const char *source_url,
-    char *image_b64, const char *image_mime, bool in_voice);
+    char *image_b64, const char *image_mime, bool in_voice,
+    chatbot_vision_sink_t sink, void *sink_data);
+
+// True when `body` starts the way an image of `mime` must. The one check
+// every image from outside passes before it is shown to a model.
+bool chatbot_image_magic_ok(const char *body, size_t len, const char *mime);
 
 // Non-zero when `line` is an action rather than speech, and then the
 // offset of the action text within it -- past a CTCP opening delimiter
@@ -1240,6 +1254,12 @@ typedef struct
   // one line to plain_max_chars.
   bool            vision_plain;
   uint32_t        plain_max_chars;
+
+  // Where the plain caption goes instead of the channel, when the request
+  // was made for a caller rather than a room. Cleared as it fires, so
+  // req_free can tell a sink still owed its one call.
+  chatbot_vision_sink_t vision_sink;
+  void                 *vision_sink_data;
 
   char            chat_model[64];
   float           temperature;
@@ -1630,6 +1650,7 @@ bool chatbot_pricewatch_register(void);
 // Both write ONLY the invoking speaker's dossier — there is no target
 // argument, which is the whole of their permission model.
 bool chatbot_remember_register(void);
+bool chatbot_look_register(void);
 
 // The dossier of whoever typed ctx's line, created when `create` is set
 // and this is the first the bot has heard of them; 0 when the speaker

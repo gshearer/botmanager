@@ -91,6 +91,14 @@
 // from the ear.
 #define REACHY_WAV_MAX (25u * 32000u + 4096u)
 
+// Seconds a /frame.jpg may take. earbridge answers in ~0.2 s; this stays
+// under core's unload quiescence budget so a reload never waits it out.
+#define REACHY_FRAME_TIMEOUT 4
+
+// A body past this did not come from the eye: a 3840x2592 frame, the
+// camera's largest, encodes to ~2 MB.
+#define REACHY_FRAME_MAX (3u * 1024u * 1024u)
+
 // Live persist threads across every bound bot. Two slots per bot — ears
 // and mouth — against a tree-wide task_add_persist pool of 16, so the
 // array is generous, not tight.
@@ -299,6 +307,8 @@ static double reachy_kv_double(const reachy_state_t *, const char *);
 static bool reachy_bridge_url(char *, size_t);
 static void reachy_utt_done(const curl_response_t *);
 static void reachy_health_done(const curl_response_t *);
+static bool reachy_capture(void *, method_capture_t *);
+static void reachy_frame_done(const curl_response_t *);
 static bool reachy_prime_seq(reachy_state_t *, const char *);
 static void reachy_bridge_up(reachy_state_t *);
 static void reachy_bridge_down(reachy_state_t *);

@@ -66,8 +66,6 @@ static void vision_cooldown_stamp(chatbot_vision_cd_t *ring,
     const char *key, time_t now);
 static void vision_url_cd_key(const char *target, const char *url,
     char *out, size_t out_cap);
-static bool vision_magic_ok(const char *body, size_t len,
-    const char *mime);
 static void vision_on_fetch_done(const curl_response_t *resp);
 
 // ----------------------------------------------------------------------
@@ -488,8 +486,8 @@ vision_url_cd_key(const char *target, const char *url,
 // Fetch completion (curl worker thread)
 // ----------------------------------------------------------------------
 
-static bool
-vision_magic_ok(const char *body, size_t len, const char *mime)
+bool
+chatbot_image_magic_ok(const char *body, size_t len, const char *mime)
 {
   if(body == NULL || len < 8) return(false);
 
@@ -612,7 +610,7 @@ vision_on_fetch_done(const curl_response_t *resp)
     goto done;
   }
 
-  if(!vision_magic_ok(resp->body, resp->body_len, mime_canon))
+  if(!chatbot_image_magic_ok(resp->body, resp->body_len, mime_canon))
   {
     clam(CLAM_WARN, "vision",
         "fetch magic mismatch url='%s' mime='%s'",
@@ -666,7 +664,7 @@ vision_on_fetch_done(const curl_response_t *resp)
 
   // Ownership transfer: b64 is now owned by the reply pipeline.
   chatbot_reply_submit_vision(ctx->st, &synth, ctx->image_url,
-      b64, mime_canon, ctx->in_voice);
+      b64, mime_canon, ctx->in_voice, NULL, NULL);
   b64 = NULL;
 
   method_release(method);

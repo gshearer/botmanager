@@ -340,6 +340,16 @@ fact_kind_name(mem_fact_kind_t k)
   return("fact");
 }
 
+// Hand the caption to the caller that asked for it, once.
+static void
+vision_sink_fire(chatbot_req_t *r, const char *caption)
+{
+  chatbot_vision_sink_t sink = r->vision_sink;
+
+  r->vision_sink = NULL;
+  sink(r->vision_sink_data, caption);
+}
+
 // The instance reference r->method carries is given back here — the
 // reply streams from a curl worker long after the turn that started it,
 // and a `plugin reload irc` in between unregisters the instance the
@@ -351,6 +361,13 @@ static void
 req_free(chatbot_req_t *r)
 {
   if(r == NULL) return;
+
+  // A caller's sink is owed exactly one call, and this is the one path
+  // every request leaves by — so a request that ends without a caption
+  // says so here.
+  if(r->vision_sink != NULL)
+    vision_sink_fire(r, NULL);
+
   method_release(r->method);
   if(r->personality_body) mem_free(r->personality_body);
   if(r->contract_body)    mem_free(r->contract_body);
@@ -2108,7 +2125,11 @@ llm_done(const llm_chat_response_t *resp)
       char one[METHOD_TEXT_SZ];
 
       vision_plain_flatten(tail, r->plain_max_chars, one, sizeof(one));
-      if(one[0] != '\0')
+
+      if(r->vision_sink != NULL)
+        vision_sink_fire(r, one[0] != '\0' ? one : NULL);
+
+      else if(one[0] != '\0')
         send_reply_line(r, one);
     }
 
@@ -4527,7 +4548,7 @@ vision_plain_submit(chatbot_req_t *r)
 void
 chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
     const char *source_url, char *image_b64, const char *image_mime,
-    bool in_voice)
+    bool in_voice, chatbot_vision_sink_t sink, void *sink_data)
 {
   uint32_t top_k;
   uint32_t rr_cap;
@@ -4541,6 +4562,7 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   if(st == NULL || msg == NULL || image_b64 == NULL || image_mime == NULL)
   {
     if(image_b64 != NULL) mem_free(image_b64);
+    if(sink != NULL)      sink(sink_data, NULL);
     return;
   }
 
@@ -4571,8 +4593,10 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
       sizeof(r->reply_target));
 
   // Attach vision payload — from this point on req_free releases b64.
-  r->vision_active = true;
-  r->vision_plain  = !in_voice;
+  r->vision_active    = true;
+  r->vision_plain     = !in_voice || sink != NULL;
+  r->vision_sink      = sink;
+  r->vision_sink_data = sink_data;
   r->image_b64     = image_b64;
   snprintf(r->image_mime,       sizeof(r->image_mime),       "%s", image_mime);
   snprintf(r->image_source_url, sizeof(r->image_source_url), "%s",

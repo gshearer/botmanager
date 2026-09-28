@@ -444,6 +444,51 @@ reachy_health_done(const curl_response_t *resp)
   reachy_wait_unref(p);
 }
 
+// The eye: one still from the camera, through earbridge's /frame.jpg,
+// for whoever asked through method_capture_async(). Core owns `cap`, so
+// it rides the transfer as its user_data and needs no context of ours.
+static bool
+reachy_capture(void *handle, method_capture_t *cap)
+{
+  reachy_state_t *st = handle;
+  curl_request_t *cr;
+  char            base[REACHY_URL_SZ];
+  char            url[REACHY_URL_SZ];
+
+  if(reachy_stopping(st) || reachy_bridge_url(base, sizeof(base)) != SUCCESS)
+    return(false);
+
+  if((size_t)snprintf(url, sizeof(url), "%s/frame.jpg", base) >= sizeof(url))
+    return(false);
+
+  cr = curl_request_create(CURL_METHOD_GET, url, reachy_frame_done, cap);
+  curl_request_set_timeout(cr, REACHY_FRAME_TIMEOUT);
+
+  // A refused submit releases the request and never completes it, so
+  // `cap` is still core's to take back.
+  return(curl_request_submit(cr) == SUCCESS);
+}
+
+// Curl worker thread. The body dies with this callback, so the frame is
+// handed on from inside it.
+static void
+reachy_frame_done(const curl_response_t *resp)
+{
+  method_capture_t *cap = resp->user_data;
+
+  if(resp->status == 200 && resp->body_len > 0
+      && resp->body_len <= REACHY_FRAME_MAX)
+  {
+    method_capture_done(cap, resp->body, resp->body_len, "image/jpeg");
+    return;
+  }
+
+  clam(CLAM_WARN, REACHY_CTX,
+      "the eye answered http %ld with a %zu-byte body — no frame",
+      (long)resp->status, resp->body_len);
+  method_capture_done(cap, NULL, 0, NULL);
+}
+
 // Find out where the ear currently is before listening to it.
 //
 // earbridge keeps a ring of eight utterances and drops the oldest, so a
@@ -1966,7 +2011,7 @@ reachy_list_joined_channels(void *handle, method_joined_channel_cb_t cb,
 // non-bridged emitter that renders columns is the bit's next reader.
 static const method_driver_t reachy_driver = {
   .name                 = "reachy",
-  .caps                 = METHOD_CAP_SPOKEN,
+  .caps                 = METHOD_CAP_SPOKEN | METHOD_CAP_SIGHT,
   .colors               = NULL,
   .create               = reachy_create,
   .destroy              = reachy_destroy,
@@ -1980,6 +2025,7 @@ static const method_driver_t reachy_driver = {
   .get_self             = reachy_get_self,
   .eject_probe          = NULL,
   .eject                = NULL,
+  .capture              = reachy_capture,
 };
 
 // ----------------------------------------------------------------------
