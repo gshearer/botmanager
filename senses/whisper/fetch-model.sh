@@ -27,6 +27,13 @@
 # live beside it under senses/whisper/models/ (gitignored). WHISPER_DIR is
 # kept for a source checkout, which upstream's own downloader can then serve.
 #
+# ⚠ That directory is a STAGING copy since 2026-09-28. The server runs in the
+# `inference` container, which no longer sees /mnt/fast at all, and reads
+# /home/doc/models/ggml-large-v3-turbo.bin inside it. After a fetch, copy the
+# .bin and its .sha256 there:
+#   scp senses/whisper/models/ggml-large-v3-turbo.bin{,.sha256} \
+#       doc@10.68.100.56:models/
+#
 # Environment overrides:
 #   DEST_DIR   where the .bin lands     (default: senses/whisper/models)
 #   WHISPER_DIR whisper.cpp checkout,   (default: ~/src/whisper.cpp)

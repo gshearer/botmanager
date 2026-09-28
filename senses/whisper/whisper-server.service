@@ -55,9 +55,9 @@
 # Port map for the initiative: robot daemon 8000, earbridge 8090 (on the
 # robot), kokorod 8003, whisper-server 8004. The DGX Spark holds 8001/8002.
 # ⚠ Those last two no longer share a host: whisper moved to the `inference`
-# container (10.68.100.56) and kokorod did NOT, because it needs sherpa-onnx,
-# which is in no repo a container can install from. kokorod stays in `shell`
-# beside botman, on loopback. The split is deliberate, not drift.
+# container (10.68.100.56) and kokorod did NOT — it runs beside botman on
+# `lab`, on CPU, because Kokoro aborts on onnxruntime's CUDA provider
+# (senses/kokorod/kokorod.service). The split is deliberate, not drift.
 
 [Unit]
 Description=whisper.cpp STT server (reachy senses)
@@ -80,11 +80,18 @@ After=default.target
 # where the sharing is real.
 
 [Service]
+# ⭑ SELF-CONTAINED since 2026-09-28 (operator): `inference` has NO /mnt/fast
+# — it is a system of its own with both GPUs, not a consumer of the NAS tree.
+# Every file this unit needs (ggml-large-v3-turbo.bin, fetched on the
+# botmanager host by senses/whisper/fetch-model.sh, then scp'd — the .sha256
+# travels beside it) lives in the container's own /home/doc/models.
+# Getting a model there is a copy INTO the container (scp from wherever it was
+# fetched), never a bind mount back out.
 Type=simple
-WorkingDirectory=/mnt/fast/doc/projects/botmanager/senses/whisper
+WorkingDirectory=/home/doc/models
 # Fail loudly and immediately on a missing model rather than crash-looping on
 # an error message buried in whisper's own startup output.
-ExecStartPre=/usr/bin/test -r /mnt/fast/doc/projects/botmanager/senses/whisper/models/ggml-large-v3-turbo.bin
+ExecStartPre=/usr/bin/test -r /home/doc/models/ggml-large-v3-turbo.bin
 # --inference-path defaults to /inference on 1.9.1 (measured from --help,
 # 08-03); that is the route RCH-4's `whispercpp` stt_dialect posts to, and
 # it is why the STT service URL carries no /v1. Left at the default
@@ -102,15 +109,27 @@ ExecStartPre=/usr/bin/test -r /mnt/fast/doc/projects/botmanager/senses/whisper/m
 # resp->text[0] == '\0' test), so anything whisper declines costs nothing
 # downstream. If real speech starts coming back blank, lower -nth first.
 ExecStart=/usr/bin/whisper-server \
-    -m /mnt/fast/doc/projects/botmanager/senses/whisper/models/ggml-large-v3-turbo.bin \
+    -m /home/doc/models/ggml-large-v3-turbo.bin \
     --host 0.0.0.0 --port 8004 \
-    --suppress-nst -nth 0.8
-# ggml 0.21 loads its compute backends as separate .so files and does NOT
-# search /usr/lib/ggml on its own — without this the registry comes up with
-# zero devices and the GGML_ASSERT(device) in the header fires before the
-# port is ever bound.
-Environment=GGML_BACKEND_PATH=/usr/lib/ggml
-# The model load is ~1.6 GB off disk into VRAM; give it room before systemd
+    --suppress-nst -nth 0.8 -nfa
+# ⭑ ON THE B70 since 2026-09-27, not the 4090 — the operator's layout gives the
+# 4090 to the chat model alone and everything else the voice loop needs to
+# the Arc. Measured before the move on eight clips: transcripts identical to
+# the 4090's, 200-280 ms per utterance against 30-80. -nfa (flash attention
+# OFF) is ~70 ms FASTER on this card; it is in those numbers.
+#
+# The Vulkan backend is `extra/ggml-vulkan` UNPACKED into
+# ~/opt/ggml-vulkan-0.25.3, NOT installed. ⛔ Do not `pacman -S ggml-vulkan`:
+# every CUDA llama.cpp/whisper service here loads each backend in
+# /usr/lib/ggml at start and would spread onto Vulkan devices on its next
+# restart. ggml 0.25 still scans /usr/lib/ggml itself (CUDA + CPU load from
+# there — ggml-cpu stays REQUIRED, see the header); GGML_BACKEND_PATH adds the
+# one extra .so. CUDA is hidden so the 4090 cannot be picked, and Vulkan
+# device 1 is the B70 (device 0 is the 4090 seen through Vulkan).
+Environment=GGML_BACKEND_PATH=/home/doc/opt/ggml-vulkan-0.25.3/usr/lib/ggml/libggml-vulkan.so
+Environment=CUDA_VISIBLE_DEVICES=
+Environment=GGML_VK_VISIBLE_DEVICES=1
+# The model load is ~1.6 GB off disk into the B70; give it room before systemd
 # decides the unit is wedged.
 TimeoutStartSec=180
 Restart=on-failure
