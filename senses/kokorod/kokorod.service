@@ -1,63 +1,68 @@
 # kokorod.service — Kokoro text-to-speech for the reachy senses (RCH-3).
 #
-# Master copy. Install with:
-#   install -Dm644 senses/kokorod/kokorod.service \
-#       ~/.config/systemd/user/kokorod.service
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now kokorod
+# Master copy. Since 2026-09-28 this runs in the `inference` nspawn container
+# (10.68.100.56), NOT on the botmanager host — install it there by copy, since
+# that container has no /mnt/fast and cannot see this tree:
+#   scp build/senses/kokorod/kokorod doc@10.68.100.56:bin/kokorod
+#   tar -C senses/kokorod/models -cf - kokoro-multi-lang-v1_0 \
+#       | ssh doc@10.68.100.56 'tar -C models -xf -'
+#   scp senses/kokorod/kokorod.service doc@10.68.100.56:.config/systemd/user/
+#   ssh doc@10.68.100.56 'systemctl --user daemon-reload
+#                         systemctl --user enable --now kokorod'
+# ⚠ The binary is built on the botmanager host (the container never builds
+# software) and links the container's own `sherpa-onnx` package — rebuild and
+# re-copy after either side's sherpa-onnx changes version. 1.13.8 on both at
+# the move.
 #
-# A systemd *user* unit, like its whisper sibling. Unlike whisper this is
-# pure CPU — Kokoro synthesizes at roughly RTF 0.09 on eight threads, so the
-# 4090 stays entirely whisper's. Measured 2026-09-27 on `lab`: a 2.4 s line
-# takes 0.33 s on 4 threads, 0.24 on 8 and 16; past 8 buys almost nothing.
-# ⚠ onnxruntime-cuda (Arch 1.29.0-3) aborts building Kokoro's execution plan
-# on the CUDA provider, so --provider cuda is not a working option today. Loopback only: the sole consumer is the
-# botman daemon on this host, which uploads the finished WAV to the robot.
+# WHY IT MOVED (operator, 2026-09-28): `inference` is the self-contained home
+# of every model botmanager runs; kokorod was the last one living beside
+# botman. It came over byte-for-byte (377 files, tree sha256 4dc6566e…) and
+# synthesizes exactly as fast here as on `lab`: a 2.4 s line in 0.21 s on 8
+# threads, 16 no better. The price is one LAN hop for the WAV, ~100 KB per
+# second of speech.
 #
-# Port map for the initiative: robot daemon 8000, earbridge 8090 (on the
-# robot), kokorod 8003, whisper-server 8004. The DGX Spark holds 8001/8002.
+# Pure CPU. ⚠ onnxruntime-cuda (Arch 1.29.0-3, installed in this container)
+# aborts building Kokoro's execution plan on the CUDA provider, so
+# --provider cuda is not a working option today; its CPU path is fine. The
+# 4090 is karan's brain and the B70 holds whisper + embeddings either way.
 #
-# The binary is built by the main meson tree, guarded on the sherpa-onnx
-# package being installed. Model weights are gitignored and fetched per
-# TODO.md §RCH-2.
+# Port map: robot daemon 8000, earbridge 8090 (on the robot); in `inference`
+# kokorod 8003, whisper-server 8004, embeddings 8005, karan's chat 8008. The
+# DGX Sparks hold 8001/8006/8007.
+#
+# ⭑ What points botman here is the registry row, not this file:
+# `llm set service senses-tts url http://10.68.100.56:8003/v1` — never
+# del/add, which takes the bound model offline — and scripts/bm-restore.sh
+# registers the same on a rebuild. Moving this service again means both.
 
 [Unit]
 Description=kokorod — Kokoro TTS server (reachy senses)
 Documentation=https://github.com/k2-fsa/sherpa-onnx
 After=default.target
 
-# ⚠⚠ HOST GATE (2026-08-30). /home/doc and /mnt/fast are both shared
-# out to the parent host and to the other LXC containers under
-# /mnt/fast/lxc, so this unit file AND the default.target.wants/ symlink
-# that enables it are visible on every one of them — as are the venvs,
-# binaries and model weights the unit refers to. Without this gate each
-# of those hosts started its own copy.
-#
-# The marker lives on the container rootfs, which is NOT either shared
-# mount, so it exists on this host and nowhere else. Deliberately a file
-# rather than ConditionHost=: a hostname is renameable, and a rename
-# would disable autostart silently with no error anywhere. Create it
-# when installing this unit:
-#     sudo touch /etc/botmanager-host
-# A failed condition makes systemd SKIP the unit quietly — Result is
-# success, not failed — so Restart= does not engage.
-ConditionPathExists=/etc/botmanager-host
+# ⚠ NO HOST GATE, deliberately — as for whisper-server and embed-b70. The
+# ConditionPathExists=/etc/botmanager-host this unit carried from 2026-08-30
+# protected against one unit file being visible on every LXC through the
+# shared /home/doc. nspawn gives `inference` its OWN /home/doc and it has no
+# /mnt/fast, so there is nothing to protect against, and the marker does not
+# exist there — keeping the line would silently skip the unit at every boot.
 
 [Service]
 Type=simple
-WorkingDirectory=/mnt/fast/doc/projects/botmanager/senses/kokorod
+WorkingDirectory=/home/doc/models/kokoro-multi-lang-v1_0
 # Fail immediately and legibly if the model is missing, rather than letting
 # sherpa-onnx report it from inside a restart loop.
-ExecStartPre=/usr/bin/test -r /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/model.onnx
+ExecStartPre=/usr/bin/test -r /home/doc/models/kokoro-multi-lang-v1_0/model.onnx
 # ⚠ kokoro-multi-lang-v1_0, NOT v1_1 — v1.1 is the Mandarin model and has
 # none of af_heart / af_bella / am_michael. See TODO.md §SHERPA-TRUTH.
-ExecStart=/mnt/fast/doc/projects/botmanager/build/senses/kokorod/kokorod \
-    --model    /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/model.onnx \
-    --voices   /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/voices.bin \
-    --tokens   /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/tokens.txt \
-    --data-dir /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/espeak-ng-data \
-    --lexicon  /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/lexicon-us-en.txt \
-    --lang en --port 8003 --threads 8
+# --bind 0.0.0.0: botman reaches this from `lab` across the network.
+ExecStart=/home/doc/bin/kokorod \
+    --model    /home/doc/models/kokoro-multi-lang-v1_0/model.onnx \
+    --voices   /home/doc/models/kokoro-multi-lang-v1_0/voices.bin \
+    --tokens   /home/doc/models/kokoro-multi-lang-v1_0/tokens.txt \
+    --data-dir /home/doc/models/kokoro-multi-lang-v1_0/espeak-ng-data \
+    --lexicon  /home/doc/models/kokoro-multi-lang-v1_0/lexicon-us-en.txt \
+    --lang en --bind 0.0.0.0 --port 8003 --threads 8
 Restart=on-failure
 RestartSec=5
 SyslogIdentifier=kokorod
