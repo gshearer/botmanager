@@ -452,13 +452,6 @@ crypto_parse_args(const char *args, crypto_req_t *req, crypto_largs_t *la,
       continue;
     }
 
-    if(strcmp(tok, "-l") == 0 || strcmp(tok, "--list") == 0)
-    {
-      la->op = CRYPTO_OP_SHOW;
-      tok = strtok_r(NULL, " \t", &saveptr);
-      continue;
-    }
-
     if(strcmp(tok, "-a") == 0 || strcmp(tok, "--add") == 0 ||
        strcmp(tok, "-d") == 0 || strcmp(tok, "--del") == 0)
     {
@@ -486,6 +479,18 @@ crypto_parse_args(const char *args, crypto_req_t *req, crypto_largs_t *la,
 
       tok = strtok_r(NULL, " \t", &saveptr);
       continue;
+    }
+
+    // No selector starts with '-', so this is a flag we don't have —
+    // matching it as a symbol would only answer "not found".
+    if(tok[0] == '-')
+    {
+      char err[CRYPTO_REPLY_SZ];
+
+      snprintf(err, sizeof(err), "Unknown option '%s'. Lists: "
+          "!show crypto list [list]", tok);
+      cmd_reply(ctx, err);
+      return(false);
     }
 
     // Bare tokens are held verbatim and turned into selectors only after
@@ -611,7 +616,7 @@ crypto_expand(const cmd_ctx_t *ctx, crypto_req_t *req,
     if(rc == CRYPTO_LIST_NOSUCH)
     {
       snprintf(err, sizeof(err),
-          "No list called '%s'. Try !crypto --list", it->text);
+          "No list called '%s'. Try !show crypto list", it->text);
       cmd_reply(ctx, err);
       return(false);
     }
@@ -656,15 +661,14 @@ crypto_expand(const cmd_ctx_t *ctx, crypto_req_t *req,
   return(true);
 }
 
-// --list / --add / --del. Lists are userns-scoped, so every operation
-// needs a namespace; mutating one additionally needs a known user.
+// --add / --del. Lists are userns-scoped, so every operation needs a
+// namespace; mutating one additionally needs a known user. Reading them
+// is `show crypto list` below.
 static void
 crypto_list_cmd(const cmd_ctx_t *ctx, const crypto_largs_t *la)
 {
   userns_t *ns = userns_session_resolve(ctx);
   char      line[CRYPTO_REPLY_SZ];
-  char      names[CRYPTO_REPLY_SZ - 64];   // leaves room for the heading
-  uint32_t  count   = 0;
   uint8_t   changed = 0;
   uint8_t   total   = 0;
   bool      dropped = false;
@@ -672,28 +676,6 @@ crypto_list_cmd(const cmd_ctx_t *ctx, const crypto_largs_t *la)
 
   if(ns == NULL)   // the resolver already replied
     return;
-
-  if(la->op == CRYPTO_OP_SHOW)
-  {
-    if(crypto_lists_names(ns->id, names, sizeof(names), &count)
-        != CRYPTO_LIST_OK)
-    {
-      cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
-      return;
-    }
-
-    if(count == 0)
-    {
-      cmd_reply(ctx, "No crypto lists yet. "
-          "Make one: !crypto --add bags BTC ETH SOL");
-      return;
-    }
-
-    snprintf(line, sizeof(line), CLR_BOLD "Your crypto lists:" CLR_RESET
-        " %s", names);
-    cmd_reply(ctx, line);
-    return;
-  }
 
   if(ctx->username == NULL || ctx->username[0] == '\0')
   {
@@ -755,7 +737,7 @@ crypto_list_cmd(const cmd_ctx_t *ctx, const crypto_largs_t *la)
     }
 
     snprintf(line, sizeof(line),
-        CLR_GREEN "%s" CLR_RESET " @%s — %u symbol%s (view: !crypto @%s)",
+        CLR_GREEN "%s" CLR_RESET " @%s — %u symbol%s (view: !show crypto list %s)",
         (changed > 0) ? "Saved" : "No change", la->list, (unsigned)total,
         (total == 1) ? "" : "s", la->list);
     cmd_reply(ctx, line);
@@ -768,7 +750,7 @@ crypto_list_cmd(const cmd_ctx_t *ctx, const crypto_largs_t *la)
   if(rc == CRYPTO_LIST_NOSUCH)
   {
     snprintf(line, sizeof(line),
-        "No list called '%s'. Try !crypto --list", la->list);
+        "No list called '%s'. Try !show crypto list", la->list);
     cmd_reply(ctx, line);
     return;
   }
@@ -1132,10 +1114,73 @@ crypto_reply_verbose(const cmd_ctx_t *ctx,
 
 // --mcap card
 //
-// Six lines, each a fixed label column followed by dot-separated facts.
-// Everything here is read-only formatting of one global snapshot plus,
-// when it is already warm, the listings cache.
+// A grid, not a paragraph: a label column, then a right-aligned figure
+// and a right-aligned move, so the eye reads the numbers straight down
+// and the arrows line up. Context the figure needs (what it is a share
+// of, the cap behind a sector) trails in gray. Everything here is
+// read-only formatting of one global snapshot plus, when it is already
+// warm, the listings cache.
 
+#define CRYPTO_MCAP_LABEL_W  14
+#define CRYPTO_MCAP_VALUE_W  10
+#define CRYPTO_MCAP_MOVE_W    9
+#define CRYPTO_MCAP_BAR_W    20
+#define CRYPTO_MCAP_CELL_SZ  96
+
+// Appends `text` to `line` padded to `width` visible columns, right- or
+// left-aligned. A cell wider than its column is appended as-is.
+static void
+crypto_mcap_cell(char *line, size_t cap, const char *text, int width,
+    bool right)
+{
+  char cell[CRYPTO_MCAP_CELL_SZ];
+
+  snprintf(cell, sizeof(cell), "%s", text);
+
+  if(right)
+    display_align_right(cell, sizeof(cell), width);
+  else
+    display_align_left(cell, sizeof(cell), width);
+
+  display_cat(line, cap, cell);
+}
+
+// Starts a row with its label column; `indent` sets a row under a
+// subheading back by two, inside the same column width.
+static void
+crypto_mcap_label(char *line, size_t cap, const char *label, bool indent)
+{
+  char text[CRYPTO_MCAP_CELL_SZ];
+
+  snprintf(text, sizeof(text), CLR_BOLD CLR_CYAN "%s%s" CLR_RESET,
+      indent ? "  " : "", label);
+  line[0] = '\0';
+  crypto_mcap_cell(line, cap, text, CRYPTO_MCAP_LABEL_W, false);
+}
+
+// One grid row: label, figure, move, gray note. An empty move keeps its
+// column so the notes stay aligned; an empty note ends the row there.
+static void
+crypto_mcap_row(const cmd_ctx_t *ctx, const char *label, bool indent,
+    const char *value, const char *move, const char *note)
+{
+  char line[CRYPTO_REPLY_SZ];
+  char gray[CRYPTO_MCAP_CELL_SZ];
+
+  crypto_mcap_label(line, sizeof(line), label, indent);
+  crypto_mcap_cell(line, sizeof(line), value, CRYPTO_MCAP_VALUE_W, true);
+
+  if(move[0] != '\0' || note[0] != '\0')
+    crypto_mcap_cell(line, sizeof(line), move, CRYPTO_MCAP_MOVE_W, true);
+
+  if(note[0] != '\0')
+  {
+    snprintf(gray, sizeof(gray), "   " CLR_GRAY "%s" CLR_RESET, note);
+    display_cat(line, sizeof(line), gray);
+  }
+
+  cmd_reply(ctx, line);
+}
 
 // Advancers, decliners and the day's extremes among the top-ranked
 // coins. Leaves out->valid false when the listings cache is cold: the
@@ -1197,45 +1242,12 @@ crypto_reply_mcap(const cmd_ctx_t *ctx, const coinmarketcap_global_t *g)
 {
   crypto_breadth_t breadth;
   char             line[CRYPTO_REPLY_SZ];
-  char             cap[32], vol[32], vol_rep[32], alt[32];
-  char             cap_mv[48], vol_mv[48];
-  char             btc_mv[48], eth_mv[48];
-  char             defi_c[32], defi_v[32], defi_mv[48];
-  char             stable_c[32], stable_v[32], stable_mv[48];
-  char             deriv_v[32], deriv_mv[48];
+  char             val[32], mv[48], note[160];
   char             n_active[24], n_total[24], n_exch[24], n_pairs[24];
   char             n_new[24];
   char             age[24];
   double           turnover  = 0.0;
   double           alt_share = 0.0;
-
-  crypto_fmt_usd(g->total_cap,          cap,      sizeof(cap));
-  crypto_fmt_usd(g->total_vol,          vol,      sizeof(vol));
-  crypto_fmt_usd(g->total_vol_reported, vol_rep,  sizeof(vol_rep));
-  crypto_fmt_usd(g->altcoin_cap,        alt,      sizeof(alt));
-  crypto_fmt_usd(g->defi_cap,           defi_c,   sizeof(defi_c));
-  crypto_fmt_usd(g->defi_vol_24h,       defi_v,   sizeof(defi_v));
-  crypto_fmt_usd(g->stablecoin_cap,     stable_c, sizeof(stable_c));
-  crypto_fmt_usd(g->stablecoin_vol,     stable_v, sizeof(stable_v));
-  crypto_fmt_usd(g->derivatives_vol,    deriv_v,  sizeof(deriv_v));
-
-  crypto_fmt_move(crypto_pct_change(g->total_cap, g->total_cap_yest,
-      g->total_cap_chg_24h), cap_mv, sizeof(cap_mv));
-  crypto_fmt_move(crypto_pct_change(g->total_vol, g->total_vol_yest,
-      g->total_vol_chg_24h), vol_mv, sizeof(vol_mv));
-
-  crypto_fmt_points(g->btc_dom_chg_24h, btc_mv, sizeof(btc_mv));
-  crypto_fmt_points(g->eth_dom_chg_24h, eth_mv, sizeof(eth_mv));
-
-  crypto_fmt_move(g->defi_chg_24h,        defi_mv,   sizeof(defi_mv));
-  crypto_fmt_move(g->stablecoin_chg_24h,  stable_mv, sizeof(stable_mv));
-  crypto_fmt_move(g->derivatives_chg_24h, deriv_mv,  sizeof(deriv_mv));
-
-  crypto_fmt_count(g->active_cryptos,      n_active, sizeof(n_active));
-  crypto_fmt_count(g->total_cryptos,       n_total,  sizeof(n_total));
-  crypto_fmt_count(g->active_exchanges,    n_exch,   sizeof(n_exch));
-  crypto_fmt_count(g->active_market_pairs, n_pairs,  sizeof(n_pairs));
-  crypto_fmt_count(g->new_cryptos_24h,     n_new,    sizeof(n_new));
 
   crypto_fmt_age(g->fetched_at > 0
       ? (int64_t)time(NULL) - g->fetched_at : 0, age, sizeof(age));
@@ -1249,65 +1261,130 @@ crypto_reply_mcap(const cmd_ctx_t *ctx, const coinmarketcap_global_t *g)
   }
 
   snprintf(line, sizeof(line),
-      CLR_BOLD CLR_WHITE "Global Cryptocurrency Market" CLR_RESET
-      "  " CLR_GRAY "as of %s ago" CLR_RESET, age);
+      CLR_BOLD CLR_WHITE "Crypto market" CLR_RESET
+      CLR_GRAY "  ·  as of %s ago" CLR_RESET, age);
   cmd_reply(ctx, line);
 
-  snprintf(line, sizeof(line),
-      CRYPTO_CARD_LABEL CLR_BOLD CLR_WHITE "%s" CLR_RESET " %s"
-      CRYPTO_CARD_DOT "24h volume " CLR_WHITE "%s" CLR_RESET " %s"
-      CLR_GRAY " (%s reported)" CLR_RESET
-      CRYPTO_CARD_DOT "turnover " CLR_WHITE "%.1f%%" CLR_RESET,
-      "Market", cap, cap_mv, vol, vol_mv, vol_rep, turnover);
-  cmd_reply(ctx, line);
+  // The market as a whole.
+  crypto_fmt_usd(g->total_cap, val, sizeof(val));
+  crypto_fmt_move(crypto_pct_change(g->total_cap, g->total_cap_yest,
+      g->total_cap_chg_24h), mv, sizeof(mv));
+  crypto_mcap_row(ctx, "Market cap", false, val, mv, "");
 
-  snprintf(line, sizeof(line),
-      CRYPTO_CARD_LABEL CLR_YELLOW "BTC" CLR_RESET " %.1f%% %s"
-      CRYPTO_CARD_DOT CLR_CYAN "ETH" CLR_RESET " %.1f%% %s"
-      CRYPTO_CARD_DOT "altcoins " CLR_WHITE "%s" CLR_RESET " (%.1f%%)",
-      "Dominance", g->btc_dom, btc_mv, g->eth_dom, eth_mv, alt, alt_share);
-  cmd_reply(ctx, line);
+  crypto_fmt_usd(g->total_vol, val, sizeof(val));
+  crypto_fmt_move(crypto_pct_change(g->total_vol, g->total_vol_yest,
+      g->total_vol_chg_24h), mv, sizeof(mv));
+  crypto_fmt_usd(g->total_vol_reported, note, sizeof(note));
+  strlcat(note, " reported", sizeof(note));
+  crypto_mcap_row(ctx, "Volume 24h", false, val, mv, note);
 
-  // Each sector's percentage belongs to its 24-hour volume, so the cap
-  // and the traded figure are stated side by side and the arrow sits
-  // against the one it actually describes.
-  snprintf(line, sizeof(line),
-      CRYPTO_CARD_LABEL "stablecoins " CLR_WHITE "%s" CLR_RESET " cap, "
-      CLR_WHITE "%s" CLR_RESET " traded %s"
-      CRYPTO_CARD_DOT "DeFi " CLR_WHITE "%s" CLR_RESET " cap, "
-      CLR_WHITE "%s" CLR_RESET " traded %s"
-      CRYPTO_CARD_DOT "derivatives " CLR_WHITE "%s" CLR_RESET " traded %s",
-      "Sectors", stable_c, stable_v, stable_mv, defi_c, defi_v, defi_mv,
-      deriv_v, deriv_mv);
-  cmd_reply(ctx, line);
+  snprintf(val, sizeof(val), "%.1f%%", turnover);
+  crypto_mcap_row(ctx, "Turnover", false, val, "", "of market cap, 24h");
 
-  snprintf(line, sizeof(line),
-      CRYPTO_CARD_LABEL CLR_WHITE "%s" CLR_RESET " active of "
-      CLR_WHITE "%s" CLR_RESET " tracked"
-      CRYPTO_CARD_DOT CLR_WHITE "%s" CLR_RESET " exchanges"
-      CRYPTO_CARD_DOT CLR_WHITE "%s" CLR_RESET " market pairs"
-      CRYPTO_CARD_DOT CLR_WHITE "%s" CLR_RESET " new in 24h",
-      "Universe", n_active, n_total, n_exch, n_pairs, n_new);
-  cmd_reply(ctx, line);
+  // Who holds the market.
+  snprintf(val, sizeof(val), "%.1f%%", g->btc_dom);
+  crypto_fmt_points(g->btc_dom_chg_24h, mv, sizeof(mv));
+  crypto_mcap_row(ctx, "BTC dominance", false, val, mv, "pts");
 
+  snprintf(val, sizeof(val), "%.1f%%", g->eth_dom);
+  crypto_fmt_points(g->eth_dom_chg_24h, mv, sizeof(mv));
+  crypto_mcap_row(ctx, "ETH dominance", false, val, mv, "pts");
+
+  crypto_fmt_usd(g->altcoin_cap, val, sizeof(val));
+  snprintf(note, sizeof(note), "%.1f%% of market cap", alt_share);
+  crypto_mcap_row(ctx, "Altcoins", false, val, "", note);
+
+  // Each sector's percentage belongs to its 24-hour volume, so volume is
+  // the figure the arrow sits beside and the cap trails as context.
+  cmd_reply(ctx, CLR_BOLD CLR_CYAN "Sectors" CLR_RESET
+      CLR_GRAY "  ·  24h volume" CLR_RESET);
+
+  crypto_fmt_usd(g->stablecoin_vol, val, sizeof(val));
+  crypto_fmt_move(g->stablecoin_chg_24h, mv, sizeof(mv));
+  crypto_fmt_usd(g->stablecoin_cap, note + 4, sizeof(note) - 4);
+  memcpy(note, "cap ", 4);
+  crypto_mcap_row(ctx, "Stablecoins", true, val, mv, note);
+
+  crypto_fmt_usd(g->defi_vol_24h, val, sizeof(val));
+  crypto_fmt_move(g->defi_chg_24h, mv, sizeof(mv));
+  crypto_fmt_usd(g->defi_cap, note + 4, sizeof(note) - 4);
+  memcpy(note, "cap ", 4);
+  crypto_mcap_row(ctx, "DeFi", true, val, mv, note);
+
+  crypto_fmt_usd(g->derivatives_vol, val, sizeof(val));
+  crypto_fmt_move(g->derivatives_chg_24h, mv, sizeof(mv));
+  crypto_mcap_row(ctx, "Derivatives", true, val, mv, "");
+
+  // Breadth: the top of the market as a bar, then its two extremes.
   crypto_breadth_survey(&breadth);
 
   if(breadth.valid)
   {
-    char best[48], worst[48];
+    char best[48], worst[48], label[24];
+    int  up_cells = 0;
+    int  dn_cells = 0;
+
+    snprintf(label, sizeof(label), "Top %" PRId32, breadth.counted);
+    crypto_mcap_label(line, sizeof(line), label, false);
+
+    if(breadth.counted > 0)
+    {
+      up_cells = (int)lround((double)breadth.up * CRYPTO_MCAP_BAR_W
+          / breadth.counted);
+      dn_cells = (int)lround((double)breadth.down * CRYPTO_MCAP_BAR_W
+          / breadth.counted);
+
+      if(up_cells + dn_cells > CRYPTO_MCAP_BAR_W)
+        dn_cells = CRYPTO_MCAP_BAR_W - up_cells;
+    }
+
+    display_cat(line, sizeof(line), CLR_GREEN);
+    for(int i = 0; i < up_cells; i++)
+      display_cat(line, sizeof(line), "█");
+
+    display_cat(line, sizeof(line), CLR_RED);
+    for(int i = 0; i < dn_cells; i++)
+      display_cat(line, sizeof(line), "█");
+
+    display_cat(line, sizeof(line), CLR_GRAY);
+    for(int i = up_cells + dn_cells; i < CRYPTO_MCAP_BAR_W; i++)
+      display_cat(line, sizeof(line), "░");
+
+    snprintf(note, sizeof(note), CLR_RESET "  " CLR_GREEN "%" PRId32 " up"
+        CLR_RESET CLR_GRAY " · " CLR_RESET CLR_RED "%" PRId32 " down"
+        CLR_RESET, breadth.up, breadth.down);
+    display_cat(line, sizeof(line), note);
+    cmd_reply(ctx, line);
 
     crypto_fmt_move(breadth.best_pct,  best,  sizeof(best));
     crypto_fmt_move(breadth.worst_pct, worst, sizeof(worst));
 
-    snprintf(line, sizeof(line),
-        CRYPTO_CARD_LABEL "top %" PRId32 ": " CLR_GREEN "%" PRId32
-        " up" CLR_RESET " / " CLR_RED "%" PRId32 " down" CLR_RESET
-        CRYPTO_CARD_DOT "best " CLR_WHITE "%s" CLR_RESET " %s"
-        CRYPTO_CARD_DOT "worst " CLR_WHITE "%s" CLR_RESET " %s",
-        "Breadth", breadth.counted, breadth.up, breadth.down,
-        breadth.best, best, breadth.worst, worst);
+    crypto_mcap_label(line, sizeof(line), "Best", true);
+    crypto_mcap_cell(line, sizeof(line), breadth.best,
+        CRYPTO_MCAP_VALUE_W, true);
+    crypto_mcap_cell(line, sizeof(line), best, CRYPTO_MCAP_MOVE_W, true);
+    cmd_reply(ctx, line);
+
+    crypto_mcap_label(line, sizeof(line), "Worst", true);
+    crypto_mcap_cell(line, sizeof(line), breadth.worst,
+        CRYPTO_MCAP_VALUE_W, true);
+    crypto_mcap_cell(line, sizeof(line), worst, CRYPTO_MCAP_MOVE_W, true);
     cmd_reply(ctx, line);
   }
+
+  // The universe the figures above are drawn from.
+  crypto_fmt_count(g->active_cryptos,      n_active, sizeof(n_active));
+  crypto_fmt_count(g->total_cryptos,       n_total,  sizeof(n_total));
+  crypto_fmt_count(g->active_exchanges,    n_exch,   sizeof(n_exch));
+  crypto_fmt_count(g->active_market_pairs, n_pairs,  sizeof(n_pairs));
+  crypto_fmt_count(g->new_cryptos_24h,     n_new,    sizeof(n_new));
+
+  snprintf(note, sizeof(note), "active of %s  ·  %s new today",
+      n_total, n_new);
+  crypto_mcap_row(ctx, "Coins", false, n_active, "", note);
+
+  snprintf(note, sizeof(note), "%s market pairs", n_pairs);
+  crypto_mcap_row(ctx, "Exchanges", false, n_exch, "", note);
 }
 
 // Request factory — deep-copies the command context so it survives
@@ -1540,6 +1617,114 @@ static const cmd_nl_t crypto_nl = {
                              / sizeof(crypto_nl_examples[0])),
 };
 
+// ----------------------------------------------------------------------
+// show crypto — the read-only side of lists
+// ----------------------------------------------------------------------
+
+static void
+crypto_show_cmd(const cmd_ctx_t *ctx)
+{
+  cmd_reply(ctx, "usage: !show crypto list [list]");
+}
+
+// `show crypto list` names every list in the namespace with its size;
+// `show crypto list <name>` spells one out. Neither touches CoinMarketCap
+// — `!crypto @name` is how a list gets priced.
+static void
+crypto_show_list_cmd(const cmd_ctx_t *ctx)
+{
+  userns_t         *ns = userns_session_resolve(ctx);
+  char              line[CRYPTO_REPLY_SZ];
+  char              body[CRYPTO_REPLY_SZ - 64];   // leaves room for the heading
+  char              name[CRYPTO_LIST_NAME_SZ] = "";
+  const char       *arg = ctx->args;
+  crypto_symset_t   set;
+  crypto_list_rc_t  rc;
+  uint32_t          count = 0;
+  size_t            used  = 0;
+  size_t            j     = 0;
+
+  if(ns == NULL)   // the resolver already replied
+    return;
+
+  while(arg != NULL && (*arg == ' ' || *arg == '\t'))
+    arg++;
+
+  // Same folding as --add/--del: an optional '@', lowercased, and only
+  // the first word — the name grammar has no spaces in it.
+  if(arg != NULL && *arg == '@')
+    arg++;
+
+  for(; arg != NULL && arg[j] != '\0' && arg[j] != ' ' && arg[j] != '\t'
+      && j + 1 < sizeof(name); j++)
+    name[j] = (char)tolower((unsigned char)arg[j]);
+
+  name[j] = '\0';
+
+  if(name[0] == '\0')
+  {
+    if(crypto_lists_names(ns->id, body, sizeof(body), &count)
+        != CRYPTO_LIST_OK)
+    {
+      cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
+      return;
+    }
+
+    if(count == 0)
+    {
+      cmd_reply(ctx, "No crypto lists yet. "
+          "Make one: !crypto --add bags BTC ETH SOL");
+      return;
+    }
+
+    snprintf(line, sizeof(line), CLR_BOLD "Your crypto lists:" CLR_RESET
+        " %s", body);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(!crypto_list_name_ok(name))
+  {
+    cmd_reply(ctx, "List names are up to 32 letters, digits, '-' or '_'.");
+    return;
+  }
+
+  rc = crypto_lists_get(ns->id, name, &set);
+
+  if(rc == CRYPTO_LIST_NOSUCH)
+  {
+    snprintf(line, sizeof(line),
+        "No list called '%s'. Try !show crypto list", name);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(rc != CRYPTO_LIST_OK)
+  {
+    cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
+    return;
+  }
+
+  body[0] = '\0';
+
+  // CRYPTO_LIST_MAX symbols of COINMARKETCAP_SYMBOL_SZ always fit `body`;
+  // the bound is belt and braces against either constant growing.
+  for(uint8_t i = 0; i < set.n; i++)
+  {
+    int wrote = snprintf(body + used, sizeof(body) - used, "%s%s",
+        (i > 0) ? " " : "", set.sym[i]);
+
+    if(wrote < 0 || (size_t)wrote >= sizeof(body) - used)
+      break;
+
+    used += (size_t)wrote;
+  }
+
+  snprintf(line, sizeof(line), CLR_BOLD "@%s" CLR_RESET " (%u): %s",
+      name, (unsigned)set.n, body);
+  cmd_reply(ctx, line);
+}
+
 // Plugin lifecycle
 
 static const cmd_decl_t crypto_decl = {
@@ -1547,7 +1732,7 @@ static const cmd_decl_t crypto_decl = {
   .name        = "crypto",
   .usage       =
       "crypto [options] [@list|symbol|rank|range…] | crypto --verbose <symbol>"
-      " | crypto --mcap | crypto --list"
+      " | crypto --mcap"
       " | crypto --add|--del <list> <symbols…>",
   .description = "Show cryptocurrency market data from CoinMarketCap",
   .help_long   =
@@ -1556,9 +1741,9 @@ static const cmd_decl_t crypto_decl = {
       "supply, tags, the chains it is deployed on and its links. "
       "--mcap reports the whole market: capitalisation, volume, "
       "dominance, sectors and breadth. "
-      "--list shows your lists; --add creates or appends to one and "
-      "--del removes symbols (a list disappears when its last symbol "
-      "does). Lists are private to your namespace and holding or "
+      "--add creates or appends to a list and --del removes symbols (a "
+      "list disappears when its last symbol does); `show crypto list` "
+      "reads them. Lists are private to your namespace and holding or "
       "changing one requires a known user.",
   .group       = "everyone",
   .scope       = CMD_SCOPE_ANY,
@@ -1568,10 +1753,44 @@ static const cmd_decl_t crypto_decl = {
   .nl          = &crypto_nl,
 };
 
+static const cmd_decl_t show_crypto_decl = {
+  .module      = CRYPTO_CTX,
+  .name        = "crypto",
+  .usage       = "show crypto <subcommand> ...",
+  .description = "Read-only views of the crypto command's state.",
+  .help_long   = "Subcommands: list.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = crypto_show_cmd,
+  .parent_path = "show",
+  .abbrev      = "c",
+};
+
+static const cmd_decl_t show_crypto_list_decl = {
+  .module      = CRYPTO_CTX,
+  .name        = "list",
+  .usage       = "show crypto list [list]",
+  .description = "Your saved crypto lists, or the symbols in one.",
+  .help_long   = "Bare: every list in this namespace with its symbol count. "
+                 "With a name (the '@' is optional): that list's symbols, "
+                 "without quoting them — `!crypto @name` prices a list.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = crypto_show_list_cmd,
+  .parent_path = "show/crypto",
+};
+
 static bool
 crypto_init(void)
 {
   if(cmd_register(&crypto_decl) != SUCCESS)
+    return(FAIL);
+
+  // Parent before child: show/crypto/list resolves through show/crypto.
+  if(cmd_register(&show_crypto_decl) != SUCCESS
+      || cmd_register(&show_crypto_list_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, CRYPTO_CTX, "crypto command plugin initialized");
@@ -1595,6 +1814,7 @@ crypto_start(void)
 static void
 crypto_deinit(void)
 {
+  cmd_unregister_path("show/crypto");
   cmd_unregister_path("crypto");
 
   clam(CLAM_INFO, CRYPTO_CTX, "crypto command plugin deinitialized");

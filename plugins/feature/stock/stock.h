@@ -63,7 +63,6 @@ typedef struct
 typedef enum
 {
   STOCK_OP_NONE,
-  STOCK_OP_SHOW,   // --list
   STOCK_OP_ADD,    // --add <name> <syms…>
   STOCK_OP_DEL     // --del <name> <syms…>
 } stock_list_op_t;
@@ -101,6 +100,8 @@ typedef struct
 // than reaching a translation unit that can never define them.
 #ifdef STOCK_CMD_UNIT
 static void stock_cmd(const cmd_ctx_t *);
+static void stock_show_cmd(const cmd_ctx_t *);
+static void stock_show_list_cmd(const cmd_ctx_t *);
 static bool stock_init(void);
 static bool stock_start(void);
 static void stock_deinit(void);

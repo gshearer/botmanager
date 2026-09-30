@@ -675,6 +675,7 @@ static bool
 stock_parse(const cmd_ctx_t *ctx, const char *args, stock_args_t *out)
 {
   char  buf[STOCK_REPLY_SZ];
+  char  line[STOCK_REPLY_SZ];
   char *save = NULL;
   char *tok;
 
@@ -714,13 +715,6 @@ stock_parse(const cmd_ctx_t *ctx, const char *args, stock_args_t *out)
       break;
     }
 
-    if(strcmp(tok, "-l") == 0 || strcmp(tok, "--list") == 0)
-    {
-      out->op = STOCK_OP_SHOW;
-      tok = strtok_r(NULL, " \t", &save);
-      continue;
-    }
-
     if(strcmp(tok, "-a") == 0 || strcmp(tok, "--add") == 0 ||
        strcmp(tok, "-d") == 0 || strcmp(tok, "--del") == 0)
     {
@@ -748,6 +742,16 @@ stock_parse(const cmd_ctx_t *ctx, const char *args, stock_args_t *out)
 
       tok = strtok_r(NULL, " \t", &save);
       continue;
+    }
+
+    // No ticker starts with '-', so this is a flag we don't have —
+    // quoting it as a symbol would only answer "no data".
+    if(tok[0] == '-')
+    {
+      snprintf(line, sizeof(line), "Unknown option '%s'. Lists: "
+          "!show stock list [list]", tok);
+      cmd_reply(ctx, line);
+      return(false);
     }
 
     // bare token: one or more comma-separated symbols or '@list' refs
@@ -845,7 +849,7 @@ stock_expand(const cmd_ctx_t *ctx, stock_args_t *a)
     if(rc == STOCK_LIST_NOSUCH)
     {
       snprintf(line, sizeof(line),
-          "No list called '%s'. Try !stock --list", it->text);
+          "No list called '%s'. Try !show stock list", it->text);
       cmd_reply(ctx, line);
       return(false);
     }
@@ -872,15 +876,14 @@ stock_expand(const cmd_ctx_t *ctx, stock_args_t *a)
   return(true);
 }
 
-// --list / --add / --del. Lists are userns-scoped, so every operation
-// needs a namespace; mutating one additionally needs a known user.
+// --add / --del. Lists are userns-scoped, so every operation needs a
+// namespace; mutating one additionally needs a known user. Reading them
+// is `show stock list` below.
 static void
 stock_list_cmd(const cmd_ctx_t *ctx, const stock_args_t *a)
 {
   userns_t *ns = userns_session_resolve(ctx);
   char      line[STOCK_REPLY_SZ];
-  char      names[STOCK_REPLY_SZ - 64];   // leaves room for the heading
-  uint32_t  count   = 0;
   uint8_t   changed = 0;
   uint8_t   total   = 0;
   bool      dropped = false;
@@ -888,28 +891,6 @@ stock_list_cmd(const cmd_ctx_t *ctx, const stock_args_t *a)
 
   if(ns == NULL)   // the resolver already replied
     return;
-
-  if(a->op == STOCK_OP_SHOW)
-  {
-    if(stock_lists_names(ns->id, names, sizeof(names), &count)
-        != STOCK_LIST_OK)
-    {
-      cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
-      return;
-    }
-
-    if(count == 0)
-    {
-      cmd_reply(ctx, "No stock lists yet. "
-          "Make one: !stock --add tech AAPL MSFT NVDA");
-      return;
-    }
-
-    snprintf(line, sizeof(line), CLR_BOLD "Your stock lists:" CLR_RESET
-        " %s", names);
-    cmd_reply(ctx, line);
-    return;
-  }
 
   if(ctx->username == NULL || ctx->username[0] == '\0')
   {
@@ -971,7 +952,7 @@ stock_list_cmd(const cmd_ctx_t *ctx, const stock_args_t *a)
     }
 
     snprintf(line, sizeof(line),
-        CLR_GREEN "%s" CLR_RESET " @%s — %u symbol%s (view: !stock @%s)",
+        CLR_GREEN "%s" CLR_RESET " @%s — %u symbol%s (view: !show stock list %s)",
         (changed > 0) ? "Saved" : "No change", a->list, (unsigned)total,
         (total == 1) ? "" : "s", a->list);
     cmd_reply(ctx, line);
@@ -984,7 +965,7 @@ stock_list_cmd(const cmd_ctx_t *ctx, const stock_args_t *a)
   if(rc == STOCK_LIST_NOSUCH)
   {
     snprintf(line, sizeof(line),
-        "No list called '%s'. Try !stock --list", a->list);
+        "No list called '%s'. Try !show stock list", a->list);
     cmd_reply(ctx, line);
     return;
   }
@@ -1072,7 +1053,7 @@ stock_cmd(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "Usage: !stock [-v] <@list|symbol…>  |  !stock -s <search words>"
-        "  |  !stock --list");
+        "  |  !show stock list [list]");
     return;
   }
 
@@ -1134,20 +1115,128 @@ static const cmd_nl_t stock_nl = {
 };
 
 // ----------------------------------------------------------------------
+// show stock — the read-only side of lists
+// ----------------------------------------------------------------------
+
+static void
+stock_show_cmd(const cmd_ctx_t *ctx)
+{
+  cmd_reply(ctx, "usage: !show stock list [list]");
+}
+
+// `show stock list` names every list in the namespace with its size;
+// `show stock list <name>` spells one out. Neither touches the quote
+// provider — `!stock @name` is how a list gets priced.
+static void
+stock_show_list_cmd(const cmd_ctx_t *ctx)
+{
+  userns_t       *ns = userns_session_resolve(ctx);
+  char            line[STOCK_REPLY_SZ];
+  char            body[STOCK_REPLY_SZ - 64];   // leaves room for the heading
+  char            name[STOCK_LIST_NAME_SZ] = "";
+  const char     *arg = ctx->args;
+  stock_symset_t  set;
+  stock_list_rc_t rc;
+  uint32_t        count = 0;
+  size_t          used  = 0;
+  size_t          j     = 0;
+
+  if(ns == NULL)   // the resolver already replied
+    return;
+
+  while(arg != NULL && (*arg == ' ' || *arg == '	'))
+    arg++;
+
+  // Same folding as --add/--del: an optional '@', lowercased, and only
+  // the first word — the name grammar has no spaces in it.
+  if(arg != NULL && *arg == '@')
+    arg++;
+
+  for(; arg != NULL && arg[j] != '\0' && arg[j] != ' ' && arg[j] != '\t'
+      && j + 1 < sizeof(name); j++)
+    name[j] = (char)tolower((unsigned char)arg[j]);
+
+  name[j] = '\0';
+
+  if(name[0] == '\0')
+  {
+    if(stock_lists_names(ns->id, body, sizeof(body), &count)
+        != STOCK_LIST_OK)
+    {
+      cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
+      return;
+    }
+
+    if(count == 0)
+    {
+      cmd_reply(ctx, "No stock lists yet. "
+          "Make one: !stock --add tech AAPL MSFT NVDA");
+      return;
+    }
+
+    snprintf(line, sizeof(line), CLR_BOLD "Your stock lists:" CLR_RESET
+        " %s", body);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(!stock_list_name_ok(name))
+  {
+    cmd_reply(ctx, "List names are up to 32 letters, digits, '-' or '_'.");
+    return;
+  }
+
+  rc = stock_lists_get(ns->id, name, &set);
+
+  if(rc == STOCK_LIST_NOSUCH)
+  {
+    snprintf(line, sizeof(line),
+        "No list called '%s'. Try !show stock list", name);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(rc != STOCK_LIST_OK)
+  {
+    cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
+    return;
+  }
+
+  body[0] = '\0';
+
+  // STOCK_LIST_MAX symbols of STOCK_SYM_SZ always fit `body`; the bound
+  // is belt and braces against either constant growing.
+  for(uint8_t i = 0; i < set.n; i++)
+  {
+    int wrote = snprintf(body + used, sizeof(body) - used, "%s%s",
+        (i > 0) ? " " : "", set.sym[i]);
+
+    if(wrote < 0 || (size_t)wrote >= sizeof(body) - used)
+      break;
+
+    used += (size_t)wrote;
+  }
+
+  snprintf(line, sizeof(line), CLR_BOLD "@%s" CLR_RESET " (%u): %s",
+      name, (unsigned)set.n, body);
+  cmd_reply(ctx, line);
+}
+
+// ----------------------------------------------------------------------
 // Plugin lifecycle
 // ----------------------------------------------------------------------
 
 static const cmd_decl_t stock_decl = {
   .module      = STOCK_CTX,
   .name        = "stock",
-  .usage       = "stock [-v] <@list|symbol…> | stock -s <words> | stock --list"
+  .usage       = "stock [-v] <@list|symbol…> | stock -s <words>"
                  " | stock --add|--del <list> <symbols…>",
   .description = "Stock, ETF, fund, index, FX and commodity quotes",
   .help_long   =
       "Quote one or more symbols, or a saved list with @name. "
-      "--list shows your lists; --add creates or appends to one and "
-      "--del removes symbols (a list disappears when its last symbol "
-      "does). Lists are private to your namespace and holding or "
+      "--add creates or appends to a list and --del removes symbols (a "
+      "list disappears when its last symbol does); `show stock list` "
+      "reads them. Lists are private to your namespace and holding or "
       "changing one requires a known user.",
   .group       = "everyone",
   .scope       = CMD_SCOPE_ANY,
@@ -1157,10 +1246,44 @@ static const cmd_decl_t stock_decl = {
   .nl          = &stock_nl,
 };
 
+static const cmd_decl_t show_stock_decl = {
+  .module      = STOCK_CTX,
+  .name        = "stock",
+  .usage       = "show stock <subcommand> ...",
+  .description = "Read-only views of the stock command's state.",
+  .help_long   = "Subcommands: list.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = stock_show_cmd,
+  .parent_path = "show",
+  .abbrev      = "$",
+};
+
+static const cmd_decl_t show_stock_list_decl = {
+  .module      = STOCK_CTX,
+  .name        = "list",
+  .usage       = "show stock list [list]",
+  .description = "Your saved stock lists, or the symbols in one.",
+  .help_long   = "Bare: every list in this namespace with its symbol count. "
+                 "With a name (the '@' is optional): that list's symbols, "
+                 "without quoting them — `!stock @name` prices a list.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = stock_show_list_cmd,
+  .parent_path = "show/stock",
+};
+
 static bool
 stock_init(void)
 {
   if(cmd_register(&stock_decl) != SUCCESS)
+    return(FAIL);
+
+  // Parent before child: show/stock/list resolves through show/stock.
+  if(cmd_register(&show_stock_decl) != SUCCESS
+      || cmd_register(&show_stock_list_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, STOCK_CTX, "stock command plugin initialized");
@@ -1184,6 +1307,7 @@ stock_start(void)
 static void
 stock_deinit(void)
 {
+  cmd_unregister_path("show/stock");
   cmd_unregister_path("stock");
 
   clam(CLAM_INFO, STOCK_CTX, "stock command plugin deinitialized");

@@ -56,7 +56,6 @@ typedef struct
 typedef enum
 {
   CRYPTO_OP_NONE,
-  CRYPTO_OP_SHOW,   // --list
   CRYPTO_OP_ADD,    // --add <name> <syms…>
   CRYPTO_OP_DEL     // --del <name> <syms…>
 } crypto_list_op_t;
@@ -134,6 +133,8 @@ typedef struct
 // than reaching a translation unit that can never define them.
 #ifdef CRYPTO_CMD_UNIT
 static void crypto_cmd_crypto(const cmd_ctx_t *ctx);
+static void crypto_show_cmd(const cmd_ctx_t *ctx);
+static void crypto_show_list_cmd(const cmd_ctx_t *ctx);
 static bool crypto_init(void);
 static bool crypto_start(void);
 static void crypto_deinit(void);
