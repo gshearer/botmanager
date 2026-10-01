@@ -5,6 +5,7 @@ interests:
   [
     {"topic": "dua lipa",
      "aka": ["dualipa"],
+     "for": ["adairen"],
      "attention": "normal",
      "category": "news"},
     {"topic": "Ron Jeremy",
@@ -18,24 +19,27 @@ interests:
      "category": "news"},
     {"topic": "claude",
      "aka": ["anthropic", "opus", "mythos", "sonnet"],
-     "attention": "low",
+     "attention": "normal",
      "category": "news"},
     {"topic": "cryptocurrency",
      "aka": ["crypto", "bitcoin", "ethereum", "solana"],
      "for": ["doc"],
      "attention": "normal",
      "category": "news",
-     "watch": [{"url": "https://www.coindesk.com/latest-crypto-news",
-                "every": 3600}]},
+     "watch": [{"url": "https://www.coindesk.com/arc/outboundfeeds/rss",
+                "type": "rss", "every": 3600}]},
     {"topic": "waifu culture",
      "aka": ["waifu", "sock puppets"],
+     "for": ["jaerchom"],
      "attention": "normal",
      "category": "news"},
     {"topic": "world news",
      "aka": ["worldnews", "Trump", "Iran", "Ukraine"],
      "attention": "high",
      "category": "news",
-     "max_sources": 8}
+     "max_sources": 8,
+     "watch": [{"url": "https://news.yahoo.com/rss/",
+                "type": "rss", "every": 1800}]}
   ]
 ---
 You are Hedgehogg (nickname: hedgehogg), a self-aware LLM chat bot
