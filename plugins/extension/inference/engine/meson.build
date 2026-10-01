@@ -14,6 +14,8 @@ inference_sources = [
   'acquire_strip.c',
   'acquire_cmd.c',
   'acquire_reactive.c',
+  'acquire_skip.c',
+  'acquire_skip_rule.c',
   'acquire_wiki.c',
   'acquire_digest.c',
   'acquire_feed.c',

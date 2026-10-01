@@ -16,6 +16,7 @@
 #include "task.h"
 
 #include <pthread.h>
+#include <regex.h>
 
 // The job context below carries a resolved SXNG category. Types only —
 // the search itself is reached by dlsym, so a missing searxng plugin
@@ -47,6 +48,12 @@ typedef struct
   uint64_t total_feed_304;
   uint64_t total_feed_new_items;
   uint64_t total_feed_errors;
+
+  // Result pages passed over before fetching, by which half of the
+  // skip predicate refused them, and fetches that came back unreadable.
+  uint64_t total_skip_rule;
+  uint64_t total_skip_learned;
+  uint64_t total_fetch_unusable;
 } acquire_stats_t;
 
 // Lifecycle.
@@ -171,6 +178,42 @@ size_t acquire_get_topic_snapshot(const char *bot_name,
 #define ACQUIRE_DEF_IMAGE_MAX_PER_PAGE         6
 #define ACQUIRE_DEF_IMAGE_URL_SKIPLIST \
     "icon;sprite;logo;avatar;favicon;pixel;tracking"
+
+// Page skip — the operator's rule and the hosts acquisition has learned
+// it cannot read. The default rule is the five paywalled publishers
+// measured 2026-09-06 (28 of 167 news slots, none fetchable). It is
+// one ERE rather than a list so no separator is lost to the grammar.
+// Every class stops at '/', '?' and '#', so the name can only match
+// inside the authority — never in another host's path or query.
+#define ACQUIRE_DEF_PAGE_URL_SKIP_REGEX \
+    "^https?://([^/?#]*@)?([^/?#@]+\\.)?" \
+    "(reuters|wsj|bloomberg|economist|forbes)\\.com\\.?([:/?#]|$)"
+
+// How the rule is compiled — one definition, so the tests compile the
+// shipped pattern exactly as the engine does.
+#define ACQUIRE_SKIP_REGEX_FLAGS  (REG_EXTENDED | REG_ICASE | REG_NOSUB)
+
+// Ceilings on the learning knobs. fail_urls holds up to the threshold,
+// so the threshold bounds the row; the days bound keeps make_interval
+// in range. A row with no live skip and no failure for PRUNE_DAYS is
+// deleted by the corpus sweep.
+#define ACQUIRE_HOST_SKIP_FAILURES_MAX         32
+#define ACQUIRE_HOST_SKIP_DAYS_MAX             365
+#define ACQUIRE_HOST_SKIP_PRUNE_DAYS           30
+
+// acq_skip_stop()'s bound on waiting for queued skip writes.
+#define ACQUIRE_SKIP_STOP_DRAIN_SECS           10
+
+// Extra results asked of SearXNG beyond the sources a job wants, so a
+// skipped result hands its slot on instead of shrinking the batch. The
+// service still caps the request at plugin.searxng.max_results.
+#define ACQUIRE_SKIP_HEADROOM                  4
+
+// Hosts held in memory as currently skipped. The DB table is the
+// durable copy; this is what the curl-worker callbacks consult, since
+// they may not block on a query.
+#define ACQUIRE_SKIP_HOSTS_MAX                 256
+#define ACQUIRE_HOST_SZ                        256
 
 // Feed-state sizing. Per-feed dedup + conditional-GET state lives on
 // the bot entry (one slot per declared feed, across all topics); the
@@ -312,6 +355,14 @@ typedef struct
   // Master switch for the personality-declared feeds dispatcher. When
   // false, acq_feeds_tick is a no-op; SXNG + reactive paths untouched.
   bool      sources_enabled;
+
+  // Page skip. A 200 stripping to fewer bytes than page_min_usable_bytes
+  // is a failed fetch; host_skip_failures distinct failing URLs with no
+  // success between them skip the host for host_skip_days. 0 failures
+  // turns learning off.
+  uint32_t  page_min_usable_bytes;
+  uint32_t  host_skip_failures;
+  uint32_t  host_skip_days;
 } acquire_cfg_t;
 
 // One extracted image slot. Populated inside the scanner; later copied
@@ -423,6 +474,74 @@ size_t acq_extract_images(const char *html, size_t html_len,
 // true on hit.
 bool acq_find_title(const char *html, size_t html_len,
     char *out, size_t out_cap);
+
+// Page skip (acquire_skip_rule.c — pure, so the tests link it alone).
+
+// Copy the lowercased host of an http(s) URL into `out`, dropping any
+// userinfo, port and trailing dot. False when the URL has no host this
+// can name, the host carries a byte no hostname does, or it does not
+// fit; `out` is then empty. Every host key in acquire_host_skip comes
+// through here — a search result and an operator's typed host alike.
+bool acq_url_host(const char *url, char *out, size_t out_cap);
+
+// What one result-page fetch says about its host. The success value is
+// 0; UNUSABLE and TRANSIENT both mean "do not digest", and they differ
+// only in that UNUSABLE counts toward skipping the host.
+typedef enum
+{
+  ACQ_FETCH_USABLE = 0,
+  ACQ_FETCH_UNUSABLE,    // 401/403/451, or a 200 too thin to read
+  ACQ_FETCH_TRANSIENT    // transport error, or any other status
+} acq_fetch_verdict_t;
+
+acq_fetch_verdict_t acq_fetch_verdict(long curl_code, long status,
+    size_t strip_len, uint32_t min_usable);
+
+// Page skip (acquire_skip.c).
+
+typedef enum
+{
+  ACQ_SKIP_NONE = 0,
+  ACQ_SKIP_RULE,         // acquire.page_url_skip_regex matched
+  ACQ_SKIP_LEARNED,      // the host is in acquire_host_skip, unexpired
+  ACQ_SKIP_BADURL        // no host acq_url_host can name — not fetched
+} acq_skip_t;
+
+// Compile `pattern` as the operator's rule, replacing the last one. An
+// empty pattern, or one regcomp refuses (WARN), leaves no rule at all.
+void acq_skip_set_regex(const char *pattern);
+
+// Load the unexpired skipped hosts from the DB. Start phase only.
+void acq_skip_start(void);
+
+// Latch off new skip writes and wait, up to ACQUIRE_SKIP_STOP_DRAIN_SECS,
+// for the queued ones. A queued write runs core's async_cb, which the
+// unload barrier cannot attribute to this mapping, so its callback into
+// this plugin would otherwise outlive dlclose. Returns how many are
+// still queued. Called from acquire_stop().
+size_t acq_skip_stop(void);
+
+// Drop the rule and the in-memory host set.
+void acq_skip_exit(void);
+
+// Delete rows with no live skip and nothing recorded for
+// ACQUIRE_HOST_SKIP_PRUNE_DAYS. Synchronous; the corpus sweep's task.
+void acq_skip_prune(void);
+
+// Non-blocking; safe from the curl worker.
+acq_skip_t acq_skip_check(const char *url);
+
+// Record a fetch outcome for `url`'s host. Fires an async write and
+// returns; TRANSIENT records nothing.
+void acq_skip_note(const char *url, acq_fetch_verdict_t v, long status);
+
+// Forget `host` entirely — its row, then its in-memory skip. `host` is
+// normalised by acq_url_host, the same boundary that wrote the key.
+// Synchronous; command threads only. False when the DELETE failed
+// (logged); otherwise *existed says whether there was a row to forget.
+bool acq_skip_forget(const char *host, bool *existed);
+
+size_t acq_skip_armed_count(void);
 
 // Registry helper: caller must hold acquire_entries_lock (rd or wr).
 // Returns NULL if no entry with `name` exists.

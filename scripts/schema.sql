@@ -219,6 +219,20 @@ CREATE TABLE IF NOT EXISTS acquire_topic_stats (
   PRIMARY KEY (bot_name, topic_name)
 );
 
+-- Hosts the acquisition engine could not read (401/403/451, or a page
+-- that strips to almost nothing). fail_urls holds the DISTINCT failing
+-- URLs since the last success; reaching acquire.host_skip_failures sets
+-- skip_until. See ACQUIRE.md §Page skip.
+CREATE TABLE IF NOT EXISTS acquire_host_skip (
+  host          TEXT PRIMARY KEY,
+  fail_urls     TEXT[] NOT NULL DEFAULT '{}',
+  last_fail_url TEXT,
+  last_status   INTEGER,
+  last_fail_at  TIMESTAMPTZ,
+  last_ok_at    TIMESTAMPTZ,
+  skip_until    TIMESTAMPTZ
+);
+
 -- Late-add FK on conversation_log.dossier_id moved into the chat
 -- plugin's memory_ensure_tables alongside the conversation_log table
 -- itself (R1). Nothing to do here.

@@ -258,6 +258,19 @@ test_acq_strip = executable('test_acq_strip',
   link_with : [test_harness],
 )
 
+# Acquisition's page-skip rules: the host cut from a search result, the
+# verdict a fetch earns, and the shipped regex. Pure, so the one file
+# links alone; the learning itself is SQL and is checked against the DB.
+test_acq_skip = executable('test_acq_skip',
+  'test_acq_skip.c',
+  '../plugins/extension/inference/engine/acquire_skip_rule.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories(
+                             '../plugins/extension/inference/engine'),
+                         include_directories('../plugins/service/searxng')],
+  link_with : [test_harness],
+)
+
 # The corpus binding `bot.<n>.corpus` carries: names, and the weights
 # that let two bots share one ingested corpus at opposite strengths. Its
 # whole failure mode is silent — a misread weight answers out of the
@@ -626,6 +639,7 @@ test('fact_merge', test_fact_merge)
 test('knowledge_rank', test_knowledge_rank)
 test('knowledge_corpus', test_knowledge_corpus)
 test('acq_strip', test_acq_strip)
+test('acq_skip', test_acq_skip)
 test('knowledge_dedup', test_knowledge_dedup)
 test('kv_bot', test_kv_bot)
 test('set_bot', test_set_bot)

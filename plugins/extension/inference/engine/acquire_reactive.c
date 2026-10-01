@@ -330,6 +330,11 @@ acq_reactive_start_search(acq_job_ctx_t *ctx)
   if(ctx->topic_max_sources > 0)
     n_wanted = ctx->topic_max_sources;
 
+  // Ask past the sources wanted, so a result the skip predicate refuses
+  // hands its slot on (acq_reactive_sxng_done) rather than shrinking the
+  // batch. The service caps the request at its own max_results.
+  n_wanted += ACQUIRE_SKIP_HEADROOM;
+
   pthread_mutex_lock(&acquire_stat_mutex);
   acquire_stats.total_queries++;
   pthread_mutex_unlock(&acquire_stat_mutex);
@@ -364,25 +369,43 @@ acq_reactive_curl_done(const curl_response_t *cresp)
   bool     imgs_on;
   char *stripped;
   uint32_t img_cap;
-  size_t strip_len;
+  uint32_t min_usable;
+  size_t   strip_len;
+  acq_fetch_verdict_t verdict;
+
+  pthread_mutex_lock(&acquire_cfg_mutex);
+  imgs_on    = acquire_cfg.images_enabled;
+  img_cap    = acquire_cfg.image_max_per_page;
+  min_usable = acquire_cfg.page_min_usable_bytes;
+  pthread_mutex_unlock(&acquire_cfg_mutex);
+
   if(cresp->curl_code != 0 || cresp->status != 200
       || cresp->body == NULL || cresp->body_len == 0)
   {
+    verdict = acq_fetch_verdict((long)cresp->curl_code, cresp->status, 0,
+        min_usable);
+
     clam(CLAM_WARN, ACQUIRE_CTX,
-        "%s fetch failed bot=%s topic=%s http=%ld err='%s'",
+        "%s fetch failed bot=%s topic=%s http=%ld err='%s' url='%s'",
         acq_ctx_mode(ctx), ctx->bot_name, ctx->topic_name, cresp->status,
-        cresp->error != NULL ? cresp->error : "(transport)");
+        cresp->error != NULL ? cresp->error
+            : cresp->curl_code != 0 ? "(transport)" : "-",
+        src->page_url);
+
+    if(verdict == ACQ_FETCH_UNUSABLE)
+    {
+      pthread_mutex_lock(&acquire_stat_mutex);
+      acquire_stats.total_fetch_unusable++;
+      pthread_mutex_unlock(&acquire_stat_mutex);
+    }
+
+    acq_skip_note(src->page_url, verdict, cresp->status);
     acq_source_release(src);
     return;
   }
 
   // I1 — harvest images off the raw body BEFORE strip. Allocate the
   // slot array lazily to keep the no-images path allocation-free.
-  pthread_mutex_lock(&acquire_cfg_mutex);
-  imgs_on = acquire_cfg.images_enabled;
-  img_cap = acquire_cfg.image_max_per_page;
-  pthread_mutex_unlock(&acquire_cfg_mutex);
-
   if(imgs_on && img_cap > 0)
   {
     size_t cap = img_cap;
@@ -410,11 +433,22 @@ acq_reactive_curl_done(const curl_response_t *cresp)
   strip_len = acq_strip_html(cresp->body, cresp->body_len,
       stripped, ACQUIRE_REACTIVE_STRIPPED_MAX);
 
-  if(strip_len == 0)
+  // A 200 is not a page. One that strips to almost nothing is a host
+  // refusing us politely, and it counts against the host like a 403.
+  verdict = acq_fetch_verdict(0, cresp->status, strip_len, min_usable);
+  acq_skip_note(src->page_url, verdict, cresp->status);
+
+  if(verdict != ACQ_FETCH_USABLE)
   {
     clam(CLAM_WARN, ACQUIRE_CTX,
-        "%s strip yielded empty body bot=%s topic=%s",
-        acq_ctx_mode(ctx), ctx->bot_name, ctx->topic_name);
+        "%s page unreadable bot=%s topic=%s stripped=%zu url='%s'",
+        acq_ctx_mode(ctx), ctx->bot_name, ctx->topic_name, strip_len,
+        src->page_url);
+
+    pthread_mutex_lock(&acquire_stat_mutex);
+    acquire_stats.total_fetch_unusable++;
+    pthread_mutex_unlock(&acquire_stat_mutex);
+
     mem_free(stripped);
     acq_source_release(src);
     return;
@@ -650,8 +684,13 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
   acq_job_ctx_t *ctx = (acq_job_ctx_t *)resp->user_data;
 
   uint32_t cap;
-  size_t take;
-  size_t submitted;
+  size_t   take;
+  size_t   submitted;
+  size_t   pick[SXNG_MAX_RESULTS];
+  uint64_t n_skip    = 0;
+  uint64_t n_rule    = 0;
+  uint64_t n_learned = 0;
+
   if(!resp->ok || resp->n_results == 0)
   {
     clam(CLAM_DEBUG, ACQUIRE_CTX,
@@ -674,7 +713,62 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
   if(ctx->topic_max_sources > 0)
     cap = ctx->topic_max_sources;
 
-  take = resp->n_results < cap ? resp->n_results : cap;
+  // Take the first `cap` results the skip predicate lets through. The
+  // search asked for ACQUIRE_SKIP_HEADROOM more than `cap`, so a skip
+  // hands its slot to the next result instead of costing the job one.
+  take = 0;
+
+  for(size_t i = 0; i < resp->n_results && i < SXNG_MAX_RESULTS
+      && take < cap; i++)
+  {
+    const char *url = resp->results[i].url;
+    acq_skip_t  why;
+
+    if(url[0] == '\0')
+      continue;
+
+    why = acq_skip_check(url);
+
+    if(why == ACQ_SKIP_NONE)
+    {
+      pick[take++] = i;
+      continue;
+    }
+
+    n_skip++;
+
+    if(why == ACQ_SKIP_RULE)
+      n_rule++;
+
+    else if(why == ACQ_SKIP_LEARNED)
+      n_learned++;
+
+    clam(CLAM_DEBUG, ACQUIRE_CTX,
+        "%s skip bot=%s topic=%s reason=%s url='%s'",
+        acq_ctx_mode(ctx), ctx->bot_name, ctx->topic_name,
+        why == ACQ_SKIP_RULE ? "rule"
+            : why == ACQ_SKIP_LEARNED ? "learned" : "badurl", url);
+  }
+
+  if(n_rule > 0 || n_learned > 0)
+  {
+    pthread_mutex_lock(&acquire_stat_mutex);
+    acquire_stats.total_skip_rule    += n_rule;
+    acquire_stats.total_skip_learned += n_learned;
+    pthread_mutex_unlock(&acquire_stat_mutex);
+  }
+
+  // Every result was skipped: the job still ran, so it ends through the
+  // one terminal release — a proactive try is counted and logged even
+  // when it yields nothing.
+  if(take == 0 && n_skip > 0)
+  {
+    pthread_mutex_lock(&ctx->lock);
+    ctx->pending_sources = 1;
+    pthread_mutex_unlock(&ctx->lock);
+    acq_job_release_source(ctx);
+    return;
+  }
 
   if(take == 0)
   {
@@ -692,17 +786,11 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
 
   submitted = 0;
 
-  for(size_t i = 0; i < take; i++)
+  for(size_t k = 0; k < take; k++)
   {
-    const sxng_result_t *r = &resp->results[i];
+    const sxng_result_t *r = &resp->results[pick[k]];
 
     acq_source_ctx_t *src;
-    if(r->url[0] == '\0')
-    {
-      // Release this slot's refcount and continue.
-      acq_job_release_source(ctx);
-      continue;
-    }
 
     // I1 — wrap the parent ctx in a per-source ctx so curl_done and
     // digest_done can carry image-extractor state without touching

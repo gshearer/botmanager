@@ -107,6 +107,18 @@ acquire_load_config(void)
   raw_skip = kv_get_str("acquire.image_url_skiplist");
   acq_parse_skiplist(raw_skip, c.image_skiplist, &c.image_skiplist_n);
 
+  // Page skip. Zero is a meaningful value for all three, so none is
+  // promoted to a default here.
+  c.page_min_usable_bytes = (uint32_t)kv_get_uint("acquire.page_min_usable_bytes");
+  c.host_skip_failures    = (uint32_t)kv_get_uint("acquire.host_skip_failures");
+  c.host_skip_days        = (uint32_t)kv_get_uint("acquire.host_skip_days");
+
+  if(c.host_skip_failures > ACQUIRE_HOST_SKIP_FAILURES_MAX)
+    c.host_skip_failures = ACQUIRE_HOST_SKIP_FAILURES_MAX;
+  if(c.host_skip_days > ACQUIRE_HOST_SKIP_DAYS_MAX)
+    c.host_skip_days = ACQUIRE_HOST_SKIP_DAYS_MAX;
+  acq_skip_set_regex(kv_get_str("acquire.page_url_skip_regex"));
+
   if(c.image_min_dim_px == 0)
     c.image_min_dim_px = ACQUIRE_DEF_IMAGE_MIN_DIM_PX;
   if(c.image_max_per_page == 0)
@@ -239,6 +251,35 @@ acquire_register_kv(void)
       "When true, <img> tags missing both width and height attributes"
       " are dropped. Default false — many CMSs rely on CSS for sizing.");
 
+  // Page skip — the operator's rule and the learned host list. Both
+  // filter search results BEFORE the fetch, so a skipped result hands
+  // its slot to the next one. Neither touches `watch:` feeds.
+  kv_register("acquire.page_url_skip_regex", KV_STR,
+      ACQUIRE_DEF_PAGE_URL_SKIP_REGEX,
+      acquire_kv_changed, NULL,
+      "One POSIX extended regex, matched case-insensitively against each"
+      " search-result URL before acquisition fetches it. A match is"
+      " skipped and the next result takes its slot. Use alternation for"
+      " several hosts. Empty = no rule; a pattern that fails to compile"
+      " is logged and also means no rule. Shipped value: five paywalled"
+      " news publishers.");
+  kv_register("acquire.page_min_usable_bytes", KV_UINT32, "200",
+      acquire_kv_changed, NULL,
+      "A fetched page that strips to fewer bytes than this is not"
+      " digested and counts as a failure of its host, like a 401/403."
+      " 0 = only an empty page counts.");
+  kv_register("acquire.host_skip_failures", KV_UINT32, "3",
+      acquire_kv_changed, NULL,
+      "Distinct failing URLs, with no success between them, after which"
+      " acquisition skips that host. Failures are 401, 403, 451 or a"
+      " page under acquire.page_min_usable_bytes. 0 = never learn;"
+      " clamped to 32. See: show acquire hosts.");
+  kv_register("acquire.host_skip_days", KV_UINT32, "7",
+      acquire_kv_changed, NULL,
+      "Days a learned host stays skipped, clamped to 365. Afterwards its"
+      " next result is fetched as a test: a failure skips it again, a"
+      " success clears it.");
+
   // Personality-declared feeds: master switch. When false,
   // acq_feeds_tick is a no-op per bot per tick; SXNG reactive + proactive
   // paths are unaffected.
@@ -277,6 +318,19 @@ acquire_ensure_tables(void)
       " total_queries  BIGINT NOT NULL DEFAULT 0,"
       " total_ingested BIGINT NOT NULL DEFAULT 0,"
       " PRIMARY KEY (bot_name, topic_name)"
+      ")");
+
+  // Hosts acquisition could not read. fail_urls holds the DISTINCT
+  // failing URLs since the last success, up to the threshold.
+  acquire_run_ddl(
+      "CREATE TABLE IF NOT EXISTS acquire_host_skip ("
+      " host          TEXT PRIMARY KEY,"
+      " fail_urls     TEXT[] NOT NULL DEFAULT '{}',"
+      " last_fail_url TEXT,"
+      " last_status   INTEGER,"
+      " last_fail_at  TIMESTAMPTZ,"
+      " last_ok_at    TIMESTAMPTZ,"
+      " skip_until    TIMESTAMPTZ"
       ")");
 }
 
@@ -878,6 +932,7 @@ acquire_register_config(void)
   acquire_register_kv();
   acquire_load_config();
   acquire_ensure_tables();
+  acq_skip_start();
 
   // A8 — engine-global corpus-lifecycle sweep. Snapshot the cadence
   // from the freshly-loaded config; the task subsystem does not
@@ -925,6 +980,11 @@ acquire_stop(void)
   }
 
   pthread_rwlock_unlock(&acquire_entries_lock);
+
+  // Queued skip writes call back into this plugin through core's
+  // async_cb, which the unload barrier cannot see. Wait them out here,
+  // before deinit, while new ones are latched off.
+  (void)acq_skip_stop();
 }
 
 void
@@ -964,6 +1024,8 @@ acquire_exit(void)
   pthread_mutex_destroy(&acquire_stat_mutex);
   pthread_mutex_destroy(&acquire_dedup_mutex);
   pthread_mutex_destroy(&acquire_ingest_cb_mutex);
+
+  acq_skip_exit();
 
   // libxml2 cleanup — idempotent, releases global parser state.
   xmlCleanupParser();

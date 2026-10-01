@@ -5,7 +5,9 @@
 #include "knowledge_priv.h"
 
 #include "cmd.h"
+#include "colors.h"
 #include "db.h"
+#include "display.h"
 #include "method.h"
 #include "userns.h"
 #include "util.h"
@@ -64,6 +66,7 @@ acquire_cmd_root(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "  trigger <bot> <topic>         — fire a proactive query now");
   cmd_reply(ctx, "  fire <bot> <topic> <subject>  — enqueue a reactive job now");
   cmd_reply(ctx, "  source trigger <bot> <url>    — arm a personality feed for next tick");
+  cmd_reply(ctx, "  unskip <host>                 — forget a learned host skip");
   cmd_reply(ctx, "  digest-test <topic> <body>    — dry-run the digester");
 }
 
@@ -245,6 +248,15 @@ acq_cmd_show_acquire(const cmd_ctx_t *ctx)
       (unsigned long long)s.total_feed_new_items,
       (unsigned long long)s.total_feed_errors,
       acq_yn(cfg.sources_enabled));
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  page skip: rule=%llu  learned=%llu  unreadable=%llu"
+      "  hosts_skipped=%zu  (show acquire hosts)",
+      (unsigned long long)s.total_skip_rule,
+      (unsigned long long)s.total_skip_learned,
+      (unsigned long long)s.total_fetch_unusable,
+      acq_skip_armed_count());
   cmd_reply(ctx, line);
 
   // Per-bot snapshot: ring depth, kick-pending, live rate slots.
@@ -727,6 +739,149 @@ acquire_cmd_source_trigger(const cmd_ctx_t *ctx)
   cmd_reply(ctx, reply);
 }
 
+// /show acquire hosts — hosts acquisition is failing to read, and the
+// ones it has stopped fetching. A host whose last fetch succeeded has
+// nothing to say and is left out.
+
+#define ACQ_HOSTS_COL_HOST   36
+#define ACQ_HOSTS_COLS       (2 + ACQ_HOSTS_COL_HOST + 6 + 6 + 13 + 13)
+#define ACQ_HOSTS_RULE_COLS  200
+
+static void
+acq_fmt_when(int64_t epoch, char *out, size_t cap)
+{
+  time_t    t = (time_t)epoch;
+  struct tm tm;
+
+  if(epoch <= 0 || localtime_r(&t, &tm) == NULL
+      || strftime(out, cap, "%m-%d %H:%M", &tm) == 0)
+    strlcpy(out, "-", cap);
+}
+
+static void
+acq_cmd_show_hosts(const cmd_ctx_t *ctx)
+{
+  db_result_t *res;
+  const char  *rx;
+  uint32_t     n_fail;
+  uint32_t     n_days;
+  char         line[ACQ_HOSTS_RULE_COLS * 4 + 64];
+  char         host[ACQ_HOSTS_COL_HOST * 4 + 8];
+  char         until[24];
+  char         last[24];
+  char         rule[DISPLAY_RULE_SZ(ACQ_HOSTS_COLS)];
+  char         rx_fit[ACQ_HOSTS_RULE_COLS * 4 + 8];
+
+  res = db_result_alloc();
+
+  if(db_query(
+      "SELECT host, cardinality(fail_urls), COALESCE(last_status, 0),"
+      " CASE WHEN skip_until > NOW()"
+      "  THEN EXTRACT(EPOCH FROM skip_until)::bigint ELSE 0 END,"
+      " COALESCE(EXTRACT(EPOCH FROM last_fail_at)::bigint, 0)"
+      " FROM acquire_host_skip"
+      " WHERE cardinality(fail_urls) > 0 OR skip_until > NOW()"
+      " ORDER BY (skip_until > NOW()) DESC NULLS LAST,"
+      "  last_fail_at DESC NULLS LAST"
+      " LIMIT 40", res) != SUCCESS || !res->ok)
+  {
+    cmd_reply(ctx, "error: query failed");
+    db_result_free(res);
+    return;
+  }
+
+  pthread_mutex_lock(&acquire_cfg_mutex);
+  n_fail = acquire_cfg.host_skip_failures;
+  n_days = acquire_cfg.host_skip_days;
+  pthread_mutex_unlock(&acquire_cfg_mutex);
+
+  if(res->rows == 0)
+    cmd_reply(ctx, "No host is failing or skipped.");
+
+  else
+  {
+    strlcpy(host, "HOST", sizeof(host));
+    display_align_left(host, sizeof(host), ACQ_HOSTS_COL_HOST);
+    snprintf(line, sizeof(line),
+        "  " CLR_BOLD "%s %5s %5s  %-11s  %-11s" CLR_RESET,
+        host, "PAGES", "HTTP", "SKIPPED TO", "LAST FAIL");
+    cmd_reply(ctx, line);
+
+    strlcpy(rule, "  ", sizeof(rule));
+    display_rule(rule, sizeof(rule), ACQ_HOSTS_COLS - 2);
+    cmd_reply(ctx, rule);
+
+    for(uint32_t r = 0; r < res->rows; r++)
+    {
+      char raw[ACQUIRE_HOST_SZ];
+
+      db_result_copy(raw, sizeof(raw), res, r, 0);
+      display_fit(raw, ACQ_HOSTS_COL_HOST - 1, host, sizeof(host), "…");
+      display_align_left(host, sizeof(host), ACQ_HOSTS_COL_HOST);
+      acq_fmt_when(db_result_get_i64(res, r, 3, 0), until, sizeof(until));
+      acq_fmt_when(db_result_get_i64(res, r, 4, 0), last, sizeof(last));
+
+      snprintf(line, sizeof(line), "  %s %5" PRId64 " %5" PRId64
+          "  %-11s  %-11s", host,
+          db_result_get_i64(res, r, 1, 0),
+          db_result_get_i64(res, r, 2, 0), until, last);
+      cmd_reply(ctx, line);
+    }
+  }
+
+  db_result_free(res);
+
+  if(n_fail == 0)
+    strlcpy(line,
+        CLR_GRAY "  learning is off (acquire.host_skip_failures=0)" CLR_RESET,
+        sizeof(line));
+
+  else
+    snprintf(line, sizeof(line),
+        CLR_GRAY "  a host is skipped after %u unreadable pages, for %u"
+        " days — /acquire unskip <host> clears one" CLR_RESET,
+        n_fail, n_days);
+
+  cmd_reply(ctx, line);
+
+  // Fitted, so a long pattern cannot push CLR_RESET off the end of the
+  // line and bleed gray into the replies after it.
+  rx = kv_get_str("acquire.page_url_skip_regex");
+  display_fit(rx != NULL && rx[0] != '\0' ? rx : "(none)",
+      ACQ_HOSTS_RULE_COLS, rx_fit, sizeof(rx_fit), "…");
+  snprintf(line, sizeof(line), CLR_GRAY "  rule: %s" CLR_RESET, rx_fit);
+  cmd_reply(ctx, line);
+}
+
+// /acquire unskip <host>
+
+static const cmd_arg_desc_t ad_acq_unskip[] = {
+  // Unvalidated here on purpose: acq_skip_forget runs it through
+  // acq_url_host, the same boundary that wrote the key, which takes the
+  // `_` and IPv6 literals the generic hostname check refuses.
+  { "host", CMD_ARG_NONE, CMD_ARG_REQUIRED, ACQUIRE_HOST_SZ - 1, NULL },
+};
+
+static void
+acquire_cmd_unskip(const cmd_ctx_t *ctx)
+{
+  const char *host    = ctx->parsed->argv[0];
+  bool        existed = false;
+  char        line[320];
+
+  if(!acq_skip_forget(host, &existed))
+  {
+    cmd_reply(ctx, "unskip: database write failed — see the log");
+    return;
+  }
+
+  snprintf(line, sizeof(line),
+      existed ? "unskip: forgot %s — its next result will be fetched"
+              : "unskip: %s was not on the list",
+      host);
+  cmd_reply(ctx, line);
+}
+
 // Commands — /show acquire, /acquire trigger, /acquire fire,
 // /acquire source trigger, /acquire digest-test. A2 shipped only the
 // /acquire root stub.
@@ -755,6 +910,41 @@ static const cmd_decl_t show_acquire_decl = {
   .cb          = acq_cmd_show_acquire,
   .parent_path = "show",
   .abbrev      = "acq",
+};
+
+static const cmd_decl_t show_acquire_hosts_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = "hosts",
+  .usage       = "show acquire hosts",
+  .description = "Hosts acquisition cannot read, and the ones it skips",
+  .help_long   =
+      "Lists hosts whose result pages have failed (401, 403, 451, or a"
+      " page under acquire.page_min_usable_bytes) since their last"
+      " success, and when each skip expires. Also prints the operator"
+      " rule, acquire.page_url_skip_regex, which skips by URL without"
+      " learning anything. Both apply to acquisition's own fetches only;"
+      " !search and !news are untouched.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = acq_cmd_show_hosts,
+  .parent_path = "show/acquire",
+};
+
+static const cmd_decl_t unskip_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = "unskip",
+  .usage       = "acquire unskip <host>",
+  .description = "Forget a learned host skip; its next result is fetched",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = acquire_cmd_unskip,
+  .parent_path = ACQUIRE_CTX,
+  .arg_desc    = ad_acq_unskip,
+  .arg_count   = (uint8_t)(sizeof(ad_acq_unskip) / sizeof(ad_acq_unskip[0])),
 };
 
 static const cmd_decl_t trigger_decl = {
@@ -868,7 +1058,9 @@ acquire_register_commands(void)
   // NULL) keeps them distinct at dispatch time. Mirrors the
   // /show knowledge pattern.
   cmd_register(&show_acquire_decl);
+  cmd_register(&show_acquire_hosts_decl);
   cmd_register(&trigger_decl);
+  cmd_register(&unskip_decl);
   cmd_register(&fire_decl);
   cmd_register(&digest_test_decl);
 
@@ -1224,6 +1416,10 @@ acquire_sweep_tick(task_t *t)
     t->state = TASK_ENDED;
     return;
   }
+
+  // Learned host rows that have gone quiet. Engine-global, so it runs
+  // whether or not any bot has a corpus to sweep.
+  acq_skip_prune();
 
   // Snapshot the registry under the read lock. Capacity is bounded
   // by the registry length; real-world deployments register a
