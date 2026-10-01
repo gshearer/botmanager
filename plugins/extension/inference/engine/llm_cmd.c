@@ -1610,6 +1610,118 @@ cmd_llm_set_model(const cmd_ctx_t *ctx)
   cmd_reply(ctx, msg);
 }
 
+// /llm set service <name> url <base_url>
+//
+// A service outlives the address it was registered at. The registry had
+// `add` and `del` but no `set`, so the only ways to move one were to
+// delete every model that referenced it and re-add the lot -- which takes
+// those models offline for the duration, and on an embed service that
+// means every RAG write and recall fails while it is gone -- or to UPDATE
+// the row in psql and reload the plugin, which works, leaves no
+// discoverable path, and sends the next person back to del/add.
+//
+// Written when the GPU services moved out of the `shell` LXC into the
+// `inference` nspawn container on 2026-09-07 and both `senses-stt` and
+// `hiigara-embed` had to follow them across the network.
+//
+// base_url is stored verbatim, exactly as `llm add service` stores it:
+// whether a service's URL carries /v1 is a property of the service and not
+// something this can infer -- `senses-stt` deliberately has none, because
+// whisper.cpp serves transcription at the root.
+static void
+cmd_llm_set_service(const cmd_ctx_t *ctx)
+{
+  const char  *name;
+  const char  *field;
+  const char  *base_url;
+  char        *e_name;
+  char        *e_url;
+  db_result_t *res;
+  char         sql[1024];
+  char         msg[512];
+
+  if(ctx->parsed == NULL || ctx->parsed->argc < 3)
+  {
+    cmd_reply(ctx, "usage: llm set service <name> url <base_url>");
+    return;
+  }
+
+  name     = ctx->parsed->argv[0];
+  field    = ctx->parsed->argv[1];
+  base_url = ctx->parsed->argv[2];
+
+  if(strcasecmp(field, "url") != 0)
+  {
+    cmd_reply(ctx, "error: only 'url' is settable");
+    return;
+  }
+
+  e_name = db_escape(name);
+  e_url  = db_escape(base_url);
+
+  if(e_name == NULL || e_url == NULL)
+  {
+    if(e_name != NULL)
+      mem_free(e_name);
+
+    if(e_url != NULL)
+      mem_free(e_url);
+
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE llm_services SET base_url='%s' WHERE name='%s'", e_url, e_name);
+  mem_free(e_name);
+  mem_free(e_url);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    snprintf(msg, sizeof(msg), "update failed: %s", res->error);
+    cmd_reply(ctx, msg);
+    db_result_free(res);
+    return;
+  }
+
+  if(res->rows_affected == 0)
+  {
+    snprintf(msg, sizeof(msg), "no such service: %s", name);
+    cmd_reply(ctx, msg);
+    db_result_free(res);
+    return;
+  }
+
+  db_result_free(res);
+
+  // ⚠⚠ BOTH reloads, and the second is the one that moves live traffic.
+  // Every llm_models row caches its own copy of the service's base_url,
+  // resolved from the JOIN at reload time so the submit path needs no
+  // second lookup (llm_priv.h). Reloading only the service cache updates
+  // what `show llm service` and a /models refresh use, while every actual
+  // chat, embed and stt request keeps going to the OLD address -- and
+  // keeps succeeding for as long as the old endpoint is still up, which
+  // is exactly the window a migration runs in. Measured on 2026-09-07:
+  // with services-only, `llm service <n> refresh` hit the new host while
+  // `llm test` and every RAG embed still hit the old one.
+  //
+  // `llm add service` needs only the first because a new service has no
+  // models yet, and `llm del service` is blocked while any model refers to
+  // it. This is the first operation that can move a service under live
+  // models, so it is the first that needs the second reload.
+  //
+  // The /models cache is deliberately NOT dropped: it is keyed on the
+  // service name, and a move is normally the same service at a new
+  // address. Re-probe with `llm service <name> refresh` where it is not.
+  llm_services_reload();
+  llm_models_reload();
+
+  snprintf(msg, sizeof(msg), "%s url = %s", name, base_url);
+  cmd_reply(ctx, msg);
+}
+
 // /llm test: a bounded synchronous probe.
 //
 // This is the documented exception to the daemon's non-blocking rule
@@ -2250,6 +2362,12 @@ static const cmd_arg_desc_t ad_set_model[] = {
   { "value", CMD_ARG_NONE, CMD_ARG_REQUIRED, 20,                    NULL },
 };
 
+static const cmd_arg_desc_t ad_set_service[] = {
+  { "name",     CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
+  { "field",    CMD_ARG_NONE, CMD_ARG_REQUIRED, 32,                    NULL },
+  { "base_url", CMD_ARG_NONE, CMD_ARG_REQUIRED, 0,                     NULL },
+};
+
 static const cmd_arg_desc_t ad_llm_service[] = {
   { "name",   CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
   { "action", CMD_ARG_NONE, CMD_ARG_REQUIRED, 16,                    NULL },
@@ -2296,6 +2414,7 @@ static void
 cmd_llm_set_usage(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: llm set model <name> max_context <tokens>");
+  cmd_reply(ctx, "       llm set service <name> url <base_url>");
 }
 
 static const cmd_decl_t llm_decl = {
@@ -2399,6 +2518,22 @@ static const cmd_decl_t llm_set_model_decl = {
   .abbrev      = "m",
   .arg_desc    = ad_set_model,
   .arg_count   = (uint8_t)(sizeof(ad_set_model) / sizeof(ad_set_model[0])),
+};
+
+static const cmd_decl_t llm_set_service_decl = {
+  .module      = "llm",
+  .name        = "service",
+  .usage       = "llm set service <name> url <base_url>",
+  .description = "Repoint a registered service at a new base URL",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_set_service,
+  .parent_path = "llm/set",
+  .abbrev      = "s",
+  .arg_desc    = ad_set_service,
+  .arg_count   = (uint8_t)(sizeof(ad_set_service) / sizeof(ad_set_service[0])),
 };
 
 static const cmd_decl_t llm_del_service_decl = {
@@ -2544,6 +2679,7 @@ llm_register_commands(void)
 
   cmd_register(&llm_set_decl);
   cmd_register(&llm_set_model_decl);
+  cmd_register(&llm_set_service_decl);
 
   // service <name> <action> (refresh)
   cmd_register(&llm_service_decl);
