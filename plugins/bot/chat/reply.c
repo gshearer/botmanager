@@ -379,6 +379,7 @@ req_free(chatbot_req_t *r)
   if(r->stash_images)     mem_free(r->stash_images);
   if(r->image_b64)        mem_free(r->image_b64);
   if(r->turns)            mem_free(r->turns);
+  if(r->pin)              mem_free(r->pin);
   chatbot_hold_unlink(&r->hold);
   mem_free(r);
 }
@@ -773,7 +774,7 @@ nl_bridge_ask_task(task_t *t)
     // momentarily finished.
     if(!chatbot_hold_disowned(&d->hold))
       chatbot_reply_submit(d->st, &d->msg, d->was_addressed,
-          d->is_direct, true, NULL);
+          d->is_direct, true, NULL, NULL);
 
     chatbot_hold_unlink(&d->hold);
     mem_free(d);
@@ -2872,6 +2873,56 @@ prompt_emit_mentions(char *buf, size_t pos, size_t cap,
   return pos;
 }
 
+// One KNOWLEDGE row, sanitized like every other retrieved line. `tag`
+// prefixes the bracketed heading ("" for an ordinary retrieved row).
+static size_t
+prompt_emit_knowledge_row(char *buf, size_t pos, size_t cap,
+    const chatbot_req_t *r, const knowledge_chunk_t *c, const char *tag)
+{
+  const char *url_suffix = "";
+  char url_buf[KNOWLEDGE_SOURCE_URL_SZ + 16];
+  char safe_sec[KNOWLEDGE_SECTION_SZ];
+  char safe_txt[KNOWLEDGE_CHUNK_TEXT_SZ];
+  char safe_url[KNOWLEDGE_SOURCE_URL_SZ];
+  time_t now = time(NULL);
+
+  if(pos >= cap)
+    return pos;
+
+  sanitize_copy(safe_sec, sizeof(safe_sec), c->section_heading);
+  sanitize_copy(safe_txt, sizeof(safe_txt), c->text);
+
+  if(r->include_source_url && c->source_url[0] != '\0')
+  {
+    sanitize_copy(safe_url, sizeof(safe_url), c->source_url);
+    snprintf(url_buf, sizeof(url_buf), " (%s)", safe_url);
+    url_suffix = url_buf;
+  }
+
+  if(safe_sec[0] != '\0' || tag[0] != '\0')
+    pos += snprintf(buf + pos, cap - pos,
+        "- [%s%s] %s%s\n", tag, safe_sec, safe_txt, url_suffix);
+
+  else
+    pos += snprintf(buf + pos, cap - pos,
+        "- %s%s\n", safe_txt, url_suffix);
+
+  // One line per chunk that actually reached the prompt — the rows the
+  // byte budget cut never appear, because this traces the PROMPT and
+  // not the retrieval. `corpus` is the field with no other reporter:
+  // a bot binds several corpora and they are ranked as one pool, so
+  // which one won a slot is invisible everywhere else, including in
+  // the block itself. A pin's cos is 0: it was never ranked.
+  clam(CLAM_DEBUG, "rag",
+      "trace=kinject target=%s corpus=%s cos=%.3f id=%" PRId64
+      " age=%lldd%s head='%.90s'",
+      r->reply_target, c->corpus, (double)c->score, c->id,
+      (long long)((now - c->created) / 86400),
+      tag[0] != '\0' ? " pinned" : "", safe_txt);
+
+  return pos;
+}
+
 static size_t
 prompt_emit_knowledge(char *buf, size_t pos, size_t cap,
     const chatbot_req_t *r,
@@ -2880,16 +2931,12 @@ prompt_emit_knowledge(char *buf, size_t pos, size_t cap,
   size_t block_start;
   size_t block_cap_bytes;
   size_t n_emitted;
-  time_t now = time(NULL);
-  char safe_sec[KNOWLEDGE_SECTION_SZ];
-  char safe_txt[KNOWLEDGE_CHUNK_TEXT_SZ];
-  char safe_url[KNOWLEDGE_SOURCE_URL_SZ];
 
   // Traced empty, and before the early return, for the reason the
   // memory block is (see prompt_emit_memory): "knowledge contributed
   // nothing" is a result, and a silent return makes a working trace
   // indistinguishable from a broken one.
-  if(n_kchunks == 0 || pos >= cap)
+  if((n_kchunks == 0 && r->pin == NULL) || pos >= cap)
   {
     clam(CLAM_DEBUG, "rag",
         "trace=kblock target=%s rows=0/%zu bytes=0 cap=%u corpora=%s",
@@ -2912,45 +2959,25 @@ prompt_emit_knowledge(char *buf, size_t pos, size_t cap,
 
   n_emitted = 0;
 
+  // The pin goes first, so the byte budget below can only cut what
+  // retrieval added around it; its retrieved copy, if any, is skipped.
+  if(r->pin != NULL)
+  {
+    pos = prompt_emit_knowledge_row(buf, pos, cap, r, r->pin,
+        CHATBOT_PIN_LABEL ": ");
+    n_emitted++;
+  }
+
   for(size_t i = 0; i < n_kchunks && pos < cap; i++)
   {
-    const char *url_suffix = "";
-    char url_buf[KNOWLEDGE_SOURCE_URL_SZ + 16];
-
     if(pos - block_start >= block_cap_bytes)
       break;
 
-    sanitize_copy(safe_sec, sizeof(safe_sec), kchunks[i].section_heading);
-    sanitize_copy(safe_txt, sizeof(safe_txt), kchunks[i].text);
+    if(r->pin != NULL && kchunks[i].id == r->pin->id)
+      continue;
 
-    if(r->include_source_url && kchunks[i].source_url[0] != '\0')
-    {
-      sanitize_copy(safe_url, sizeof(safe_url), kchunks[i].source_url);
-      snprintf(url_buf, sizeof(url_buf), " (%s)", safe_url);
-      url_suffix = url_buf;
-    }
-
-    if(safe_sec[0] != '\0')
-      pos += snprintf(buf + pos, cap - pos,
-          "- [%s] %s%s\n", safe_sec, safe_txt, url_suffix);
-    else
-      pos += snprintf(buf + pos, cap - pos,
-          "- %s%s\n", safe_txt, url_suffix);
-
+    pos = prompt_emit_knowledge_row(buf, pos, cap, r, &kchunks[i], "");
     n_emitted++;
-
-    // One line per chunk that actually reached the prompt — the rows the
-    // byte budget cut never appear, because this traces the PROMPT and
-    // not the retrieval. `corpus` is the field with no other reporter:
-    // a bot binds several corpora and they are ranked as one pool, so
-    // which one won a slot is invisible everywhere else, including in
-    // the block itself.
-    clam(CLAM_DEBUG, "rag",
-        "trace=kinject target=%s corpus=%s cos=%.3f id=%" PRId64
-        " age=%lldd head='%.90s'",
-        r->reply_target, kchunks[i].corpus, (double)kchunks[i].score,
-        kchunks[i].id,
-        (long long)((now - kchunks[i].created) / 86400), safe_txt);
   }
 
   if(pos < cap)
@@ -2958,8 +2985,8 @@ prompt_emit_knowledge(char *buf, size_t pos, size_t cap,
 
   clam(CLAM_DEBUG, "rag",
       "trace=kblock target=%s rows=%zu/%zu bytes=%zu cap=%u corpora=%s",
-      r->reply_target, n_emitted, n_kchunks, pos - block_start,
-      r->knowledge_max_chars, r->knowledge_corpus);
+      r->reply_target, n_emitted, n_kchunks + (r->pin != NULL ? 1 : 0),
+      pos - block_start, r->knowledge_max_chars, r->knowledge_corpus);
 
   return pos;
 }
@@ -3773,14 +3800,18 @@ knowledge_gather_images(chatbot_req_t *r,
 
   cap = r->images_per_reply;
 
-  // (a) RAG-attached fetch.
-  if(n > 0)
+  // (a) RAG-attached fetch. A pinned chunk's pictures come first.
+  if(n > 0 || r->pin != NULL)
   {
     int64_t ids[64];
-    size_t  n_ids = n > 64 ? 64 : n;
+    size_t  n_ids = 0;
 
-    for(size_t i = 0; i < n_ids; i++)
-      ids[i] = chunks[i].id;
+    if(r->pin != NULL)
+      ids[n_ids++] = r->pin->id;
+
+    for(size_t i = 0; i < n && n_ids < 64; i++)
+      if(r->pin == NULL || chunks[i].id != r->pin->id)
+        ids[n_ids++] = chunks[i].id;
 
     rag_img = mem_alloc("chatbot", "stash_images_rag",
         sizeof(knowledge_image_t) * cap);
@@ -4098,7 +4129,7 @@ req_load_history(chatbot_req_t *r, const char *botname)
 void
 chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
     bool was_addressed, bool is_direct_address, bool nl_bridge_off,
-    const char *fallback)
+    const char *fallback, const knowledge_chunk_t *pin)
 {
   uint32_t top_k;
   uint32_t rr_cap;
@@ -4130,6 +4161,12 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
 
   if(fallback != NULL)
     strlcpy(r->fallback, fallback, sizeof(r->fallback));
+
+  if(pin != NULL)
+  {
+    r->pin = mem_alloc("chatbot", "req_pin", sizeof(*r->pin));
+    memcpy(r->pin, pin, sizeof(*r->pin));
+  }
 
   strlcpy(r->sender,          msg->sender,   sizeof(r->sender));
   strlcpy(r->sender_metadata, msg->metadata, sizeof(r->sender_metadata));

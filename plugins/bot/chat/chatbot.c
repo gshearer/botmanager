@@ -1955,7 +1955,7 @@ chatbot_consider_speaking(chatbot_state_t *st, const method_msg_t *msg,
   // nothing on a voice method.
   chatbot_reply_submit(st, msg, decision == CHATBOT_SPEAK_REPLY,
       reason == CHATBOT_CLASSIFY_DIRECT || reason == CHATBOT_CLASSIFY_FLOOR,
-      false, NULL);
+      false, NULL, NULL);
 
   // VF-3: stamp the per-target witness-interject ring ONLY after a
   // successful interject submit. Direct-address replies (REPLY) do

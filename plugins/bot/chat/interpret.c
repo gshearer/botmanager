@@ -478,7 +478,7 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   // putting one on the wire unvoiced is the bare tool dump this module
   // exists to prevent.
   chatbot_reply_submit(st, &msg, was_addressed, is_direct, true,
-      lines == 1 ? capture : NULL);
+      lines == 1 ? capture : NULL, NULL);
 }
 
 uint64_t

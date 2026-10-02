@@ -619,12 +619,23 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
     pthread_mutex_unlock(&acquire_ingest_cb_mutex);
 
     if(cb != NULL)
-      cb(bot_name, topic_name, subject,
-          dest_corpus, id, resp->relevance,
+    {
+      knowledge_chunk_t chunk;
+
+      memset(&chunk, 0, sizeof(chunk));
+      chunk.id      = id;
+      chunk.created = time(NULL);
+      strlcpy(chunk.corpus,          dest_corpus,   sizeof(chunk.corpus));
+      strlcpy(chunk.source_url,      canon,         sizeof(chunk.source_url));
+      strlcpy(chunk.section_heading, section,       sizeof(chunk.section_heading));
+      strlcpy(chunk.text,            resp->summary, sizeof(chunk.text));
+
+      cb(bot_name, topic_name, subject, &chunk, resp->relevance,
           is_proactive
               ? ACQUIRE_INGEST_PROACTIVE
               : ACQUIRE_INGEST_REACTIVE,
           user);
+    }
   }
 
   return(SUCCESS);

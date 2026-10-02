@@ -608,7 +608,7 @@ deferred_deliver_say(chatbot_state_t *st, method_msg_t *msg,
         " your voice. Do not mention this cue.]",
         body, deferred_who(msg), deferred_venue(msg));
 
-  chatbot_reply_submit(st, msg, false, false, true, plain);
+  chatbot_reply_submit(st, msg, false, false, true, plain, NULL);
 }
 
 // A repeat that can no longer run is stopped, not re-armed: what
@@ -659,7 +659,7 @@ deferred_refuse_run(chatbot_state_t *st, method_msg_t *msg, int64_t id,
             ? " — so you have stopped doing it" : "",
         deferred_venue(msg));
 
-  chatbot_reply_submit(st, msg, false, false, true, plain);
+  chatbot_reply_submit(st, msg, false, false, true, plain, NULL);
 }
 
 // A `run` row: dispatch under the asker's identity with the output

@@ -499,6 +499,10 @@ typedef struct
 // so a persona that vetos a subject doesn't retry instantly.
 #define CHATBOT_VOLUNTEER_CHAN_SLOTS 16
 
+// The KNOWLEDGE-block tag on a pinned chunk (chatbot_reply_submit's
+// `pin`). One spelling, because the volunteer cue names the item by it.
+#define CHATBOT_PIN_LABEL "JUST READ"
+
 // V2 — content-level dedup rings. Each ring is a pure LRU on its
 // `volunteered_at` stamp; oldest slot evicts on write. All three live
 // on chatbot_volunteer_state_t and share st->volunteer.mutex with the
@@ -898,9 +902,12 @@ bool chatbot_label_is_zip(const char *label);
 // answer. Only a cue voicing an already-committed fact supplies one,
 // and only when it can vouch for the line as it stands: see
 // chatbot_req_t.fallback.
+// pin is a knowledge chunk the turn is ABOUT — rendered first in the
+// KNOWLEDGE block under CHATBOT_PIN_LABEL whatever retrieval returns.
+// NULL on every submit but volunteer's. Copied; the caller keeps it.
 void chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
     bool was_addressed, bool is_direct_address, bool nl_bridge_off,
-    const char *fallback);
+    const char *fallback, const knowledge_chunk_t *pin);
 
 // Image-vision sibling of chatbot_reply_submit. Seeds the vision
 // fields (image_b64 ownership transfers in from the caller; mime is
@@ -1198,6 +1205,13 @@ typedef struct
   uint32_t        knowledge_top_k;
   uint32_t        knowledge_lexical_k;
   uint32_t        knowledge_max_chars;
+
+  // The chunk this turn is about, or NULL (chatbot_reply_submit's `pin`).
+  // mem_alloc'd copy, freed in req_free. A volunteer cue announces a page
+  // the bot just read, and retrieval keyed on the cue does not find that
+  // page — the fresh row is mid-embed and older rows on the same topic
+  // outrank it — so it rides in here rather than through the ranker.
+  knowledge_chunk_t *pin;
 
   // Byte budget for the RECALLED block, snapshot from
   // `memory.rag_max_context_chars` at submit time for the same reason

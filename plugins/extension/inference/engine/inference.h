@@ -535,11 +535,17 @@ typedef enum
   ACQUIRE_INGEST_PROACTIVE
 } acquire_ingest_mode_t;
 
+// Fired once per NEW chunk, on the curl worker that digested it. `chunk`
+// is the row as it was just written — id, corpus, source_url, heading,
+// digest text — and lives only for the call; a consumer that keeps it
+// copies it. It is handed over whole because a consumer about to say
+// something about the page needs what the page said, and a retrieval
+// keyed on the topic name does not find it: the fresh row is still
+// being embedded, and older rows about the same topic outrank it.
 typedef void (*acquire_ingest_cb_t)(
     const char *bot_name, const char *topic_name,
-    const char *subject, const char *corpus,
-    int64_t chunk_id, uint32_t relevance,
-    acquire_ingest_mode_t mode, void *user);
+    const char *subject, const knowledge_chunk_t *chunk,
+    uint32_t relevance, acquire_ingest_mode_t mode, void *user);
 
 // Width sentinel for knowledge_retrieve's two channels.
 //

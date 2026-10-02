@@ -27,9 +27,13 @@ typedef struct
   char     bot_name  [ACQUIRE_BOT_NAME_SZ];
   char     topic_name[ACQUIRE_TOPIC_NAME_SZ];
   char     subject   [ACQUIRE_SUBJECT_SZ];
-  int64_t  chunk_id;
   uint32_t relevance;
   acquire_ingest_mode_t mode;
+
+  // The page as it was just written. It is the whole of what the bot has
+  // to say: it goes to the reply as its pin, because retrieval keyed on
+  // the cue does not find it (see chatbot_req_t.pin).
+  knowledge_chunk_t chunk;
 
   // V2 — populated by the semantic-dedup gate in volunteer_cascade()
   // when the gate runs (threshold > 0 and the embedding row is ready).
@@ -448,13 +452,13 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   // catches the common case); kept for defensive coverage against
   // future ingest paths that skip that LRU.
   pthread_mutex_lock(&st->volunteer.mutex);
-  dup_chunk = volunteer_chunk_ring_hit_locked(&st->volunteer, job->chunk_id);
+  dup_chunk = volunteer_chunk_ring_hit_locked(&st->volunteer, job->chunk.id);
   pthread_mutex_unlock(&st->volunteer.mutex);
   if(dup_chunk)
   {
     clam(CLAM_DEBUG, "chatbot",
         "volunteer skip bot=%s reason=same_chunk chunk=%" PRId64,
-        bot_name, job->chunk_id);
+        bot_name, job->chunk.id);
     return(false);
   }
 
@@ -529,7 +533,7 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
       "behavior.volunteer.dedup_threshold");
   if(thresh > 0)
   {
-    uint32_t dim = knowledge_get_chunk_embedding(job->chunk_id,
+    uint32_t dim = knowledge_get_chunk_embedding(job->chunk.id,
         job->seed_vec, CHATBOT_VOLUNTEER_EMBED_DIM_MAX);
     if(dim > 0)
     {
@@ -538,7 +542,7 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
 
       pthread_mutex_lock(&st->volunteer.mutex);
       max_cos = volunteer_embed_ring_max_cos_locked(
-          &st->volunteer, job->seed_vec, dim, job->chunk_id,
+          &st->volunteer, job->seed_vec, dim, job->chunk.id,
           &dup_chunk_id);
       pthread_mutex_unlock(&st->volunteer.mutex);
       if(max_cos >= thresh)
@@ -546,7 +550,7 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
         clam(CLAM_DEBUG, "chatbot",
             "volunteer skip bot=%s chunk=%" PRId64
             " reason=semantic_dup cos=%u/100 dup_chunk=%" PRId64,
-            bot_name, job->chunk_id, max_cos, dup_chunk_id);
+            bot_name, job->chunk.id, max_cos, dup_chunk_id);
         return(false);
       }
       // Thread the vec through to volunteer_submit for stamping.
@@ -715,8 +719,8 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
 }
 
 // Compose + submit. Builds a synthetic method_msg_t that routes through
-// the existing reply pipeline so RAG, KNOWLEDGE, and IMAGES all splice
-// naturally. The seed text is framed as a user-side "you just noticed"
+// the existing reply pipeline, with the page pinned at the head of the
+// KNOWLEDGE block and RAG and IMAGES splicing around it as usual. The seed text is framed as a user-side "you just noticed"
 // note; the persona retains SKIP as the final veto.
 
 static void
@@ -798,11 +802,22 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   // The seed is the *user turn* of a single-message exchange. Persona
   // body + anti-injection reminder + RAG all run above it; the model
   // produces either a short in-character mention or a SKIP line.
+  //
+  // ⚠⚠ The cue points AT the page; it never carries it. The page rides
+  // in as the reply's pin, inside the fenced, sanitized KNOWLEDGE block,
+  // because it is web text. Until 2026-10-02 there was no pin and the
+  // cue announced "something new" the model could not see: 58 of 61
+  // turns 09-27..10-02 had a KNOWLEDGE block without the page, and 56
+  // of the 61 put nothing on the wire — the persona is told to say what
+  // a thing actually IS and never to pad, so SKIP was the right answer. What spoke before that was whatever
+  // the topic name retrieved, which is why one Dua Lipa photo dump was
+  // announced six times in September.
   snprintf(msg.text, sizeof(msg.text),
-      "[internal cue: you've just read something new about '%s' "
-      "(topic=%s, relevance=%u) via your regular feeds.%s If it's worth "
-      "mentioning in %s right now, post a single short in-character "
-      "line referencing it. If it's not channel-appropriate or not "
+      "[internal cue: the KNOWLEDGE item marked " CHATBOT_PIN_LABEL
+      " is something new you've just read about '%s' (topic=%s, "
+      "relevance=%u) via your regular feeds.%s If it's worth mentioning "
+      "in %s right now, post a single short in-character line about "
+      "what it actually says. If it's not channel-appropriate or not "
       "worth bringing up, reply with SKIP on its own line. Do not "
       "explain yourself.]",
       job->subject, job->topic_name, job->relevance, care, chan);
@@ -810,7 +825,7 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   clam(CLAM_INFO, "chatbot",
       "volunteer posted bot=%s chan=%s subject='%s' chunk=%" PRId64
       " relevance=%u mode=%s addressed=%zu",
-      job->bot_name, chan, job->subject, job->chunk_id, job->relevance,
+      job->bot_name, chan, job->subject, job->chunk.id, job->relevance,
       job->mode == ACQUIRE_INGEST_PROACTIVE ? "proactive" : "reactive",
       pick->n_present);
 
@@ -831,11 +846,11 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   slot->last_attempted   = slot->last_volunteered;
   st->volunteer.per_hour_counter++;
 
-  volunteer_chunk_ring_stamp_locked(&st->volunteer, job->chunk_id, now);
+  volunteer_chunk_ring_stamp_locked(&st->volunteer, job->chunk.id, now);
   if(job->subject[0] != '\0')
     volunteer_subject_ring_stamp_locked(&st->volunteer, job->subject, now);
   if(job->seed_dim > 0)
-    volunteer_embed_ring_stamp_locked(&st->volunteer, job->chunk_id,
+    volunteer_embed_ring_stamp_locked(&st->volunteer, job->chunk.id,
         job->seed_dim, job->seed_vec, now);
   pthread_mutex_unlock(&st->volunteer.mutex);
 
@@ -854,7 +869,7 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   // nl_bridge_off=false: the volunteer cue never embeds tool output, so
   // it keeps the bridge — a volunteered line may legitimately reach for
   // a command.
-  chatbot_reply_submit(st, &msg, false, false, false, NULL);
+  chatbot_reply_submit(st, &msg, false, false, false, NULL, &job->chunk);
   method_release(method);
 }
 
@@ -905,16 +920,16 @@ volunteer_task(task_t *t)
 
 static void
 volunteer_ingest_cb(const char *bot_name, const char *topic_name,
-    const char *subject, const char *corpus, int64_t chunk_id,
+    const char *subject, const knowledge_chunk_t *chunk,
     uint32_t relevance, acquire_ingest_mode_t mode, void *user)
 {
   task_t *t;
   volunteer_job_t *job;
 
-  (void)corpus;
   (void)user;
 
-  if(bot_name == NULL || topic_name == NULL || subject == NULL)
+  if(bot_name == NULL || topic_name == NULL || subject == NULL
+      || chunk == NULL)
     return;
 
   job = mem_alloc("chatbot", "volunteer_job", sizeof(*job));
@@ -923,7 +938,7 @@ volunteer_ingest_cb(const char *bot_name, const char *topic_name,
   snprintf(job->bot_name,   sizeof(job->bot_name),   "%s", bot_name);
   snprintf(job->topic_name, sizeof(job->topic_name), "%s", topic_name);
   snprintf(job->subject,    sizeof(job->subject),    "%s", subject);
-  job->chunk_id  = chunk_id;
+  memcpy(&job->chunk, chunk, sizeof(job->chunk));
   job->relevance = relevance;
   job->mode      = mode;
 
