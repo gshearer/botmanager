@@ -510,6 +510,19 @@ test_wikimedia_parse = executable('test_wikimedia_parse',
   dependencies : core_deps,
 )
 
+# The oddsapi parse layer prices a game from its books, which is where a
+# wrong number would be plausible. Fixtures are files, because the live
+# replies recorded beside them are too large to inline.
+test_oddsapi_parse = executable('test_oddsapi_parse',
+  'test_oddsapi_parse.c',
+  '../plugins/service/oddsapi/oddsapi_parse.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/service/oddsapi')],
+  c_args : ['-DODDSAPI_FIXTURE_DIR="' + (meson.current_source_dir() / 'oddsapi') + '"'],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps + [m_dep],
+)
+
 test_kraken_ws_channels = executable('test_kraken_ws_channels',
   'test_kraken_ws_channels.c',
   '../plugins/service/kraken/kraken_ws_channels.c',
@@ -656,6 +669,7 @@ test('cmd_inflight', test_cmd_inflight)
 test('cmd_usage_line', test_cmd_usage_line)
 test('kraken_ws_channels', test_kraken_ws_channels)
 test('wikimedia_parse', test_wikimedia_parse)
+test('oddsapi_parse', test_oddsapi_parse)
 test('gemini_ws_channels', test_gemini_ws_channels)
 test('coinbase_ws_channels', test_coinbase_ws_channels)
 test('wxg_geo', test_wxg_geo)

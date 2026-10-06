@@ -181,6 +181,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `giphy` | plugins/service/giphy/giphy.c | Giphy GIF API client (`GIPHY_CTX`) |
 | `giphy.cmd` | plugins/service/giphy/giphy_cmd.c | `!giphy` GIF search, the giphy plugin's own command surface (`GIPHY_CMD_CTX`) |
 | `kraken` | plugins/service/kraken/kraken_sign.c | top-level kraken plugin (`KR_CTX`) |
+| `oddsapi` | plugins/service/oddsapi/oddsapi_parse.c | The Odds API — betting lines, futures, scores (`ODDSAPI_CTX`) |
 | `openweather` | plugins/service/openweather/openweather.c | OpenWeather API (`OW_CTX`) |
 | `rawg` | plugins/service/rawg/rawg.c | RAWG video-games database API (`RAWG_CTX`) |
 | `reachyapi` | plugins/service/reachyapi/reachyapi.c | Reachy Mini robot daemon REST client — moves, motors, volume, sound, tracking, DoA (`REACHYAPI_CTX`) |

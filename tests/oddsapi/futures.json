@@ -1,0 +1,108 @@
+[
+ {
+  "id": "f_sb",
+  "sport_key": "americanfootball_nfl_super_bowl_winner",
+  "sport_title": "NFL Super Bowl Winner",
+  "commence_time": 1770000000,
+  "home_team": null,
+  "away_team": null,
+  "bookmakers": [
+   {
+    "key": "draftkings",
+    "title": "DraftKings",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "outrights",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Buffalo Bills",
+        "price": 600
+       },
+       {
+        "name": "Kansas City Chiefs",
+        "price": 450
+       },
+       {
+        "name": "Detroit Lions",
+        "price": 700
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "fanduel",
+    "title": "FanDuel",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "outrights",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Kansas City Chiefs",
+        "price": 500
+       },
+       {
+        "name": "Buffalo Bills",
+        "price": 650
+       },
+       {
+        "name": "Detroit Lions",
+        "price": 800
+       },
+       {
+        "name": "Carolina Panthers",
+        "price": 50000
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "betmgm",
+    "title": "BetMGM",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "outrights",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Detroit Lions",
+        "price": 750
+       },
+       {
+        "name": "Buffalo Bills",
+        "price": 600
+       },
+       {
+        "name": "Kansas City Chiefs",
+        "price": 475
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "espnbet",
+    "title": "ESPN BET",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Buffalo Bills",
+        "price": -110
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+]

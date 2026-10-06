@@ -1,0 +1,62 @@
+[
+ {
+  "id": "g_ars_che",
+  "sport_key": "soccer_epl",
+  "sport_title": "EPL",
+  "commence_time": 1760191200,
+  "home_team": "Arsenal",
+  "away_team": "Chelsea",
+  "bookmakers": [
+   {
+    "key": "draftkings",
+    "title": "DraftKings",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Arsenal",
+        "price": -120
+       },
+       {
+        "name": "Draw",
+        "price": 260
+       },
+       {
+        "name": "Chelsea",
+        "price": 320
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "fanduel",
+    "title": "FanDuel",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Chelsea",
+        "price": 310
+       },
+       {
+        "name": "Arsenal",
+        "price": -115
+       },
+       {
+        "name": "Draw",
+        "price": 270
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+]

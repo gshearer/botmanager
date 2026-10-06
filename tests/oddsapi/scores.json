@@ -1,0 +1,53 @@
+[
+ {
+  "id": "s_live",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760191200,
+  "completed": false,
+  "home_team": "Buffalo Bills",
+  "away_team": "Kansas City Chiefs",
+  "scores": [
+   {
+    "name": "Kansas City Chiefs",
+    "score": "21"
+   },
+   {
+    "name": "Buffalo Bills",
+    "score": "17"
+   }
+  ],
+  "last_update": 1760199000
+ },
+ {
+  "id": "s_final",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760105000,
+  "completed": true,
+  "home_team": "Philadelphia Eagles",
+  "away_team": "Dallas Cowboys",
+  "scores": [
+   {
+    "name": "Philadelphia Eagles",
+    "score": "24"
+   },
+   {
+    "name": "Dallas Cowboys",
+    "score": "10"
+   }
+  ],
+  "last_update": 1760117000
+ },
+ {
+  "id": "s_next",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760220000,
+  "completed": false,
+  "home_team": "Seattle Seahawks",
+  "away_team": "San Francisco 49ers",
+  "scores": null,
+  "last_update": null
+ }
+]

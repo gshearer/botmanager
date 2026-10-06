@@ -1,0 +1,588 @@
+[
+ {
+  "id": "g_kc_buf",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760209200,
+  "home_team": "Buffalo Bills",
+  "away_team": "Kansas City Chiefs",
+  "bookmakers": [
+   {
+    "key": "draftkings",
+    "title": "DraftKings",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Buffalo Bills",
+        "price": -135
+       },
+       {
+        "name": "Kansas City Chiefs",
+        "price": 115
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Buffalo Bills",
+        "price": -110,
+        "point": -2.5
+       },
+       {
+        "name": "Kansas City Chiefs",
+        "price": -110,
+        "point": 2.5
+       }
+      ]
+     },
+     {
+      "key": "totals",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Over",
+        "price": -110,
+        "point": 47.5
+       },
+       {
+        "name": "Under",
+        "price": -110,
+        "point": 47.5
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "fanduel",
+    "title": "FanDuel",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Kansas City Chiefs",
+        "price": 118
+       },
+       {
+        "name": "Buffalo Bills",
+        "price": -138
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Kansas City Chiefs",
+        "price": -112,
+        "point": 2.5
+       },
+       {
+        "name": "Buffalo Bills",
+        "price": -108,
+        "point": -2.5
+       }
+      ]
+     },
+     {
+      "key": "totals",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Under",
+        "price": -108,
+        "point": 47.5
+       },
+       {
+        "name": "Over",
+        "price": -112,
+        "point": 47.5
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "betmgm",
+    "title": "BetMGM",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Kansas City Chiefs",
+        "price": 110
+       },
+       {
+        "name": "Buffalo Bills",
+        "price": -130
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Buffalo Bills",
+        "price": -120,
+        "point": -3.0
+       },
+       {
+        "name": "Kansas City Chiefs",
+        "price": 100,
+        "point": 3.0
+       }
+      ]
+     },
+     {
+      "key": "totals",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Over",
+        "price": -110,
+        "point": 47.0
+       },
+       {
+        "name": "Under",
+        "price": -110,
+        "point": 47.0
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "williamhill_us",
+    "title": "Caesars",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Kansas City Chiefs",
+        "price": 113
+       },
+       {
+        "name": "Buffalo Bills",
+        "price": -132
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Buffalo Bills",
+        "price": -105,
+        "point": -3.0
+       },
+       {
+        "name": "Kansas City Chiefs",
+        "price": -115,
+        "point": 3.0
+       }
+      ]
+     },
+     {
+      "key": "totals",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Over",
+        "price": -108,
+        "point": 47.5
+       },
+       {
+        "name": "Under",
+        "price": -112,
+        "point": 47.5
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "id": "g_sf_sea",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760198400,
+  "home_team": "Seattle Seahawks",
+  "away_team": "San Francisco 49ers",
+  "bookmakers": [
+   {
+    "key": "draftkings",
+    "title": "DraftKings",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "San Francisco 49ers",
+        "price": -300
+       },
+       {
+        "name": "Seattle Seahawks",
+        "price": 240
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Seattle Seahawks",
+        "price": -110,
+        "point": 6.5
+       },
+       {
+        "name": "San Francisco 49ers",
+        "price": -110,
+        "point": -6.5
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "fanduel",
+    "title": "FanDuel",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "San Francisco 49ers",
+        "price": -310
+       },
+       {
+        "name": "Seattle Seahawks",
+        "price": 250
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Seattle Seahawks",
+        "price": -105,
+        "point": 6.5
+       },
+       {
+        "name": "San Francisco 49ers",
+        "price": -115,
+        "point": -6.5
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "betmgm",
+    "title": "BetMGM",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "San Francisco 49ers",
+        "price": -290
+       },
+       {
+        "name": "Seattle Seahawks",
+        "price": 235
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Seattle Seahawks",
+        "price": -115,
+        "point": 7.0
+       },
+       {
+        "name": "San Francisco 49ers",
+        "price": -105,
+        "point": -7.0
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "williamhill_us",
+    "title": "Caesars",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "San Francisco 49ers",
+        "price": -305
+       },
+       {
+        "name": "Seattle Seahawks",
+        "price": 245
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Seattle Seahawks",
+        "price": -110,
+        "point": 7.0
+       },
+       {
+        "name": "San Francisco 49ers",
+        "price": -110,
+        "point": -7.0
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "fanatics",
+    "title": "Fanatics",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "San Francisco 49ers",
+        "price": -295
+       },
+       {
+        "name": "Seattle Seahawks",
+        "price": 250
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Seattle Seahawks",
+        "price": -120,
+        "point": 7.5
+       },
+       {
+        "name": "San Francisco 49ers",
+        "price": 100,
+        "point": -7.5
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "betrivers",
+    "title": "BetRivers",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "San Francisco 49ers",
+        "price": -300
+       },
+       {
+        "name": "Seattle Seahawks",
+        "price": 245
+       }
+      ]
+     },
+     {
+      "key": "totals",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Over",
+        "price": -110,
+        "point": 42.5
+       },
+       {
+        "name": "Under",
+        "price": -110,
+        "point": 42.5
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "id": "g_dal_phi",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760202000,
+  "home_team": "Philadelphia Eagles",
+  "away_team": "Dallas Cowboys",
+  "bookmakers": [
+   {
+    "key": "draftkings",
+    "title": "DraftKings",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Dallas Cowboys",
+        "price": -105
+       },
+       {
+        "name": "Philadelphia Eagles",
+        "price": -115
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Philadelphia Eagles",
+        "price": -110,
+        "point": -1.0
+       },
+       {
+        "name": "Dallas Cowboys",
+        "price": -110,
+        "point": 1.0
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "fanduel",
+    "title": "FanDuel",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Dallas Cowboys",
+        "price": 100
+       },
+       {
+        "name": "Philadelphia Eagles",
+        "price": -120
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "betmgm",
+    "title": "BetMGM",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Dallas Cowboys",
+        "price": 105
+       },
+       {
+        "name": "Philadelphia Eagles",
+        "price": -125
+       }
+      ]
+     },
+     {
+      "key": "spreads",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Philadelphia Eagles",
+        "price": -110,
+        "point": -1.0
+       },
+       {
+        "name": "Dallas Cowboys",
+        "price": -110,
+        "point": 1.0
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "key": "fanatics",
+    "title": "Fanatics",
+    "last_update": 1760100000,
+    "markets": []
+   },
+   {
+    "key": "betfair_ex_us",
+    "title": "Betfair",
+    "last_update": 1760100000,
+    "markets": [
+     {
+      "key": "h2h_lay",
+      "last_update": 1760100000,
+      "outcomes": [
+       {
+        "name": "Dallas Cowboys",
+        "price": -102
+       },
+       {
+        "name": "Philadelphia Eagles",
+        "price": -118
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+]

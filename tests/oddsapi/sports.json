@@ -1,0 +1,26 @@
+[
+ {
+  "key": "americanfootball_nfl",
+  "group": "American Football",
+  "title": "NFL",
+  "description": "US Football",
+  "active": true,
+  "has_outrights": false
+ },
+ {
+  "key": "americanfootball_nfl_super_bowl_winner",
+  "group": "American Football",
+  "title": "NFL Super Bowl Winner",
+  "description": "Super Bowl Winner 2026/2027",
+  "active": true,
+  "has_outrights": true
+ },
+ {
+  "key": "basketball_wnba",
+  "group": "Basketball",
+  "title": "WNBA",
+  "description": "US Basketball",
+  "active": false,
+  "has_outrights": false
+ }
+]

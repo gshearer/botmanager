@@ -1,0 +1,25 @@
+[
+ {
+  "id": "e_nyg_dal",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760209200,
+  "home_team": "New York Giants",
+  "away_team": "Dallas Cowboys"
+ },
+ {
+  "id": "e_nyj_mia",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760198400,
+  "home_team": "New York Jets",
+  "away_team": "Miami Dolphins"
+ },
+ {
+  "id": "e_bad",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": 1760198400,
+  "home_team": "Detroit Lions"
+ }
+]
