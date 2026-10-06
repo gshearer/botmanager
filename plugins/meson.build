@@ -48,6 +48,7 @@ subdir('service/yahoofinance')
 subdir('service/tmdb')
 subdir('service/giphy')
 subdir('service/rawg')
+subdir('service/oddsapi')
 subdir('service/wordnik')
 subdir('service/wikimedia')
 # reachyapi defines reachyapi_include, so it must precede both of its

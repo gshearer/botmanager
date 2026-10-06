@@ -193,4 +193,217 @@ typedef struct
   const char *label;                        // "NCAAF"
 } oddsapi_league_t;
 
+// ----------------------------------------------------------------------
+// The result envelope
+// ----------------------------------------------------------------------
+
+// ODDSAPI_OK is 0, so a two-state test reads success correctly. What it
+// loses is the reason, and every failure value obliges the same thing —
+// say `message` and stop — so nothing is lost that a caller acts on.
+typedef enum
+{
+  ODDSAPI_OK = 0,
+  ODDSAPI_NOT_FOUND,        // the API does not know that sport key
+  ODDSAPI_RATE_LIMITED,     // 429, or our own backoff after one
+  ODDSAPI_AUTH,             // the key was refused
+  ODDSAPI_QUOTA,            // out of credits, or below the reserve
+  ODDSAPI_TRANSPORT,        // no answer, or an HTTP status we do not map
+  ODDSAPI_PARSE             // an answer that was not the documented shape
+} oddsapi_status_t;
+
+typedef enum
+{
+  ODDSAPI_K_SPORTS = 0,     // free
+  ODDSAPI_K_EVENTS,         // free
+  ODDSAPI_K_ODDS,           // 3 credits: h2h, spreads, totals
+  ODDSAPI_K_FUTURES,        // 1 credit
+  ODDSAPI_K_SCORES,         // 2 credits
+  ODDSAPI_K_COUNT
+} oddsapi_kind_t;
+
+// The account as the API last described it. Every reply carries the
+// three counters — free calls included — so `seen` is the last reply of
+// any kind. -1 = no reply yet since the plugin loaded.
+typedef struct
+{
+  int32_t  remaining;
+  int32_t  used;
+  int32_t  last;                            // credits the last call cost
+  time_t   seen;
+  uint32_t backoff_left;                    // seconds of 429 stand-down left
+} oddsapi_quota_t;
+
+#define ODDSAPI_CACHE_KEY_SZ 96
+
+typedef struct
+{
+  char     key[ODDSAPI_CACHE_KEY_SZ];       // "odds:americanfootball_nfl"
+  time_t   fetched;                         // 0 = never answered
+  uint32_t items;
+  bool     inflight;
+} oddsapi_cache_row_t;
+
+// `stale` is true when the data is older than its TTL and was served
+// anyway — the quota reserve, the backoff, or a failed refresh — and
+// `message` then names why. On ODDSAPI_OK exactly one of the five
+// pointers is non-NULL, the one `kind` names; on a failure all are NULL.
+typedef struct
+{
+  oddsapi_status_t         status;
+  oddsapi_kind_t           kind;
+  char                     message[128];    // "" on a fresh success
+  bool                     stale;
+  time_t                   fetched;         // when the data left the API
+  const oddsapi_slate_t   *slate;
+  const oddsapi_events_t  *events;
+  const oddsapi_scores_t  *scores;
+  const oddsapi_sports_t  *sports;
+  const oddsapi_futures_t *futures;
+} oddsapi_res_t;
+
+// Runs on the curl worker thread, or on the caller's own thread when a
+// cache answers in place — fast and non-blocking either way.
+//
+// This plugin registers NO plugin_unmap_notify listener, and is the one
+// shape of async service that legitimately needs none: it is a single
+// .so whose only caller is its own command surface (oddsapi_cmd.c), so a
+// stored completion always names THIS mapping. Core sees it — quiesce
+// and audit range-test curl_iter_req_t.cb, which for our transfers
+// points here too — and refuses the dlclose while a request is
+// airborne. ⚠ That holds only while nothing else calls in. The first
+// consumer in another plugin makes this the defect written up in
+// PLUGIN.md §Lifecycle Contract ("hand back pointers other plugins gave
+// you"); copy reachyapi.c's registry before adding one.
+typedef void (*oddsapi_cb_t)(const oddsapi_res_t *res, void *user);
+
+// ----------------------------------------------------------------------
+// Real function declarations — visible only inside the oddsapi plugin.
+//
+// The five fetches share one return contract:
+//
+//   ASYNC_AIRBORNE            the callback owns `user`: the request is on
+//                             the wire, joined an identical one already
+//                             there, or was ANSWERED IN PLACE from cache
+//   ASYNC_FAILED_DELIVERED    refused, and the callback already ran with
+//                             the reason — the quota reserve or the 429
+//                             backoff, with no cached copy to serve
+//   ASYNC_FAILED_UNDELIVERED  refused before anything ran, `user` is
+//                             still yours: NULL callback, a missing or
+//                             malformed sport key, no API key, every
+//                             cache slot busy, or curl refused the submit
+//
+// ⚠ ASYNC_AIRBORNE does not mean "later". A warm cache, a joined twin
+// whose answer lands first, and both refusals run the callback before
+// the call returns, so a caller holding a lock across the call can
+// re-enter itself through its own callback.
+//
+// A second caller for a key already on the wire joins it rather than
+// spending again: two `!odds nfl` in one second cost one pull.
+// ----------------------------------------------------------------------
+
+#ifdef ODDSAPI_INTERNAL
+
+#include "async.h"
+
+// True when plugin.oddsapi.creds.apikey is set.
+bool oddsapi_configured(void);
+
+async_rc_t oddsapi_sports_async(oddsapi_cb_t cb, void *user);
+async_rc_t oddsapi_events_async(const char *sport_key, oddsapi_cb_t cb,
+    void *user);
+async_rc_t oddsapi_odds_async(const char *sport_key, oddsapi_cb_t cb,
+    void *user);
+async_rc_t oddsapi_futures_async(const char *outright_key, oddsapi_cb_t cb,
+    void *user);
+async_rc_t oddsapi_scores_async(const char *sport_key, oddsapi_cb_t cb,
+    void *user);
+
+void     oddsapi_quota_get(oddsapi_quota_t *out);
+
+// Up to `cap` rows, one per occupied cache slot; returns how many.
+uint32_t oddsapi_cache_rows(oddsapi_cache_row_t *rows, uint32_t cap);
+
+#endif // ODDSAPI_INTERNAL
+
+// ----------------------------------------------------------------------
+// dlsym shims (consumer side)
+// ----------------------------------------------------------------------
+
+#ifndef ODDSAPI_INTERNAL
+
+#include "async.h"
+#include "clam.h"
+#include "plugin.h"
+
+#include <stdlib.h>  // abort
+
+// Resolve one symbol into its shim's cache slot, or die naming it — a
+// shim with nothing behind it has no honest value to return.
+static inline void *
+oddsapi_sym(const char *name, void **slot)
+{
+  void *obj = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+
+  if(obj != NULL)
+    return(obj);
+
+  obj = plugin_dlsym_cached(ODDSAPI_CTX, name, slot);
+
+  if(obj == NULL)
+  {
+    clam(CLAM_FATAL, ODDSAPI_CTX, "dlsym failed: %s", name);
+    abort();
+  }
+
+  __atomic_store_n(slot, obj, __ATOMIC_RELEASE);
+  return(obj);
+}
+
+// One shim body: resolve, launder void* to the function type, call.
+#define ODDSAPI_SHIM(ret, name, params, args)                            \
+  static inline ret                                                      \
+  name params                                                            \
+  {                                                                      \
+    typedef ret (*fn_t) params;                                          \
+    static void *cached = NULL;                                          \
+    union { void *obj; fn_t fn; } u;                                     \
+                                                                         \
+    u.obj = oddsapi_sym(#name, &cached);                                 \
+    return(u.fn args);                                                   \
+  }
+
+ODDSAPI_SHIM(bool, oddsapi_configured, (void), ())
+ODDSAPI_SHIM(async_rc_t, oddsapi_sports_async,
+    (oddsapi_cb_t cb, void *user), (cb, user))
+ODDSAPI_SHIM(async_rc_t, oddsapi_events_async,
+    (const char *sport_key, oddsapi_cb_t cb, void *user),
+    (sport_key, cb, user))
+ODDSAPI_SHIM(async_rc_t, oddsapi_odds_async,
+    (const char *sport_key, oddsapi_cb_t cb, void *user),
+    (sport_key, cb, user))
+ODDSAPI_SHIM(async_rc_t, oddsapi_futures_async,
+    (const char *outright_key, oddsapi_cb_t cb, void *user),
+    (outright_key, cb, user))
+ODDSAPI_SHIM(async_rc_t, oddsapi_scores_async,
+    (const char *sport_key, oddsapi_cb_t cb, void *user),
+    (sport_key, cb, user))
+ODDSAPI_SHIM(uint32_t, oddsapi_cache_rows,
+    (oddsapi_cache_row_t *rows, uint32_t cap), (rows, cap))
+
+#undef ODDSAPI_SHIM
+
+// By hand: ISO C forbids `return` with a void expression.
+static inline void
+oddsapi_quota_get(oddsapi_quota_t *out)
+{
+  typedef void (*fn_t)(oddsapi_quota_t *);
+  static void *cached = NULL;
+  union { void *obj; fn_t fn; } u;
+
+  u.obj = oddsapi_sym("oddsapi_quota_get", &cached);
+  u.fn(out);
+}
+
+#endif // !ODDSAPI_INTERNAL
+
 #endif // BM_ODDSAPI_API_H

@@ -181,10 +181,11 @@ regex (the literal context portion, before any `<placeholder>`).
 | `giphy` | plugins/service/giphy/giphy.c | Giphy GIF API client (`GIPHY_CTX`) |
 | `giphy.cmd` | plugins/service/giphy/giphy_cmd.c | `!giphy` GIF search, the giphy plugin's own command surface (`GIPHY_CMD_CTX`) |
 | `kraken` | plugins/service/kraken/kraken_sign.c | top-level kraken plugin (`KR_CTX`) |
-| `oddsapi` | plugins/service/oddsapi/oddsapi_parse.c | The Odds API — betting lines, futures, scores (`ODDSAPI_CTX`) |
+| `oddsapi` | plugins/service/oddsapi/oddsapi.c | The Odds API — betting lines, futures, scores; one INFO line per paid pull (`ODDSAPI_CTX`) |
 | `openweather` | plugins/service/openweather/openweather.c | OpenWeather API (`OW_CTX`) |
 | `rawg` | plugins/service/rawg/rawg.c | RAWG video-games database API (`RAWG_CTX`) |
 | `reachyapi` | plugins/service/reachyapi/reachyapi.c | Reachy Mini robot daemon REST client — moves, motors, volume, sound, tracking, DoA (`REACHYAPI_CTX`) |
+| `oddsapi.cmd` | plugins/service/oddsapi/oddsapi_cmd.c | `show odds` (and `!odds` / `!scores` as they land), the oddsapi plugin's own command surface (`ODDSAPI_CMD_CTX`) |
 | `rawg.cmd` | plugins/service/rawg/rawg_cmd.c | `!rawg` video-game info, the rawg plugin's own command surface (`RAWGCMD_CTX`) |
 | `searxng` | plugins/service/searxng/searxng.c | SearXNG service client (`SXNG_CTX`) |
 | `shorturl` | plugins/service/shorturl/shorturl.c | mints short links into the `urls` table an off-host FastCGI daemon resolves (`SU_CTX`) |
