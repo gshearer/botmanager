@@ -104,8 +104,8 @@ bool oddsapi_team_match(const char *team, const char *query);
 #ifdef ODDSAPI_PARSE_INTERNAL
 
 // The leagues the commands know by name; a NULL outright key means no
-// futures market. ⚠ The NCAAF, NCAAB, NHL and EPL outright keys are not
-// yet confirmed against a live /v4/sports?all=true reply.
+// futures market. Every key was checked against /v4/sports?all=true
+// (tests/oddsapi/live_sports.json): the API lists no EPL outright.
 static const oddsapi_league_t oddsapi_leagues[] = {
   { "nfl",    NULL,  "americanfootball_nfl",
     "americanfootball_nfl_super_bowl_winner",       "NFL"     },
@@ -121,7 +121,7 @@ static const oddsapi_league_t oddsapi_leagues[] = {
   { "nhl",    NULL,  "icehockey_nhl",
     "icehockey_nhl_championship_winner",            "NHL"     },
   { "mls",    NULL,  "soccer_usa_mls",             NULL,     "MLS"     },
-  { "epl",    NULL,  "soccer_epl",                 "soccer_epl_winner", "EPL" },
+  { "epl",    NULL,  "soccer_epl",                 NULL,     "EPL"     },
   { "laliga", NULL,  "soccer_spain_la_liga",       NULL,     "La Liga" },
   { "ucl",    NULL,  "soccer_uefa_champs_league",  NULL,     "UCL"     },
   { "ufc",    "mma", "mma_mixed_martial_arts",     NULL,     "MMA"     },

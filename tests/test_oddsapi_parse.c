@@ -375,6 +375,71 @@ main(void)
     oddsapi_futures_clear(&f);
   }
 
+  // Replies recorded from the live API. Their contents are whatever the
+  // day held, so the cases assert what must hold of any reply: every
+  // row survives, both sides of every market land, nothing is priced 0.
+  {
+    oddsapi_sports_t sp;
+    oddsapi_events_t ev;
+    oddsapi_slate_t  sl;
+    size_t           n;
+    uint32_t         outrights = 0, books = 0, unsided = 0, unpriced = 0;
+    bool             sorted = true;
+
+    if((n = fixture("live_sports.json")) == 0
+        || !oddsapi_parse_sports(body, n, &sp))
+      return(test_skip("oddsapi_parse", "live_sports.json would not parse"));
+
+    for(uint32_t i = 0; i < sp.n; i++)
+      outrights += sp.sports[i].has_outrights;
+
+    test_check_sz("live", "every sport survives", 180, sp.n);
+    test_check_sz("live", "outright markets are flagged", 12, outrights);
+    oddsapi_sports_clear(&sp);
+
+    if((n = fixture("live_events.json")) == 0
+        || !oddsapi_parse_events(body, n, &ev))
+      return(test_skip("oddsapi_parse", "live_events.json would not parse"));
+
+    test_check_sz("live", "every event survives", 26, ev.n);
+    oddsapi_events_clear(&ev);
+
+    if((n = fixture("live_odds_nfl.json")) == 0
+        || !oddsapi_parse_odds(body, n, &sl))
+      return(test_skip("oddsapi_parse", "live_odds_nfl.json would not parse"));
+
+    for(uint32_t g = 0; g < sl.ngames; g++)
+    {
+      oddsapi_consensus_t c;
+
+      if(g > 0 && sl.games[g].commence < sl.games[g - 1].commence)
+        sorted = false;
+
+      for(uint8_t b = 0; b < sl.games[g].nbooks; b++)
+      {
+        const oddsapi_line_t *l = &sl.games[g].books[b];
+
+        books++;
+        unsided += l->ml_home == 0 || l->ml_away == 0
+            || l->spr_home_px == 0 || l->spr_away_px == 0;
+        unpriced += l->over_px == 0 || l->under_px == 0;
+      }
+
+      oddsapi_consensus(&sl.games[g], &c);
+      unpriced += c.px[ODDSAPI_COL_ML_HOME] == 0
+          || c.px[ODDSAPI_COL_SPR_HOME] == 0 || c.px[ODDSAPI_COL_OVER] == 0;
+    }
+
+    test_check_sz("live", "every game survives", 26, sl.ngames);
+    test_check_sz("live", "every book survives", 120, books);
+    test_check_bool("live", "the slate is in start order", true, sorted);
+    test_check_sz("live", "both sides of every market land by name", 0,
+        unsided);
+    test_check_sz("live", "nothing a book quoted reads as absent", 0,
+        unpriced);
+    oddsapi_slate_clear(&sl);
+  }
+
   // A contender nobody prices cannot come out of the parser, so the
   // sort's last rule is driven by hand.
   {
@@ -396,6 +461,9 @@ main(void)
     test_check_str("league", league_cases[i].name, league_cases[i].want,
         l != NULL ? l->sport_key : "");
   }
+
+  test_check_bool("league", "the API lists no EPL futures market", true,
+      oddsapi_league_find("epl")->outright_key == NULL);
 
   for(size_t i = 0; i < sizeof(team_cases) / sizeof(team_cases[0]); i++)
     test_check_bool("team", team_cases[i].name, team_cases[i].want,
