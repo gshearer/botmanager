@@ -1174,6 +1174,7 @@ oddsapi_usage(const cmd_ctx_t *ctx, const char *usage)
   const oddsapi_league_t *t = oddsapi_league_table(&n);
   char                    line[ODDSAPI_CMD_REPLY_SZ];
 
+  cmd_result_set(ctx, CMD_RESULT_REFUSED);
   snprintf(line, sizeof(line), "usage: %s", usage);
   cmd_reply(ctx, line);
   strlcpy(line, "leagues:", sizeof(line));
@@ -1268,6 +1269,7 @@ oddsapi_search(oddsapi_req_t *r, const oddsapi_sports_t *sp)
     snprintf(csv, sizeof(csv), "None of the leagues a team is searched in "
         "is in season right now — name one: %s <league> <team>",
         r->mode == ODDSAPI_MODE_SCORES_TEAM ? "scores" : "odds");
+    cmd_result_set(&r->ctx, CMD_RESULT_REFUSED);
     cmd_reply(&r->ctx, csv);
     mem_free(r);
     return;
@@ -1577,6 +1579,7 @@ oddsapi_ready(const cmd_ctx_t *ctx, const oddsapi_args_t *a,
 
   if(!oddsapi_configured())
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "Odds aren't set up yet — the operator needs to set "
         "plugin.oddsapi.creds.apikey.");
     return(false);
@@ -1584,6 +1587,7 @@ oddsapi_ready(const cmd_ctx_t *ctx, const oddsapi_args_t *a,
 
   if(a->query[0] != '\0' && strlen(a->query) < ODDSAPI_QUERY_MIN)
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "Give me at least three letters of a team's name.");
     return(false);
   }
@@ -1703,6 +1707,73 @@ oddsapi_scores_cmd(const cmd_ctx_t *ctx)
 }
 
 // ----------------------------------------------------------------------
+// NL hints — a bridged ask is retold by the persona, so a slate comes
+// back summarized; the grid is for whoever types the command
+// ----------------------------------------------------------------------
+
+static const cmd_nl_slot_t oddsapi_nl_slots[] = {
+  { .name  = "league or team",
+    .type  = CMD_NL_ARG_TOPIC,
+    .flags = CMD_NL_SLOT_REQUIRED | CMD_NL_SLOT_REMAINDER },
+};
+
+// Measured, not written: on q38nv every wording variant tried moved
+// routing, most for the worse, and dropping the props example dropped
+// odds routing everywhere. That example also teaches its own team, so
+// another player's prop pulls the Chiefs' game. AGENTS.md §Chat.
+static const cmd_nl_example_t odds_nl_examples[] = {
+  { .utterance  = "who's favoured in the nba tonight?",
+    .invocation = "/odds nba" },
+  { .utterance  = "what's the line on the lakers game?",
+    .invocation = "/odds lakers" },
+  { .utterance  = "are the celtics favoured tonight?",
+    .invocation = "/odds celtics" },
+  { .utterance  = "who's the favourite to win the world series?",
+    .invocation = "/odds mlb --futures" },
+  { .utterance  = "what's mahomes' passing yards line?",
+    .invocation = "/odds chiefs --props" },
+};
+
+static const cmd_nl_t odds_nl = {
+  .when          = "User asks who is favoured or expected to win a game, "
+                   "a fight or a title, or for a point spread, an "
+                   "over/under or a player's prop line — sportsbook odds. "
+                   "Leagues: nfl ncaaf nba ncaab wnba mlb nhl mls epl "
+                   "laliga ucl ufc boxing.",
+  .syntax        = "/odds <league> | /odds [league] <team> [--props] | "
+                   "/odds <league> --futures",
+  .slots         = oddsapi_nl_slots,
+  .slot_count    = (uint8_t)(sizeof(oddsapi_nl_slots)
+                             / sizeof(oddsapi_nl_slots[0])),
+  .examples      = odds_nl_examples,
+  .example_count = (uint8_t)(sizeof(odds_nl_examples)
+                             / sizeof(odds_nl_examples[0])),
+};
+
+static const cmd_nl_example_t scores_nl_examples[] = {
+  { .utterance  = "what's the score of the yankees game?",
+    .invocation = "/scores yankees" },
+  { .utterance  = "nfl scores from yesterday",
+    .invocation = "/scores nfl" },
+  { .utterance  = "did the bruins win?",
+    .invocation = "/scores bruins" },
+};
+
+static const cmd_nl_t scores_nl = {
+  .when          = "User asks for the score or final result of a game "
+                   "live or just played, for a league or a team. Never "
+                   "for who is favoured — that is /odds. Same leagues as "
+                   "/odds.",
+  .syntax        = "/scores <league> | /scores [league] <team>",
+  .slots         = oddsapi_nl_slots,
+  .slot_count    = (uint8_t)(sizeof(oddsapi_nl_slots)
+                             / sizeof(oddsapi_nl_slots[0])),
+  .examples      = scores_nl_examples,
+  .example_count = (uint8_t)(sizeof(scores_nl_examples)
+                             / sizeof(scores_nl_examples[0])),
+};
+
+// ----------------------------------------------------------------------
 // Registration
 // ----------------------------------------------------------------------
 
@@ -1755,6 +1826,7 @@ static const cmd_decl_t odds_decl = {
   .scope       = CMD_SCOPE_ANY,
   .methods     = METHOD_T_ANY,
   .cb          = oddsapi_odds_cmd,
+  .nl          = &odds_nl,
 };
 
 static const cmd_decl_t scores_decl = {
@@ -1773,6 +1845,7 @@ static const cmd_decl_t scores_decl = {
   .scope       = CMD_SCOPE_ANY,
   .methods     = METHOD_T_ANY,
   .cb          = oddsapi_scores_cmd,
+  .nl          = &scores_nl,
 };
 
 // Raised together: half a command surface is a half-loaded plugin, so a
