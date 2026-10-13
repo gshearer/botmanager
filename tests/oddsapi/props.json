@@ -1,0 +1,18 @@
+{"id":"p_game","sport_key":"americanfootball_nfl","sport_title":"NFL","commence_time":1792109700,
+ "home_team":"Denver Broncos","away_team":"Seattle Seahawks",
+ "bookmakers":[
+  {"key":"book_a","title":"Book A","markets":[
+   {"key":"player_pass_yds","outcomes":[
+    {"name":"Over","description":"P One","price":-110,"point":200.5},
+    {"name":"Under","description":"P One","price":-110,"point":200.5},
+    {"name":"Over","description":"P One","price":100,"point":210.5},
+    {"name":"Over","price":-110,"point":180.5},
+    {"name":"Push","description":"P Two","price":-110,"point":180.5},
+    {"name":"Over","description":"P Three","price":-110}]}]},
+  {"key":"book_b","title":"Book B","markets":[
+   {"key":"player_anytime_td","outcomes":[
+    {"name":"Yes","description":"P One","price":300}]}]},
+  {"key":"book_c","title":"Book C","markets":[
+   {"key":"player_anytime_td","outcomes":[
+    {"name":"Over","description":"P One","price":250,"point":0.5}]}]},
+  {"key":"book_d","title":"Book D"}]}

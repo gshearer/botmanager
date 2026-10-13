@@ -657,6 +657,213 @@ oddsapi_futures_clear(oddsapi_futures_t *f)
   memset(f, 0, sizeof(*f));
 }
 
+// The row for (market, player), started while `cap` allows; NULL past
+// it. A reply carries a few hundred rows, so a linear search is the
+// whole index.
+static oddsapi_prop_t *
+oddsapi_prop_find(oddsapi_props_t *out, const char *market,
+    const char *player, uint32_t cap)
+{
+  oddsapi_prop_t *p;
+
+  for(uint32_t k = 0; k < out->n; k++)
+  {
+    p = &out->props[k];
+
+    if(strcmp(p->market, market) == 0 && strcmp(p->player, player) == 0)
+      return(p);
+  }
+
+  if(out->n == cap)
+    return(NULL);
+
+  p = &out->props[out->n++];
+  memset(p, 0, sizeof(*p));
+  strlcpy(p->market, market, sizeof(p->market));
+  strlcpy(p->player, player, sizeof(p->player));
+  return(p);
+}
+
+// One book's prop markets folded into the game. An outcome names its
+// player in `description` and its side in `name`: Over / Under with a
+// line, or Yes / No without one. A book keeps the first line it quotes
+// a player at — a second Over at another point is an alternate line,
+// and pricing it beside the first would make the median a blend of two
+// different bets.
+static void
+oddsapi_book_props(struct json_object *book, oddsapi_props_t *out,
+    uint32_t cap)
+{
+  struct json_object *markets = json_get_array(book, "markets");
+  char                key[ODDSAPI_BOOK_KEY_SZ] = "";
+  uint8_t             bi;
+  size_t              nm;
+
+  if(markets == NULL || !json_get_str(book, "key", key, sizeof(key))
+      || key[0] == '\0')
+    return;
+
+  for(bi = 0; bi < out->nbooks; bi++)
+  {
+    if(strcmp(out->book_key[bi], key) == 0)
+      break;
+  }
+
+  if(bi == ODDSAPI_BOOKS_MAX)
+    return;
+
+  nm = json_object_array_length(markets);
+
+  for(size_t m = 0; m < nm; m++)
+  {
+    struct json_object *mk   = json_object_array_get_idx(markets, m);
+    struct json_object *outs = json_get_array(mk, "outcomes");
+    char                mkey[ODDSAPI_MARKET_SZ];
+    size_t              no;
+
+    if(outs == NULL || !json_get_str(mk, "key", mkey, sizeof(mkey))
+        || mkey[0] == '\0')
+      continue;
+
+    no = json_object_array_length(outs);
+
+    for(size_t o = 0; o < no; o++)
+    {
+      struct json_object *oc = json_object_array_get_idx(outs, o);
+      char                side[8];
+      char                player[ODDSAPI_TEAM_SZ];
+      int32_t             px = oddsapi_price(oc);
+      bool                over, lined;
+      float               pt = 0.0f;
+      oddsapi_prop_t     *p;
+      uint8_t             k;
+
+      if(px == 0 || !json_get_str(oc, "name", side, sizeof(side))
+          || !json_get_str(oc, "description", player, sizeof(player))
+          || player[0] == '\0')
+        continue;
+
+      if(strcmp(side, "Over") == 0 || strcmp(side, "Under") == 0)
+        lined = true;
+
+      else if(strcmp(side, "Yes") == 0 || strcmp(side, "No") == 0)
+        lined = false;
+
+      else
+        continue;
+
+      over = side[0] == 'O' || side[0] == 'Y';
+
+      if(lined && !oddsapi_point(oc, &pt))
+        continue;
+
+      if((p = oddsapi_prop_find(out, mkey, player, cap)) == NULL)
+        continue;
+
+      // The first outcome decides whether the market has a line; one
+      // that disagrees is not the same market and is not read.
+      if(p->n == 0)
+        p->has_point = lined;
+
+      else if(p->has_point != lined)
+        continue;
+
+      for(k = 0; k < p->n; k++)
+      {
+        if(p->book[k] == bi)
+          break;
+      }
+
+      if(k < p->n && (fabsf(p->pt[k] - pt) >= ODDSAPI_PT_EPS
+          || (over ? p->over[k] : p->under[k]) != 0))
+        continue;
+
+      // A book joins the table with its first price, so the table never
+      // counts a book that quoted no prop.
+      if(bi == out->nbooks)
+      {
+        strlcpy(out->book_key[bi], key, sizeof(out->book_key[bi]));
+        json_get_str(book, "title", out->book_title[bi],
+            sizeof(out->book_title[bi]));
+        out->nbooks++;
+      }
+
+      if(k == p->n)
+      {
+        p->book[k] = bi;
+        p->pt[k]   = pt;
+        p->n++;
+      }
+
+      if(over)
+        p->over[k] = px;
+
+      else
+        p->under[k] = px;
+    }
+  }
+}
+
+// The reply is one event object. A row the parser starts and no book
+// prices cannot exist — a row is started only for a priced outcome.
+bool
+oddsapi_parse_props(const char *body, size_t len, oddsapi_props_t *out)
+{
+  struct json_object *root;
+  struct json_object *books;
+  size_t              nb;
+
+  memset(out, 0, sizeof(*out));
+
+  if((root = json_parse_buf(body, len, ODDSAPI_CTX)) == NULL)
+    return(false);
+
+  if(!json_object_is_type(root, json_type_object)
+      || !oddsapi_event_head(root, out->id, out->home, out->away,
+          &out->commence))
+  {
+    json_object_put(root);
+    memset(out, 0, sizeof(*out));
+    return(false);
+  }
+
+  json_get_str(root, "sport_key", out->sport_key, sizeof(out->sport_key));
+  books = json_get_array(root, "bookmakers");
+  nb    = books != NULL ? json_object_array_length(books) : 0;
+
+  out->props = mem_alloc(ODDSAPI_CTX, "props",
+      ODDSAPI_ROWS_MAX * sizeof(*out->props));
+
+  for(size_t b = 0; b < nb; b++)
+    oddsapi_book_props(json_object_array_get_idx(books, b), out,
+        ODDSAPI_ROWS_MAX);
+
+  json_object_put(root);
+
+  if(out->n == 0)
+  {
+    mem_free(out->props);
+    out->props = NULL;
+  }
+
+  else
+  {
+    out->props = mem_realloc(out->props, out->n * sizeof(*out->props));
+    oddsapi_props_sort(out);
+  }
+
+  return(true);
+}
+
+void
+oddsapi_props_clear(oddsapi_props_t *p)
+{
+  if(p->props != NULL)
+    mem_free(p->props);
+
+  memset(p, 0, sizeof(*p));
+}
+
 // ----------------------------------------------------------------------
 // Consensus and best price
 // ----------------------------------------------------------------------
@@ -887,6 +1094,90 @@ oddsapi_futures_sort(oddsapi_futures_t *f)
 {
   if(f->n > 1)
     qsort(f->contenders, f->n, sizeof(*f->contenders), oddsapi_contender_cmp);
+}
+
+void
+oddsapi_prop_consensus(const oddsapi_prop_t *p, oddsapi_prop_line_t *out)
+{
+  double  ov[ODDSAPI_BOOKS_MAX];
+  double  un[ODDSAPI_BOOKS_MAX];
+  uint8_t no = 0;
+  uint8_t nu = 0;
+
+  memset(out, 0, sizeof(*out));
+
+  if(p->has_point && !oddsapi_modal_point(p->pt, p->n, &out->pt))
+    return;
+
+  for(uint8_t i = 0; i < p->n; i++)
+  {
+    if(p->has_point && fabsf(p->pt[i] - out->pt) >= ODDSAPI_PT_EPS)
+      continue;
+
+    out->n++;
+
+    if(p->over[i] != 0)
+    {
+      ov[no] = oddsapi_am_to_dec(p->over[i]);
+
+      if(out->best_over.px == 0
+          || ov[no] > oddsapi_am_to_dec(out->best_over.px))
+        out->best_over = (oddsapi_best_t){ p->over[i], p->book[i] };
+
+      no++;
+    }
+
+    if(p->under[i] != 0)
+    {
+      un[nu] = oddsapi_am_to_dec(p->under[i]);
+
+      if(out->best_under.px == 0
+          || un[nu] > oddsapi_am_to_dec(out->best_under.px))
+        out->best_under = (oddsapi_best_t){ p->under[i], p->book[i] };
+
+      nu++;
+    }
+  }
+
+  out->over  = no > 0 ? oddsapi_dec_to_am(oddsapi_median(ov, no)) : 0;
+  out->under = nu > 0 ? oddsapi_dec_to_am(oddsapi_median(un, nu)) : 0;
+}
+
+static int
+oddsapi_prop_cmp(const void *a, const void *b)
+{
+  const oddsapi_prop_t *pa = a;
+  const oddsapi_prop_t *pb = b;
+  oddsapi_prop_line_t   la, lb;
+  double                da, db;
+  int                   c;
+
+  if((c = strcmp(pa->market, pb->market)) != 0)
+    return(c);
+
+  oddsapi_prop_consensus(pa, &la);
+  oddsapi_prop_consensus(pb, &lb);
+
+  if(pa->has_point && pb->has_point && la.pt != lb.pt)
+    return(la.pt > lb.pt ? -1 : 1);
+
+  da = oddsapi_am_to_dec(la.over);
+  db = oddsapi_am_to_dec(lb.over);
+
+  if((da == 0.0) != (db == 0.0))
+    return(da == 0.0 ? 1 : -1);
+
+  if(da != db)
+    return(da < db ? -1 : 1);
+
+  return(strcmp(pa->player, pb->player));
+}
+
+void
+oddsapi_props_sort(oddsapi_props_t *p)
+{
+  if(p->n > 1)
+    qsort(p->props, p->n, sizeof(*p->props), oddsapi_prop_cmp);
 }
 
 // ----------------------------------------------------------------------

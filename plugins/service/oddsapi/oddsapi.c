@@ -48,6 +48,31 @@ oddsapi_key_ok(const char *s)
   return(n > 0 && n < ODDSAPI_SPORT_KEY_SZ);
 }
 
+// The boundary for a fetch's argument. A props argument is a sport key
+// and an event id joined by '/', each held to the same alphabet, and the
+// whole must leave its cache key room for the "props:" prefix — a key
+// cut short would let two games share one slot.
+static bool
+oddsapi_arg_ok(oddsapi_kind_t kind, const char *arg)
+{
+  char        sport[ODDSAPI_SPORT_KEY_SZ];
+  const char *slash;
+  size_t      n;
+
+  if(kind != ODDSAPI_K_PROPS)
+    return(oddsapi_key_ok(arg));
+
+  if((slash = strchr(arg, '/')) == NULL
+      || (n = (size_t)(slash - arg)) >= sizeof(sport))
+    return(false);
+
+  memcpy(sport, arg, n);
+  sport[n] = '\0';
+
+  return(oddsapi_key_ok(sport) && oddsapi_key_ok(slash + 1)
+      && strlen(arg) + sizeof("props:") < ODDSAPI_CACHE_KEY_SZ);
+}
+
 // Percent-encode `in` into `out`, RFC-3986 unreserved set kept verbatim.
 // Returns the bytes the whole encoding needs, like snprintf, so a return
 // >= cap is a truncation.
@@ -94,11 +119,15 @@ static bool
 oddsapi_url(oddsapi_kind_t kind, const char *arg, const char *apikey,
     char *url, size_t cap)
 {
-  const char *books = kv_get_str("plugin.oddsapi.bookmakers");
-  char        key[128];
-  char        enc[512];
-  char        sel[sizeof(enc) + 16];
-  int         need = -1;
+  const char             *books = kv_get_str("plugin.oddsapi.bookmakers");
+  const oddsapi_league_t *league;
+  const char             *event;
+  char                    key[128];
+  char                    enc[512];
+  char                    sel[sizeof(enc) + 16];
+  char                    sport[ODDSAPI_SPORT_KEY_SZ];
+  char                    markets[256];
+  int                     need = -1;
 
   if(oddsapi_urlencode(apikey, key, sizeof(key)) >= sizeof(key))
     return(false);
@@ -143,6 +172,32 @@ oddsapi_url(oddsapi_kind_t kind, const char *arg, const char *apikey,
           "&apiKey=%s", ODDSAPI_API_BASE, arg, key);
       break;
 
+    // oddsapi_arg_ok has already held `arg` to "<sport>/<event>". The
+    // markets are the league's curated set, and only the ones the reply
+    // carries are billed.
+    case ODDSAPI_K_PROPS:
+      event = strchr(arg, '/') + 1;
+      strlcpy(sport, arg, (size_t)(event - arg));
+
+      if((league = oddsapi_league_find(sport)) == NULL
+          || league->props == NULL)
+        return(false);
+
+      markets[0] = '\0';
+
+      for(const oddsapi_prop_mkt_t *m = league->props; m->key != NULL; m++)
+      {
+        if(markets[0] != '\0')
+          strlcat(markets, ",", sizeof(markets));
+
+        strlcat(markets, m->key, sizeof(markets));
+      }
+
+      need = snprintf(url, cap, "%s/%s/events/%s/odds?markets=%s"
+          "&oddsFormat=american&dateFormat=unix&%s&apiKey=%s",
+          ODDSAPI_API_BASE, sport, event, markets, sel, key);
+      break;
+
     case ODDSAPI_K_COUNT:
       break;
   }
@@ -185,6 +240,7 @@ oddsapi_snap_items(const oddsapi_snap_t *snap)
     case ODDSAPI_K_ODDS:    return(snap->u.slate.ngames);
     case ODDSAPI_K_FUTURES: return(snap->u.futures.n);
     case ODDSAPI_K_SCORES:  return(snap->u.scores.n);
+    case ODDSAPI_K_PROPS:   return(snap->u.props.n);
     case ODDSAPI_K_COUNT:   break;
   }
 
@@ -201,6 +257,7 @@ oddsapi_snap_free(oddsapi_snap_t *snap)
     case ODDSAPI_K_ODDS:    oddsapi_slate_clear(&snap->u.slate);     break;
     case ODDSAPI_K_FUTURES: oddsapi_futures_clear(&snap->u.futures); break;
     case ODDSAPI_K_SCORES:  oddsapi_scores_clear(&snap->u.scores);   break;
+    case ODDSAPI_K_PROPS:   oddsapi_props_clear(&snap->u.props);     break;
     case ODDSAPI_K_COUNT:   break;
   }
 
@@ -253,6 +310,10 @@ oddsapi_snap_parse(oddsapi_kind_t kind, const char *body, size_t len)
       ok = oddsapi_parse_scores(body, len, &snap->u.scores);
       break;
 
+    case ODDSAPI_K_PROPS:
+      ok = oddsapi_parse_props(body, len, &snap->u.props);
+      break;
+
     case ODDSAPI_K_COUNT:
       break;
   }
@@ -300,6 +361,7 @@ oddsapi_deliver(oddsapi_cb_t cb, void *user, oddsapi_kind_t kind,
       case ODDSAPI_K_ODDS:    res.slate   = &snap->u.slate;   break;
       case ODDSAPI_K_FUTURES: res.futures = &snap->u.futures; break;
       case ODDSAPI_K_SCORES:  res.scores  = &snap->u.scores;  break;
+      case ODDSAPI_K_PROPS:   res.props   = &snap->u.props;   break;
       case ODDSAPI_K_COUNT:   break;
     }
   }
@@ -440,7 +502,7 @@ oddsapi_hold_reason_locked(uint32_t reserve, oddsapi_status_t *st)
 // The fetch path
 // ----------------------------------------------------------------------
 
-// Behind all five entry points. Every KV read happens before the lock;
+// Behind all six entry points. Every KV read happens before the lock;
 // under it the request is answered from cache, joined to its twin,
 // held back by the quota, or committed to the wire — and the wire is
 // reached only after the lock is dropped.
@@ -469,7 +531,7 @@ oddsapi_fetch(oddsapi_kind_t kind, const char *arg, oddsapi_cb_t cb,
   if(kind == ODDSAPI_K_SPORTS)
     arg = "";
 
-  else if(arg == NULL || !oddsapi_key_ok(arg))
+  else if(arg == NULL || !oddsapi_arg_ok(kind, arg))
     return(ASYNC_FAILED_UNDELIVERED);
 
   snprintf(key, sizeof(key), "%s:%s", ki->name, arg);
@@ -727,6 +789,24 @@ async_rc_t
 oddsapi_scores_async(const char *sport_key, oddsapi_cb_t cb, void *user)
 {
   return(oddsapi_fetch(ODDSAPI_K_SCORES, sport_key, cb, user));
+}
+
+async_rc_t
+oddsapi_props_async(const char *sport_key, const char *event_id,
+    oddsapi_cb_t cb, void *user)
+{
+  char arg[ODDSAPI_CACHE_KEY_SZ];
+  int  n;
+
+  if(sport_key == NULL || event_id == NULL)
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  n = snprintf(arg, sizeof(arg), "%s/%s", sport_key, event_id);
+
+  if(n < 0 || (size_t)n >= sizeof(arg))
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  return(oddsapi_fetch(ODDSAPI_K_PROPS, arg, cb, user));
 }
 
 void

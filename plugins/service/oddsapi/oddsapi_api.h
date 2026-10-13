@@ -38,6 +38,7 @@
 #define ODDSAPI_TITLE_SZ      64
 #define ODDSAPI_BOOK_KEY_SZ   32
 #define ODDSAPI_SCORE_SZ      8    // the API sends a score as a string
+#define ODDSAPI_MARKET_SZ     40   // "player_reception_yds_alternate"
 
 // ----------------------------------------------------------------------
 // Results
@@ -150,6 +151,38 @@ typedef struct
   oddsapi_contender_t *contenders;          // one per distinct outcome name
 } oddsapi_futures_t;
 
+// One player's line in one prop market, across the books that quote it.
+// `over` holds Over — or Yes, in a market with no line such as anytime
+// TD — and `under` Under or No; 0 = that book does not offer the side.
+// Slot i of book/pt/over/under is one book; `book[i]` indexes the
+// props' book table.
+typedef struct
+{
+  char    market[ODDSAPI_MARKET_SZ];        // "player_pass_yds"
+  char    player[ODDSAPI_TEAM_SZ];
+  bool    has_point;                        // false for a Yes/No market
+  uint8_t n;
+  uint8_t book[ODDSAPI_BOOKS_MAX];
+  float   pt[ODDSAPI_BOOKS_MAX];
+  int32_t over[ODDSAPI_BOOKS_MAX];
+  int32_t under[ODDSAPI_BOOKS_MAX];
+} oddsapi_prop_t;
+
+// One game's player props. `props` is NULL when n is 0.
+typedef struct
+{
+  char            id[ODDSAPI_ID_SZ];
+  char            sport_key[ODDSAPI_SPORT_KEY_SZ];
+  char            home[ODDSAPI_TEAM_SZ];
+  char            away[ODDSAPI_TEAM_SZ];
+  time_t          commence;
+  uint8_t         nbooks;
+  char            book_key[ODDSAPI_BOOKS_MAX][ODDSAPI_BOOK_KEY_SZ];
+  char            book_title[ODDSAPI_BOOKS_MAX][ODDSAPI_TITLE_SZ];
+  uint32_t        n;
+  oddsapi_prop_t *props;                    // by market, then oddsapi_props_sort
+} oddsapi_props_t;
+
 // ----------------------------------------------------------------------
 // Consensus and best price
 // ----------------------------------------------------------------------
@@ -182,15 +215,37 @@ typedef struct
   uint8_t book;                             // index into the game's books
 } oddsapi_best_t;
 
-// A league the commands know by name. `alt` is a second alias or NULL;
-// `outright_key` is NULL when the league has no futures market.
+// A prop priced like a spread: the modal line, then the median and the
+// best of each side among the books standing on it.
 typedef struct
 {
-  const char *alias;                        // "ncaaf"
-  const char *alt;                          // "cfb"
-  const char *sport_key;                    // "americanfootball_ncaaf"
-  const char *outright_key;
-  const char *label;                        // "NCAAF"
+  float          pt;                        // 0 in a Yes/No market
+  int32_t        over;                      // median Over (or Yes), 0 = none
+  int32_t        under;
+  oddsapi_best_t best_over;                 // .book indexes the props' books
+  oddsapi_best_t best_under;
+  uint8_t        n;                         // books standing on the line
+} oddsapi_prop_line_t;
+
+// A player-prop market the commands ask for, and how a reply labels it.
+typedef struct
+{
+  const char *key;                          // "player_pass_yds"
+  const char *label;                        // "pass yds"
+} oddsapi_prop_mkt_t;
+
+// A league the commands know by name. `alt` is a second alias or NULL;
+// `outright_key` is NULL when the league has no futures market, and
+// `props` NULL when it has no player props — else the curated markets
+// one props ask pulls, ended by a NULL key.
+typedef struct
+{
+  const char               *alias;          // "ncaaf"
+  const char               *alt;            // "cfb"
+  const char               *sport_key;      // "americanfootball_ncaaf"
+  const char               *outright_key;
+  const char               *label;          // "NCAAF"
+  const oddsapi_prop_mkt_t *props;
 } oddsapi_league_t;
 
 // ----------------------------------------------------------------------
@@ -218,6 +273,7 @@ typedef enum
   ODDSAPI_K_ODDS,           // 3 credits: h2h, spreads, totals
   ODDSAPI_K_FUTURES,        // 1 credit
   ODDSAPI_K_SCORES,         // 2 credits
+  ODDSAPI_K_PROPS,          // 1 credit per market the reply carries
   ODDSAPI_K_COUNT
 } oddsapi_kind_t;
 
@@ -245,7 +301,7 @@ typedef struct
 
 // `stale` is true when the data is older than its TTL and was served
 // anyway — the quota reserve, the backoff, or a failed refresh — and
-// `message` then names why. On ODDSAPI_OK exactly one of the five
+// `message` then names why. On ODDSAPI_OK exactly one of the six
 // pointers is non-NULL, the one `kind` names; on a failure all are NULL.
 typedef struct
 {
@@ -259,6 +315,7 @@ typedef struct
   const oddsapi_scores_t  *scores;
   const oddsapi_sports_t  *sports;
   const oddsapi_futures_t *futures;
+  const oddsapi_props_t   *props;
 } oddsapi_res_t;
 
 // Runs on the curl worker thread, or on the caller's own thread when a
@@ -279,7 +336,7 @@ typedef void (*oddsapi_cb_t)(const oddsapi_res_t *res, void *user);
 // ----------------------------------------------------------------------
 // Real function declarations — visible only inside the oddsapi plugin.
 //
-// The five fetches share one return contract:
+// The six fetches share one return contract:
 //
 //   ASYNC_AIRBORNE            the callback owns `user`: the request is on
 //                             the wire, joined an identical one already
@@ -317,6 +374,11 @@ async_rc_t oddsapi_futures_async(const char *outright_key, oddsapi_cb_t cb,
     void *user);
 async_rc_t oddsapi_scores_async(const char *sport_key, oddsapi_cb_t cb,
     void *user);
+
+// One game's player props, in the curated markets of the league whose
+// sport key this is; refused undelivered for a league with none.
+async_rc_t oddsapi_props_async(const char *sport_key, const char *event_id,
+    oddsapi_cb_t cb, void *user);
 
 void     oddsapi_quota_get(oddsapi_quota_t *out);
 
@@ -387,6 +449,9 @@ ODDSAPI_SHIM(async_rc_t, oddsapi_futures_async,
 ODDSAPI_SHIM(async_rc_t, oddsapi_scores_async,
     (const char *sport_key, oddsapi_cb_t cb, void *user),
     (sport_key, cb, user))
+ODDSAPI_SHIM(async_rc_t, oddsapi_props_async,
+    (const char *sport_key, const char *event_id, oddsapi_cb_t cb,
+     void *user), (sport_key, event_id, cb, user))
 ODDSAPI_SHIM(uint32_t, oddsapi_cache_rows,
     (oddsapi_cache_row_t *rows, uint32_t cap), (rows, cap))
 

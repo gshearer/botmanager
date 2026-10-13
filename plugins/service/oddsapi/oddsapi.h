@@ -45,8 +45,9 @@
 // games; a college-basketball week is a few hundred.
 #define ODDSAPI_ROWS_MAX    1024
 
-// Cache slots: a league's odds, events, scores and futures, across every
-// league anyone asks for. Shared because `show odds` sizes its rows by it.
+// Cache slots: a league's odds, events, scores and futures, and one
+// game's props, across every league anyone asks for — the least recently
+// fetched goes first. Shared because `show odds` sizes its rows by it.
 #define ODDSAPI_CACHE_SZ    48
 
 // A team query shorter than this matches too much to mean anything.
@@ -73,11 +74,15 @@ bool oddsapi_parse_sports(const char *body, size_t len,
 bool oddsapi_parse_futures(const char *body, size_t len,
     oddsapi_futures_t *out);
 
+// The one reply that is an object, not an array: /events/{id}/odds.
+bool oddsapi_parse_props(const char *body, size_t len, oddsapi_props_t *out);
+
 void oddsapi_slate_clear(oddsapi_slate_t *s);
 void oddsapi_events_clear(oddsapi_events_t *e);
 void oddsapi_scores_clear(oddsapi_scores_t *s);
 void oddsapi_sports_clear(oddsapi_sports_t *s);
 void oddsapi_futures_clear(oddsapi_futures_t *f);
+void oddsapi_props_clear(oddsapi_props_t *p);
 
 // Consensus is the median per column across the books that quote it;
 // the spread and total columns first settle on the modal point and
@@ -93,6 +98,16 @@ void oddsapi_contender_consensus(const oddsapi_contender_t *c,
 // Favourite first; a contender nobody prices sorts last.
 void oddsapi_futures_sort(oddsapi_futures_t *f);
 
+// A prop priced at its modal line. `best_*.book` indexes the props'
+// book table, as `p->book[]` does.
+void oddsapi_prop_consensus(const oddsapi_prop_t *p,
+    oddsapi_prop_line_t *out);
+
+// Grouped by market; within one, the biggest line first — the starters,
+// in a yardage or points market — and in a Yes/No market the shortest
+// price first. A side nobody prices sorts last.
+void oddsapi_props_sort(oddsapi_props_t *p);
+
 // Case-insensitive alias, or an exact sport key; NULL otherwise.
 const oddsapi_league_t *oddsapi_league_find(const char *word);
 const oddsapi_league_t *oddsapi_league_table(size_t *n);
@@ -103,29 +118,71 @@ bool oddsapi_team_match(const char *team, const char *query);
 
 #ifdef ODDSAPI_PARSE_INTERNAL
 
+// The curated prop markets, operator ruling 2026-10-12: a few headline
+// markets per sport, because a props pull costs one credit per market
+// the reply carries. Keys from the API's betting-markets list; the API
+// carries props for US sports and US books only.
+static const oddsapi_prop_mkt_t oddsapi_props_football[] = {
+  { "player_pass_yds",       "pass yds" },
+  { "player_rush_yds",       "rush yds" },
+  { "player_reception_yds",  "rec yds"  },
+  { "player_anytime_td",     "any TD"   },
+  { NULL,                    NULL       },
+};
+
+static const oddsapi_prop_mkt_t oddsapi_props_basketball[] = {
+  { "player_points",         "points"   },
+  { "player_rebounds",       "rebounds" },
+  { "player_assists",        "assists"  },
+  { "player_threes",         "threes"   },
+  { NULL,                    NULL       },
+};
+
+static const oddsapi_prop_mkt_t oddsapi_props_baseball[] = {
+  { "batter_hits",           "hits"      },
+  { "batter_home_runs",      "home runs" },
+  { "pitcher_strikeouts",    "pitch Ks"  },
+  { NULL,                    NULL        },
+};
+
+static const oddsapi_prop_mkt_t oddsapi_props_hockey[] = {
+  { "player_points",               "points"   },
+  { "player_goal_scorer_anytime",  "any goal" },
+  { "player_shots_on_goal",        "shots"    },
+  { NULL,                          NULL       },
+};
+
 // The leagues the commands know by name; a NULL outright key means no
-// futures market. Every key was checked against /v4/sports?all=true
-// (tests/oddsapi/live_sports.json): the API lists no EPL outright.
+// futures market, a NULL props table no player props. Every key was
+// checked against /v4/sports?all=true (tests/oddsapi/live_sports.json):
+// the API lists no EPL outright.
 static const oddsapi_league_t oddsapi_leagues[] = {
   { "nfl",    NULL,  "americanfootball_nfl",
-    "americanfootball_nfl_super_bowl_winner",       "NFL"     },
+    "americanfootball_nfl_super_bowl_winner",       "NFL",
+    oddsapi_props_football   },
   { "ncaaf",  "cfb", "americanfootball_ncaaf",
-    "americanfootball_ncaaf_championship_winner",   "NCAAF"   },
+    "americanfootball_ncaaf_championship_winner",   "NCAAF",
+    oddsapi_props_football   },
   { "nba",    NULL,  "basketball_nba",
-    "basketball_nba_championship_winner",           "NBA"     },
+    "basketball_nba_championship_winner",           "NBA",
+    oddsapi_props_basketball },
   { "ncaab",  "cbb", "basketball_ncaab",
-    "basketball_ncaab_championship_winner",         "NCAAB"   },
-  { "wnba",   NULL,  "basketball_wnba",            NULL,     "WNBA"    },
+    "basketball_ncaab_championship_winner",         "NCAAB",
+    oddsapi_props_basketball },
+  { "wnba",   NULL,  "basketball_wnba",            NULL,     "WNBA",
+    oddsapi_props_basketball },
   { "mlb",    NULL,  "baseball_mlb",
-    "baseball_mlb_world_series_winner",             "MLB"     },
+    "baseball_mlb_world_series_winner",             "MLB",
+    oddsapi_props_baseball   },
   { "nhl",    NULL,  "icehockey_nhl",
-    "icehockey_nhl_championship_winner",            "NHL"     },
-  { "mls",    NULL,  "soccer_usa_mls",             NULL,     "MLS"     },
-  { "epl",    NULL,  "soccer_epl",                 NULL,     "EPL"     },
-  { "laliga", NULL,  "soccer_spain_la_liga",       NULL,     "La Liga" },
-  { "ucl",    NULL,  "soccer_uefa_champs_league",  NULL,     "UCL"     },
-  { "ufc",    "mma", "mma_mixed_martial_arts",     NULL,     "MMA"     },
-  { "boxing", NULL,  "boxing_boxing",              NULL,     "Boxing"  },
+    "icehockey_nhl_championship_winner",            "NHL",
+    oddsapi_props_hockey     },
+  { "mls",    NULL,  "soccer_usa_mls",             NULL,     "MLS",     NULL },
+  { "epl",    NULL,  "soccer_epl",                 NULL,     "EPL",     NULL },
+  { "laliga", NULL,  "soccer_spain_la_liga",       NULL,     "La Liga", NULL },
+  { "ucl",    NULL,  "soccer_uefa_champs_league",  NULL,     "UCL",     NULL },
+  { "ufc",    "mma", "mma_mixed_martial_arts",     NULL,     "MMA",     NULL },
+  { "boxing", NULL,  "boxing_boxing",              NULL,     "Boxing",  NULL },
 };
 
 static struct json_object *oddsapi_root_array(const char *body, size_t len,
@@ -147,6 +204,11 @@ static bool    oddsapi_col_on_point(const oddsapi_line_t *l,
     oddsapi_col_t col, const oddsapi_consensus_t *c);
 static void    oddsapi_book_futures(struct json_object *book,
     oddsapi_futures_t *out, uint32_t cap);
+static void    oddsapi_book_props(struct json_object *book,
+    oddsapi_props_t *out, uint32_t cap);
+static oddsapi_prop_t *oddsapi_prop_find(oddsapi_props_t *out,
+    const char *market, const char *player, uint32_t cap);
+static int     oddsapi_prop_cmp(const void *a, const void *b);
 
 #endif // ODDSAPI_PARSE_INTERNAL
 
@@ -191,6 +253,7 @@ typedef struct
     oddsapi_scores_t  scores;
     oddsapi_sports_t  sports;
     oddsapi_futures_t futures;
+    oddsapi_props_t   props;
   } u;
 } oddsapi_snap_t;
 
@@ -227,6 +290,7 @@ static const oddsapi_kind_info_t oddsapi_kinds[ODDSAPI_K_COUNT] = {
   [ODDSAPI_K_ODDS]    = { "odds",    "plugin.oddsapi.odds_ttl",    true  },
   [ODDSAPI_K_FUTURES] = { "futures", "plugin.oddsapi.futures_ttl", true  },
   [ODDSAPI_K_SCORES]  = { "scores",  "plugin.oddsapi.scores_ttl",  true  },
+  [ODDSAPI_K_PROPS]   = { "props",   "plugin.oddsapi.props_ttl",   true  },
 };
 
 // Module state. oddsapi_mu covers the cache, every snap's refcount, the
@@ -258,6 +322,11 @@ static const plugin_kv_entry_t oddsapi_kv_schema[] = {
     "Outright-market cache; a pull costs 1 credit (seconds).", NULL, NULL },
   { "plugin.oddsapi.scores_ttl", KV_UINT32, "600",
     "Scores cache; a pull costs 2 credits (seconds).", NULL, NULL },
+  { "plugin.oddsapi.props_ttl", KV_UINT32, "1800",
+    "One game's player-props cache; a pull costs 1 credit per market the "
+    "reply carries — 3 or 4 a game (seconds).", NULL, NULL },
+  { "plugin.oddsapi.props_rows", KV_UINT32, "3",
+    "Players shown per prop market on a props card.", NULL, NULL },
   { "plugin.oddsapi.events_ttl", KV_UINT32, "3600",
     "Game-list cache, used to find a team's next game; free (seconds).",
     NULL, NULL },
@@ -279,6 +348,7 @@ static const plugin_kv_entry_t oddsapi_kv_schema[] = {
 
 static int64_t          oddsapi_mono(void);
 static bool             oddsapi_key_ok(const char *s);
+static bool             oddsapi_arg_ok(oddsapi_kind_t kind, const char *arg);
 static size_t           oddsapi_urlencode(const char *in, char *out,
     size_t cap);
 static bool             oddsapi_url(oddsapi_kind_t kind, const char *arg,

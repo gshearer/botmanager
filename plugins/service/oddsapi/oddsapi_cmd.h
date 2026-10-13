@@ -36,7 +36,8 @@ void oddsapi_cmd_unregister(void);
 
 // Each is a decl's `usage` and the line a bad argument is answered with.
 #define ODDSAPI_ODDS_USAGE   "odds <league> | odds [<league>] <team> | " \
-                             "odds <league> --futures"
+                             "odds <league> --futures | " \
+                             "odds [<league>] <team> --props"
 #define ODDSAPI_SCORES_USAGE "scores <league> | scores [<league>] <team>"
 #define ODDSAPI_CMD_REPLY_SZ 512
 
@@ -82,6 +83,13 @@ void oddsapi_cmd_unregister(void);
                               - 2 * ODDSAPI_SCORE_PTS_W \
                               - ODDSAPI_SCORE_AWAY_W)
 
+// The props card. The player column takes what the other four leave.
+#define ODDSAPI_PROP_MKT_W   11
+#define ODDSAPI_PROP_LINE_W  8
+#define ODDSAPI_PROP_PX_W    12   // "-110 ESPN" and a gutter; under is last
+#define ODDSAPI_PROP_NAME_W  (DISPLAY_COLS - ODDSAPI_PROP_MKT_W \
+                              - ODDSAPI_PROP_LINE_W - 2 * ODDSAPI_PROP_PX_W)
+
 // The team card's grid: one row per book, then consensus and best.
 #define ODDSAPI_CARD_ROWS    (ODDSAPI_BOOKS_MAX + 2)
 #define ODDSAPI_CARD_COLS    6
@@ -93,7 +101,8 @@ typedef enum
   ODDSAPI_MODE_TEAM,        // odds: one team's next game, one row per book
   ODDSAPI_MODE_FUTURES,     // odds --futures: a league's outright market
   ODDSAPI_MODE_SCORES,      // scores: a league's live, final and next games
-  ODDSAPI_MODE_SCORES_TEAM  // scores: one team's live, last or next game
+  ODDSAPI_MODE_SCORES_TEAM, // scores: one team's live, last or next game
+  ODDSAPI_MODE_PROPS        // odds --props: one team's next game, by player
 } oddsapi_mode_t;
 
 // Parsed argument line (stack-only), shared by both commands; each
@@ -104,6 +113,7 @@ typedef struct
 {
   const oddsapi_league_t *league;
   bool                    futures;
+  bool                    props;
   char                    query[ODDSAPI_TEAM_SZ];
 } oddsapi_args_t;
 
@@ -215,6 +225,9 @@ static void     oddsapi_scores_head(const cmd_ctx_t *ctx,
     const oddsapi_res_t *res);
 static void     oddsapi_render_scores(const cmd_ctx_t *ctx,
     const oddsapi_league_t *league, const oddsapi_res_t *res);
+static void     oddsapi_render_props(const cmd_ctx_t *ctx,
+    const oddsapi_league_t *league, const oddsapi_props_t *ps,
+    const oddsapi_res_t *res);
 static const oddsapi_score_t *oddsapi_score_pick(const oddsapi_scores_t *sc,
     const char *query);
 
@@ -229,6 +242,7 @@ static void     oddsapi_on_slate(const oddsapi_res_t *res, void *user);
 static void     oddsapi_on_futures(const oddsapi_res_t *res, void *user);
 static void     oddsapi_on_scores(const oddsapi_res_t *res, void *user);
 static void     oddsapi_on_score_team(const oddsapi_res_t *res, void *user);
+static void     oddsapi_on_props(const oddsapi_res_t *res, void *user);
 static void     oddsapi_on_sports(const oddsapi_res_t *res, void *user);
 static void     oddsapi_search(oddsapi_req_t *r, const oddsapi_sports_t *sp);
 static void     oddsapi_on_events(const oddsapi_res_t *res, void *user);

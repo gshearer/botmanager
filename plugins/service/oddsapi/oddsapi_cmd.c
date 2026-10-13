@@ -976,6 +976,116 @@ oddsapi_render_scores(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
 }
 
 // ----------------------------------------------------------------------
+// odds [<league>] <team> --props
+// ----------------------------------------------------------------------
+
+// The league's curated markets in its own order, the first
+// plugin.oddsapi.props_rows players of each as oddsapi_props_sort left
+// them. A market's label stands on its first row only, so the groups
+// read down the page. Each side shows its best price and book at the
+// consensus line.
+static void
+oddsapi_render_props(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
+    const oddsapi_props_t *ps, const oddsapi_res_t *res)
+{
+  uint32_t rows = (uint32_t)kv_get_uint("plugin.oddsapi.props_rows");
+  char     line[ODDSAPI_CMD_REPLY_SZ];
+  char     tail[ODDSAPI_CELL_SZ * 3 + 16];
+  char     as_of[ODDSAPI_CELL_SZ * 3];
+
+  oddsapi_as_of(res, time(NULL), as_of, sizeof(as_of));
+  snprintf(tail, sizeof(tail), "props · %s", as_of);
+  oddsapi_render_title(ctx, league, ps->away, ps->home, ps->commence, tail);
+
+  line[0] = '\0';
+  oddsapi_cell(line, sizeof(line), CLR_GRAY "player", ODDSAPI_PROP_NAME_W,
+      false);
+  oddsapi_cell(line, sizeof(line), "market", ODDSAPI_PROP_MKT_W, false);
+  oddsapi_cell(line, sizeof(line), "line  ", ODDSAPI_PROP_LINE_W, true);
+  oddsapi_cell(line, sizeof(line), "best over", ODDSAPI_PROP_PX_W, false);
+  display_cat(line, sizeof(line), "best under" CLR_RESET);
+  cmd_reply(ctx, line);
+
+  for(const oddsapi_prop_mkt_t *m = league->props; m->key != NULL; m++)
+  {
+    uint32_t shown = 0;
+
+    for(uint32_t i = 0; i < ps->n && shown < rows; i++)
+    {
+      const oddsapi_prop_t *p = &ps->props[i];
+      oddsapi_prop_line_t   l;
+      char                  name[ODDSAPI_TEAM_SZ + 8];
+      char                  pt[16];
+      char                  over[ODDSAPI_PX_SZ];
+      char                  under[ODDSAPI_PX_SZ];
+      char                  code[ODDSAPI_CODE_SZ];
+
+      if(strcmp(p->market, m->key) != 0)
+        continue;
+
+      oddsapi_prop_consensus(p, &l);
+      display_fit(p->player, ODDSAPI_PROP_NAME_W - 2, name, sizeof(name),
+          "…");
+
+      if(p->has_point)
+        snprintf(pt, sizeof(pt), "%.1f  ", (double)l.pt);
+
+      else
+        strlcpy(pt, "yes  ", sizeof(pt));
+
+      oddsapi_px(l.best_over.px, l.best_over.px != 0
+          ? oddsapi_book_code(ps->book_key[l.best_over.book],
+              ps->book_title[l.best_over.book], code, sizeof(code))
+          : NULL, over, sizeof(over));
+      oddsapi_px(l.best_under.px, l.best_under.px != 0
+          ? oddsapi_book_code(ps->book_key[l.best_under.book],
+              ps->book_title[l.best_under.book], code, sizeof(code))
+          : NULL, under, sizeof(under));
+
+      line[0] = '\0';
+      oddsapi_cell(line, sizeof(line), name, ODDSAPI_PROP_NAME_W, false);
+      oddsapi_cell(line, sizeof(line), shown == 0 ? m->label : "",
+          ODDSAPI_PROP_MKT_W, false);
+      oddsapi_cell(line, sizeof(line), pt, ODDSAPI_PROP_LINE_W, true);
+      oddsapi_cell(line, sizeof(line), over, ODDSAPI_PROP_PX_W, false);
+
+      // A Yes/No market quotes no "No" side: say nothing rather than "—".
+      if(p->has_point || l.best_under.px != 0)
+        display_cat(line, sizeof(line), under);
+
+      cmd_reply(ctx, line);
+      shown++;
+    }
+  }
+}
+
+// A game whose props are not posted yet still names its matchup.
+static void
+oddsapi_on_props(const oddsapi_res_t *res, void *user)
+{
+  oddsapi_req_t       *r   = user;
+  const oddsapi_hit_t *hit = &r->hits[0];
+
+  if(res->status == ODDSAPI_OK && res->props->n > 0)
+    oddsapi_render_props(&r->ctx, r->league, res->props, res);
+
+  else
+  {
+    oddsapi_render_title(&r->ctx, r->league, hit->ev.away, hit->ev.home,
+        hit->ev.commence, NULL);
+
+    if(res->status == ODDSAPI_OK || res->status == ODDSAPI_NOT_FOUND)
+      cmd_reply(&r->ctx, CLR_GRAY "no player props posted yet" CLR_RESET);
+
+    else
+      cmd_reply(&r->ctx, oddsapi_status_note(res->status));
+  }
+
+  oddsapi_render_also(r);
+  mem_free(r);
+}
+
+// ----------------------------------------------------------------------
 // odds — the request and its completions
 // ----------------------------------------------------------------------
 
@@ -1025,6 +1135,12 @@ oddsapi_args_parse(const char *args, oddsapi_args_t *out)
     if(strcmp(tok, "-f") == 0 || strcmp(tok, "--futures") == 0)
     {
       out->futures = true;
+      continue;
+    }
+
+    if(strcmp(tok, "-p") == 0 || strcmp(tok, "--props") == 0)
+    {
+      out->props = true;
       continue;
     }
 
@@ -1263,9 +1379,27 @@ oddsapi_search_release(oddsapi_req_t *r)
   // lists themselves would spend. The price: the free events lists hold
   // only games live or ahead, so a team whose season is over is not
   // found, even with a final still inside the scores window.
+  //
+  // Props are pulled for the one game found, in the curated markets of
+  // its league; a league with none answers here and spends nothing.
+  if(r->mode == ODDSAPI_MODE_PROPS && r->league->props == NULL)
+  {
+    oddsapi_render_title(&r->ctx, r->league, r->hits[0].ev.away,
+        r->hits[0].ev.home, r->hits[0].ev.commence, NULL);
+    snprintf(line, sizeof(line), "No player props for %s.", r->league->label);
+    cmd_reply(&r->ctx, line);
+    oddsapi_render_also(r);
+    mem_free(r);
+    return;
+  }
+
   if(r->mode == ODDSAPI_MODE_SCORES_TEAM)
     rc = oddsapi_scores_async(r->league->sport_key, oddsapi_on_score_team,
         r);
+
+  else if(r->mode == ODDSAPI_MODE_PROPS)
+    rc = oddsapi_props_async(r->league->sport_key, r->hits[0].ev.id,
+        oddsapi_on_props, r);
 
   else
     rc = oddsapi_odds_async(r->league->sport_key, oddsapi_on_card, r);
@@ -1487,6 +1621,7 @@ oddsapi_start(const cmd_ctx_t *ctx, oddsapi_mode_t mode,
     // season: whoever typed it already decided.
     case ODDSAPI_MODE_TEAM:
     case ODDSAPI_MODE_SCORES_TEAM:
+    case ODDSAPI_MODE_PROPS:
       if(a->league != NULL)
       {
         oddsapi_search(r, NULL);
@@ -1513,6 +1648,24 @@ oddsapi_odds_cmd(const cmd_ctx_t *ctx)
 
   if(!oddsapi_ready(ctx, ok ? &a : NULL, ODDSAPI_ODDS_USAGE))
     return;
+
+  if(a.props)
+  {
+    if(a.futures || a.query[0] == '\0')
+      oddsapi_usage(ctx, ODDSAPI_ODDS_USAGE);
+
+    else if(a.league != NULL && a.league->props == NULL)
+    {
+      snprintf(line, sizeof(line), "No player props for %s.",
+          a.league->label);
+      cmd_reply(ctx, line);
+    }
+
+    else
+      oddsapi_start(ctx, ODDSAPI_MODE_PROPS, &a);
+
+    return;
+  }
 
   if(!a.futures)
   {
@@ -1541,7 +1694,7 @@ oddsapi_scores_cmd(const cmd_ctx_t *ctx)
   oddsapi_args_t a;
   bool           ok = oddsapi_args_parse(ctx->args, &a);
 
-  if(!oddsapi_ready(ctx, ok && !a.futures ? &a : NULL,
+  if(!oddsapi_ready(ctx, ok && !a.futures && !a.props ? &a : NULL,
       ODDSAPI_SCORES_USAGE))
     return;
 
@@ -1592,7 +1745,12 @@ static const cmd_decl_t odds_decl = {
                  "--futures (-f) lists a league's outright market, "
                  "favourite first: the consensus price, the probability it "
                  "implies — vig included, so the column sums past 100% — "
-                 "and the best price with its book.",
+                 "and the best price with its book. "
+                 "--props (-p) with a team shows its next game's player "
+                 "props — a few headline markets per sport, each player's "
+                 "consensus line and the best price on either side; it "
+                 "costs about one credit per market, once per game while "
+                 "cached.",
   .group       = USERNS_GROUP_EVERYONE,
   .scope       = CMD_SCOPE_ANY,
   .methods     = METHOD_T_ANY,

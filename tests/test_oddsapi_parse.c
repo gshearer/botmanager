@@ -206,6 +206,35 @@ static const struct
   { "a miss", "Buffalo Bills", "giants", false },
 };
 
+// One prop row and its price, flattened. Book names resolve through the
+// props' own table, which is what the best-price indexes point into.
+static void
+render_prop(const oddsapi_props_t *ps, const oddsapi_prop_t *p, char *out,
+    size_t cap)
+{
+  oddsapi_prop_line_t l;
+
+  oddsapi_prop_consensus(p, &l);
+  snprintf(out, cap, "%s|%s line%d %g o%d u%d best %d@%s %d@%s n%u",
+      p->market, p->player, p->has_point, (double)l.pt, l.over, l.under,
+      l.best_over.px, l.best_over.px != 0 ? ps->book_key[l.best_over.book]
+      : "-", l.best_under.px, l.best_under.px != 0
+      ? ps->book_key[l.best_under.book] : "-", l.n);
+}
+
+static const oddsapi_prop_t *
+find_prop(const oddsapi_props_t *ps, const char *market, const char *player)
+{
+  for(uint32_t i = 0; i < ps->n; i++)
+  {
+    if(strcmp(ps->props[i].market, market) == 0
+        && strcmp(ps->props[i].player, player) == 0)
+      return(&ps->props[i]);
+  }
+
+  return(NULL);
+}
+
 int
 main(void)
 {
@@ -438,6 +467,106 @@ main(void)
     test_check_sz("live", "nothing a book quoted reads as absent", 0,
         unpriced);
     oddsapi_slate_clear(&sl);
+  }
+
+  // Player props: the one reply that is an object. Rows the parser must
+  // refuse — an alternate line beside a book's first, an outcome with no
+  // player or no point, a side it does not know, a Yes/No market quoted
+  // as Over/Under — are all in props.json; the live reply checks the
+  // pricing against values worked by hand from its raw outcomes.
+  {
+    static const char *const want[] = {
+      "player_anytime_td|P One line0 0 o300 u0 best 300@book_b 0@- n1",
+      "player_pass_yds|P One line1 200.5 o-110 u-110 best -110@book_a "
+      "-110@book_a n1",
+    };
+    oddsapi_props_t ps;
+    size_t          n = fixture("props.json");
+
+    if(n == 0 || !oddsapi_parse_props(body, n, &ps))
+      return(test_skip("oddsapi_parse", "props.json would not parse"));
+
+    test_check_sz("props", "only priced, well-formed rows are kept",
+        sizeof(want) / sizeof(want[0]), ps.n);
+    test_check_sz("props", "a book with nothing kept is not in the table",
+        2, ps.nbooks);
+
+    for(uint32_t i = 0; i < ps.n && i < sizeof(want) / sizeof(want[0]); i++)
+    {
+      render_prop(&ps, &ps.props[i], out, sizeof(out));
+      test_check_str("props", want[i], want[i], out);
+    }
+
+    oddsapi_props_clear(&ps);
+
+    test_check_bool("props", "an array root is not a props reply", false,
+        oddsapi_parse_props("[]", 2, &ps));
+    test_check_bool("props", "a refused parse leaves nothing", true,
+        ps.props == NULL && ps.n == 0);
+  }
+
+  {
+    static const struct
+    {
+      const char *market;
+      const char *player;
+      const char *want;
+    } cases[] = {
+      { "player_pass_yds", "Sam Darnold",
+        "player_pass_yds|Sam Darnold line1 219.5 o-110 u-116 "
+        "best -110@espnbet -113@draftkings n2" },
+      { "player_pass_yds", "Bo Nix",
+        "player_pass_yds|Bo Nix line1 204.5 o-111 u-114 "
+        "best -110@espnbet -113@draftkings n3" },
+      { "player_anytime_td", "Jaxon Smith-Njigba",
+        "player_anytime_td|Jaxon Smith-Njigba line0 0 o105 u0 "
+        "best 115@betmgm 0@- n5" },
+    };
+    oddsapi_props_t ps;
+    size_t          n = fixture("live_props_nfl.json");
+    uint32_t        unsorted = 0;
+
+    if(n == 0 || !oddsapi_parse_props(body, n, &ps))
+      return(test_skip("oddsapi_parse", "live_props_nfl.json would not parse"));
+
+    test_check_sz("live", "every player in every market survives", 54, ps.n);
+    test_check_sz("live", "every book that quoted a prop", 6, ps.nbooks);
+
+    for(size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+      const oddsapi_prop_t *p = find_prop(&ps, cases[i].market,
+          cases[i].player);
+
+      if(p != NULL)
+        render_prop(&ps, p, out, sizeof(out));
+
+      else
+        strlcpy(out, "(missing)", sizeof(out));
+
+      test_check_str("props", cases[i].player, cases[i].want, out);
+    }
+
+    // Within a market: the biggest line first, or in a Yes/No market the
+    // shortest price first.
+    for(uint32_t i = 1; i < ps.n; i++)
+    {
+      const oddsapi_prop_t *a = &ps.props[i - 1];
+      const oddsapi_prop_t *b = &ps.props[i];
+      oddsapi_prop_line_t   la, lb;
+
+      if(strcmp(a->market, b->market) != 0)
+        continue;
+
+      oddsapi_prop_consensus(a, &la);
+      oddsapi_prop_consensus(b, &lb);
+
+      if(a->has_point ? la.pt < lb.pt
+          : oddsapi_am_to_dec(la.over) > oddsapi_am_to_dec(lb.over))
+        unsorted++;
+    }
+
+    test_check_sz("props", "each market is in sort order", 0, unsorted);
+    oddsapi_props_clear(&ps);
   }
 
   // A contender nobody prices cannot come out of the parser, so the
