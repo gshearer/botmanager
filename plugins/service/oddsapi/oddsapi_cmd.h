@@ -1,8 +1,8 @@
 #ifndef BM_ODDSAPI_CMD_H
 #define BM_ODDSAPI_CMD_H
 
-// The oddsapi plugin's command surface: `show odds` and `odds`, with
-// `scores` still to land. Pure presentation — every byte the user sees
+// The oddsapi plugin's command surface: `show odds`, `odds` and
+// `scores`. Pure presentation — every byte the user sees
 // is shaped here, while fetching, caching and pricing stay in the
 // service half of the same .so.
 //
@@ -29,9 +29,15 @@ void oddsapi_cmd_unregister(void);
 #include "userns.h"
 #include "util.h"
 
+#include <errno.h>
 #include <time.h>
 
 #define ODDSAPI_CMD_CTX      ODDSAPI_CTX ".cmd"
+
+// Each is a decl's `usage` and the line a bad argument is answered with.
+#define ODDSAPI_ODDS_USAGE   "odds <league> | odds [<league>] <team> | " \
+                             "odds <league> --futures"
+#define ODDSAPI_SCORES_USAGE "scores <league> | scores [<league>] <team>"
 #define ODDSAPI_CMD_REPLY_SZ 512
 
 // The `show odds` cache grid. The key column takes whatever the other
@@ -57,6 +63,25 @@ void oddsapi_cmd_unregister(void);
 #define ODDSAPI_SEARCH_MAX   16   // leagues one bare-team search fans out over
 #define ODDSAPI_HITS_MAX     4    // the game carded, and the "also:" lines
 
+// The futures list. The team column takes what the other four leave.
+#define ODDSAPI_FUT_RANK_W   4
+#define ODDSAPI_FUT_PX_W     11
+#define ODDSAPI_FUT_PCT_W    9
+#define ODDSAPI_FUT_BEST_W   10   // "+50000 MGM"; last, so never padded
+#define ODDSAPI_FUT_TEAM_W   (DISPLAY_COLS - ODDSAPI_FUT_RANK_W \
+                              - ODDSAPI_FUT_PX_W - ODDSAPI_FUT_PCT_W \
+                              - ODDSAPI_FUT_BEST_W)
+
+// The scores grid: when, away and its score, home and its score. The
+// home cell carries its own "@ " and the gutter before it.
+#define ODDSAPI_SCORE_WHEN_W 11
+#define ODDSAPI_SCORE_PTS_W  5
+#define ODDSAPI_SCORE_AWAY_W ((DISPLAY_COLS - ODDSAPI_SCORE_WHEN_W \
+                               - 2 * ODDSAPI_SCORE_PTS_W) / 2)
+#define ODDSAPI_SCORE_HOME_W (DISPLAY_COLS - ODDSAPI_SCORE_WHEN_W \
+                              - 2 * ODDSAPI_SCORE_PTS_W \
+                              - ODDSAPI_SCORE_AWAY_W)
+
 // The team card's grid: one row per book, then consensus and best.
 #define ODDSAPI_CARD_ROWS    (ODDSAPI_BOOKS_MAX + 2)
 #define ODDSAPI_CARD_COLS    6
@@ -64,17 +89,21 @@ void oddsapi_cmd_unregister(void);
 
 typedef enum
 {
-  ODDSAPI_MODE_SLATE,       // a league's games, one row each
-  ODDSAPI_MODE_TEAM         // one team's next game, one row per book
+  ODDSAPI_MODE_SLATE,       // odds: a league's games, one row each
+  ODDSAPI_MODE_TEAM,        // odds: one team's next game, one row per book
+  ODDSAPI_MODE_FUTURES,     // odds --futures: a league's outright market
+  ODDSAPI_MODE_SCORES,      // scores: a league's live, final and next games
+  ODDSAPI_MODE_SCORES_TEAM  // scores: one team's live, last or next game
 } oddsapi_mode_t;
 
-// Parsed argument line (stack-only). `league` is NULL when the first
-// word named none, and the whole line is then a team searched across
-// plugin.oddsapi.search_leagues.
+// Parsed argument line (stack-only), shared by both commands; each
+// decides its own mode from it. `league` is NULL when the first word
+// named none, and the whole line is then a team searched across
+// plugin.oddsapi.search_leagues. Flags may stand anywhere.
 typedef struct
 {
-  oddsapi_mode_t          mode;
   const oddsapi_league_t *league;
+  bool                    futures;
   char                    query[ODDSAPI_TEAM_SZ];
 } oddsapi_args_t;
 
@@ -149,8 +178,8 @@ static void     oddsapi_when(time_t t, time_t now, bool full, char *out,
 static void     oddsapi_px(int32_t px, const char *code, char *out,
     size_t cap);
 static void     oddsapi_spread_pt(float pt, char *out, size_t cap);
-static const char *oddsapi_book_code(const oddsapi_line_t *l, char *buf,
-    size_t cap);
+static const char *oddsapi_book_code(const char *key, const char *title,
+    char *buf, size_t cap);
 static const char *oddsapi_status_note(oddsapi_status_t st);
 
 static void     oddsapi_render_slate(const cmd_ctx_t *ctx,
@@ -175,11 +204,31 @@ static void     oddsapi_render_title(const cmd_ctx_t *ctx,
     const oddsapi_league_t *league, const char *away, const char *home,
     time_t commence, const char *tail);
 static void     oddsapi_render_also(const oddsapi_req_t *r);
+static void     oddsapi_render_futures(const cmd_ctx_t *ctx,
+    const oddsapi_league_t *league, const oddsapi_res_t *res,
+    const oddsapi_futures_t *f);
+static bool     oddsapi_score_int(const char *s, long *out);
+static void     oddsapi_score_row(const cmd_ctx_t *ctx,
+    const oddsapi_score_t *s, time_t now);
+static void     oddsapi_scores_head(const cmd_ctx_t *ctx,
+    const oddsapi_league_t *league, const char *query,
+    const oddsapi_res_t *res);
+static void     oddsapi_render_scores(const cmd_ctx_t *ctx,
+    const oddsapi_league_t *league, const oddsapi_res_t *res);
+static const oddsapi_score_t *oddsapi_score_pick(const oddsapi_scores_t *sc,
+    const char *query);
 
 static oddsapi_req_t *oddsapi_req_new(const cmd_ctx_t *ctx);
 static bool     oddsapi_args_parse(const char *args, oddsapi_args_t *out);
-static void     oddsapi_usage(const cmd_ctx_t *ctx);
+static void     oddsapi_usage(const cmd_ctx_t *ctx, const char *usage);
+static bool     oddsapi_ready(const cmd_ctx_t *ctx, const oddsapi_args_t *a,
+    const char *usage);
+static void     oddsapi_start(const cmd_ctx_t *ctx, oddsapi_mode_t mode,
+    const oddsapi_args_t *a);
 static void     oddsapi_on_slate(const oddsapi_res_t *res, void *user);
+static void     oddsapi_on_futures(const oddsapi_res_t *res, void *user);
+static void     oddsapi_on_scores(const oddsapi_res_t *res, void *user);
+static void     oddsapi_on_score_team(const oddsapi_res_t *res, void *user);
 static void     oddsapi_on_sports(const oddsapi_res_t *res, void *user);
 static void     oddsapi_search(oddsapi_req_t *r, const oddsapi_sports_t *sp);
 static void     oddsapi_on_events(const oddsapi_res_t *res, void *user);
@@ -188,6 +237,7 @@ static void     oddsapi_hit_insert(oddsapi_hit_t *hits, uint8_t *n,
 static void     oddsapi_search_release(oddsapi_req_t *r);
 static void     oddsapi_on_card(const oddsapi_res_t *res, void *user);
 static void     oddsapi_odds_cmd(const cmd_ctx_t *ctx);
+static void     oddsapi_scores_cmd(const cmd_ctx_t *ctx);
 
 #endif // ODDSAPI_CMD_INTERNAL
 

@@ -262,16 +262,16 @@ oddsapi_spread_pt(float pt, char *out, size_t cap)
 }
 
 static const char *
-oddsapi_book_code(const oddsapi_line_t *l, char *buf, size_t cap)
+oddsapi_book_code(const char *key, const char *title, char *buf, size_t cap)
 {
   for(size_t i = 0;
       i < sizeof(oddsapi_book_codes) / sizeof(oddsapi_book_codes[0]); i++)
   {
-    if(strcmp(l->key, oddsapi_book_codes[i].key) == 0)
+    if(strcmp(key, oddsapi_book_codes[i].key) == 0)
       return(oddsapi_book_codes[i].code);
   }
 
-  display_fit(l->title, 4, buf, cap, NULL);
+  display_fit(title, 4, buf, cap, NULL);
   return(buf);
 }
 
@@ -677,7 +677,8 @@ oddsapi_render_game(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
 
   for(int col = 0; col < ODDSAPI_COL_COUNT; col++)
     codes[col] = best[col].px != 0
-        ? oddsapi_book_code(&g->books[best[col].book], code_buf[col],
+        ? oddsapi_book_code(g->books[best[col].book].key,
+            g->books[best[col].book].title, code_buf[col],
             sizeof(code_buf[col]))
         : NULL;
 
@@ -772,6 +773,209 @@ oddsapi_render_also(const oddsapi_req_t *r)
 }
 
 // ----------------------------------------------------------------------
+// odds <league> --futures
+// ----------------------------------------------------------------------
+
+// `implied` is 100 over the consensus decimal price, vig and all — the
+// sum down the column is past 100%, and help_long says so.
+static void
+oddsapi_render_futures(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
+    const oddsapi_res_t *res, const oddsapi_futures_t *f)
+{
+  uint32_t rows  = (uint32_t)kv_get_uint("plugin.oddsapi.rows");
+  uint32_t shown = f->n < rows ? f->n : rows;
+  char     line[ODDSAPI_CMD_REPLY_SZ];
+  char     as_of[ODDSAPI_CELL_SZ * 3];
+
+  oddsapi_as_of(res, time(NULL), as_of, sizeof(as_of));
+  snprintf(line, sizeof(line), CLR_BOLD "%s" CLR_RESET
+      " · consensus of %u book%s · %s",
+      f->sport_title[0] != '\0' ? f->sport_title : league->label, f->nbooks,
+      f->nbooks == 1 ? "" : "s", as_of);
+  cmd_reply(ctx, line);
+
+  line[0] = '\0';
+  oddsapi_cell(line, sizeof(line), CLR_GRAY " #", ODDSAPI_FUT_RANK_W, false);
+  oddsapi_cell(line, sizeof(line), "team", ODDSAPI_FUT_TEAM_W, false);
+  oddsapi_cell(line, sizeof(line), "consensus", ODDSAPI_FUT_PX_W, false);
+  oddsapi_cell(line, sizeof(line), "implied", ODDSAPI_FUT_PCT_W, false);
+  display_cat(line, sizeof(line), "best" CLR_RESET);
+  cmd_reply(ctx, line);
+
+  for(uint32_t i = 0; i < shown; i++)
+  {
+    const oddsapi_contender_t *c = &f->contenders[i];
+    oddsapi_best_t             b;
+    int32_t                    med;
+    char                       rank[16];
+    char                       team[ODDSAPI_TEAM_SZ + 8];
+    char                       px[ODDSAPI_PX_SZ];
+    char                       pct[16];
+    char                       best[ODDSAPI_PX_SZ];
+    char                       code[ODDSAPI_CODE_SZ];
+
+    oddsapi_contender_consensus(c, &med, &b);
+    snprintf(rank, sizeof(rank), "%2u", i + 1);
+    display_fit(c->name, ODDSAPI_FUT_TEAM_W - 2, team, sizeof(team), "…");
+    oddsapi_px(med, NULL, px, sizeof(px));
+
+    if(med != 0)
+      snprintf(pct, sizeof(pct), "%.1f%%", 100.0 / oddsapi_am_to_dec(med));
+
+    else
+      strlcpy(pct, "—", sizeof(pct));
+
+    oddsapi_px(b.px, b.px != 0 ? oddsapi_book_code(f->book_key[b.book],
+        f->book_title[b.book], code, sizeof(code)) : NULL, best,
+        sizeof(best));
+
+    line[0] = '\0';
+    oddsapi_cell(line, sizeof(line), rank, ODDSAPI_FUT_RANK_W, false);
+    oddsapi_cell(line, sizeof(line), team, ODDSAPI_FUT_TEAM_W, false);
+    oddsapi_cell(line, sizeof(line), px, ODDSAPI_FUT_PX_W, false);
+    oddsapi_cell(line, sizeof(line), pct, ODDSAPI_FUT_PCT_W, false);
+    display_cat(line, sizeof(line), best);
+    cmd_reply(ctx, line);
+  }
+
+  if(f->n > shown)
+  {
+    snprintf(line, sizeof(line), CLR_GRAY "+%u more" CLR_RESET,
+        f->n - shown);
+    cmd_reply(ctx, line);
+  }
+}
+
+// ----------------------------------------------------------------------
+// scores
+// ----------------------------------------------------------------------
+
+// A score arrives as a string; only a whole number can name a winner.
+static bool
+oddsapi_score_int(const char *s, long *out)
+{
+  char *end;
+
+  errno = 0;
+  *out  = strtol(s, &end, 10);
+  return(end != s && *end == '\0' && errno == 0);
+}
+
+// The API carries no clock or period, so LIVE is all a live row can say.
+static void
+oddsapi_score_row(const cmd_ctx_t *ctx, const oddsapi_score_t *s,
+    time_t now)
+{
+  long a       = 0;
+  long h       = 0;
+  bool decided = s->completed && s->has_scores
+                 && oddsapi_score_int(s->away_score, &a)
+                 && oddsapi_score_int(s->home_score, &h) && a != h;
+  char when[ODDSAPI_WHEN_SZ];
+  char away[ODDSAPI_TEAM_SZ + 8];
+  char home[ODDSAPI_TEAM_SZ + 8];
+  char as[ODDSAPI_CELL_SZ];
+  char hs[ODDSAPI_CELL_SZ];
+  char line[ODDSAPI_CMD_REPLY_SZ];
+
+  if(!s->completed && s->has_scores)
+    strlcpy(when, CLR_RED "LIVE" CLR_RESET, sizeof(when));
+
+  else if(s->completed)
+    strlcpy(when, CLR_GRAY "F" CLR_RESET, sizeof(when));
+
+  else
+    oddsapi_when(s->commence, now, false, when, sizeof(when));
+
+  // The home cell carries its gutter and "@ "; one more column is left
+  // for the mark, and the home score's padding gutters the far side.
+  display_fit(s->away, ODDSAPI_SCORE_AWAY_W - 2, away, sizeof(away), "…");
+  strlcpy(home, "  @ ", sizeof(home));
+  display_fit(s->home, ODDSAPI_SCORE_HOME_W - 5, home + 4, sizeof(home) - 4,
+      "…");
+
+  // A final's winning score is bold; a draw names nobody.
+  snprintf(as, sizeof(as), "%s%s%s", decided && a > h ? CLR_BOLD : "",
+      s->has_scores ? s->away_score : "", decided && a > h ? CLR_RESET : "");
+  snprintf(hs, sizeof(hs), "%s%s%s", decided && h > a ? CLR_BOLD : "",
+      s->has_scores ? s->home_score : "", decided && h > a ? CLR_RESET : "");
+
+  line[0] = '\0';
+  oddsapi_cell(line, sizeof(line), when, ODDSAPI_SCORE_WHEN_W, false);
+  oddsapi_cell(line, sizeof(line), away, ODDSAPI_SCORE_AWAY_W, false);
+  oddsapi_cell(line, sizeof(line), as, ODDSAPI_SCORE_PTS_W, true);
+  oddsapi_cell(line, sizeof(line), home, ODDSAPI_SCORE_HOME_W, false);
+  oddsapi_cell(line, sizeof(line), hs, ODDSAPI_SCORE_PTS_W, true);
+  cmd_reply(ctx, line);
+}
+
+// "NFL scores · as of 2m ago", the team's query between when there is
+// one, and no age when the pull failed.
+static void
+oddsapi_scores_head(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
+    const char *query, const oddsapi_res_t *res)
+{
+  char line[ODDSAPI_CMD_REPLY_SZ];
+  char as_of[ODDSAPI_CELL_SZ * 3];
+
+  as_of[0] = '\0';
+
+  if(res->status == ODDSAPI_OK)
+    oddsapi_as_of(res, time(NULL), as_of, sizeof(as_of));
+
+  snprintf(line, sizeof(line), CLR_BOLD "%s scores" CLR_RESET "%s%s%s%s",
+      league->label, query != NULL ? " · " : "", query != NULL ? query : "",
+      as_of[0] != '\0' ? " · " : "", as_of);
+  cmd_reply(ctx, line);
+}
+
+// Live first, then finals newest first, then what is still to come —
+// three passes over a list already in start order, so nothing is sorted.
+static void
+oddsapi_render_scores(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
+    const oddsapi_res_t *res)
+{
+  const oddsapi_scores_t *sc    = res->scores;
+  uint32_t                rows  = (uint32_t)kv_get_uint("plugin.oddsapi.rows");
+  uint32_t                shown = 0;
+  time_t                  now   = time(NULL);
+  char                    line[ODDSAPI_CMD_REPLY_SZ];
+
+  if(sc->n == 0)
+  {
+    snprintf(line, sizeof(line), "No %s games in the last day or coming up.",
+        league->label);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  oddsapi_scores_head(ctx, league, NULL, res);
+
+  for(int pass = 0; pass < 3; pass++)
+  {
+    for(uint32_t k = 0; k < sc->n && shown < rows; k++)
+    {
+      const oddsapi_score_t *s    = &sc->scores[pass == 1 ? sc->n - 1 - k : k];
+      int                    tier = !s->completed && s->has_scores ? 0
+                                    : s->completed ? 1 : 2;
+
+      if(tier != pass)
+        continue;
+
+      oddsapi_score_row(ctx, s, now);
+      shown++;
+    }
+  }
+
+  if(sc->n > shown)
+  {
+    snprintf(line, sizeof(line), CLR_GRAY "+%u more — scores %s <team>"
+        CLR_RESET, sc->n - shown, league->alias);
+    cmd_reply(ctx, line);
+  }
+}
+
+// ----------------------------------------------------------------------
 // odds — the request and its completions
 // ----------------------------------------------------------------------
 
@@ -794,12 +998,17 @@ oddsapi_req_new(const cmd_ctx_t *ctx)
   return(r);
 }
 
-// First word a league → a slate, or that league's team with the rest.
-// Otherwise the whole line is a team. False when there is nothing.
+// Flags come out wherever they stand and the words left are rejoined
+// single-spaced, so "new  york" is "new york". A first word naming a
+// league is the league and the rest a team; otherwise all of it is a
+// team. False when no word is left.
 static bool
 oddsapi_args_parse(const char *args, oddsapi_args_t *out)
 {
+  char   buf[ODDSAPI_CMD_REPLY_SZ];
+  char   line[ODDSAPI_CMD_REPLY_SZ];
   char   word[ODDSAPI_SPORT_KEY_SZ];
+  char  *save = NULL;
   size_t n;
 
   memset(out, 0, sizeof(*out));
@@ -807,41 +1016,50 @@ oddsapi_args_parse(const char *args, oddsapi_args_t *out)
   if(args == NULL)
     return(false);
 
-  args += strspn(args, " \t");
-  n     = strcspn(args, " \t");
+  strlcpy(buf, args, sizeof(buf));
+  line[0] = '\0';
 
-  if(n == 0)
+  for(char *tok = strtok_r(buf, " \t", &save); tok != NULL;
+      tok = strtok_r(NULL, " \t", &save))
+  {
+    if(strcmp(tok, "-f") == 0 || strcmp(tok, "--futures") == 0)
+    {
+      out->futures = true;
+      continue;
+    }
+
+    if(line[0] != '\0')
+      strlcat(line, " ", sizeof(line));
+
+    strlcat(line, tok, sizeof(line));
+  }
+
+  if(line[0] == '\0')
     return(false);
+
+  n = strcspn(line, " ");
 
   if(n < sizeof(word))
   {
-    memcpy(word, args, n);
+    memcpy(word, line, n);
     word[n]     = '\0';
     out->league = oddsapi_league_find(word);
   }
 
-  if(out->league != NULL)
-    args += n + strspn(args + n, " \t");
-
-  strlcpy(out->query, args, sizeof(out->query));
-  n = strlen(out->query);
-
-  while(n > 0 && (out->query[n - 1] == ' ' || out->query[n - 1] == '\t'))
-    out->query[--n] = '\0';
-
-  out->mode = out->league != NULL && n == 0 ? ODDSAPI_MODE_SLATE
-                                            : ODDSAPI_MODE_TEAM;
+  strlcpy(out->query, out->league == NULL ? line
+      : line[n] == ' ' ? line + n + 1 : "", sizeof(out->query));
   return(true);
 }
 
 static void
-oddsapi_usage(const cmd_ctx_t *ctx)
+oddsapi_usage(const cmd_ctx_t *ctx, const char *usage)
 {
   size_t                  n;
   const oddsapi_league_t *t = oddsapi_league_table(&n);
   char                    line[ODDSAPI_CMD_REPLY_SZ];
 
-  cmd_reply(ctx, "usage: odds <league> | odds [<league>] <team>");
+  snprintf(line, sizeof(line), "usage: %s", usage);
+  cmd_reply(ctx, line);
   strlcpy(line, "leagues:", sizeof(line));
 
   for(size_t i = 0; i < n; i++)
@@ -931,8 +1149,10 @@ oddsapi_search(oddsapi_req_t *r, const oddsapi_sports_t *sp)
 
   if(r->nparts == 0)
   {
-    cmd_reply(&r->ctx, "None of the leagues a team is searched in is in "
-        "season right now — name one: odds <league> <team>");
+    snprintf(csv, sizeof(csv), "None of the leagues a team is searched in "
+        "is in season right now — name one: %s <league> <team>",
+        r->mode == ODDSAPI_MODE_SCORES_TEAM ? "scores" : "odds");
+    cmd_reply(&r->ctx, csv);
     mem_free(r);
     return;
   }
@@ -1000,13 +1220,15 @@ oddsapi_hit_insert(oddsapi_hit_t *hits, uint8_t *n, const oddsapi_hit_t *hit)
   hits[pos] = *hit;
 }
 
-// The last league to answer merges every part and spends the one odds
-// pull the soonest match needs — 3 credits cold, nothing on a warm
-// slate. Never touch `r` after calling this.
+// The last league to answer merges every part and spends the one pull
+// the soonest match needs: that league's odds (3 credits cold) or its
+// scores (2), and nothing on a warm cache. Never touch `r` after calling
+// this.
 static void
 oddsapi_search_release(oddsapi_req_t *r)
 {
-  char line[ODDSAPI_CMD_REPLY_SZ];
+  char       line[ODDSAPI_CMD_REPLY_SZ];
+  async_rc_t rc;
 
   if(__atomic_fetch_sub(&r->pending, 1, __ATOMIC_ACQ_REL) != 1)
     return;
@@ -1036,8 +1258,19 @@ oddsapi_search_release(oddsapi_req_t *r)
 
   r->league = r->hits[0].league;
 
-  if(oddsapi_odds_async(r->league->sport_key, oddsapi_on_card, r)
-      == ASYNC_FAILED_UNDELIVERED)
+  // A team's scores cost only the league its match landed in — never 2
+  // credits per searched league, which a cold fan-out over the scores
+  // lists themselves would spend. The price: the free events lists hold
+  // only games live or ahead, so a team whose season is over is not
+  // found, even with a final still inside the scores window.
+  if(r->mode == ODDSAPI_MODE_SCORES_TEAM)
+    rc = oddsapi_scores_async(r->league->sport_key, oddsapi_on_score_team,
+        r);
+
+  else
+    rc = oddsapi_odds_async(r->league->sport_key, oddsapi_on_card, r);
+
+  if(rc == ASYNC_FAILED_UNDELIVERED)
   {
     oddsapi_render_title(&r->ctx, r->league, r->hits[0].ev.away,
         r->hits[0].ev.home, r->hits[0].ev.commence, NULL);
@@ -1087,56 +1320,233 @@ oddsapi_on_card(const oddsapi_res_t *res, void *user)
   mem_free(r);
 }
 
-static void
-oddsapi_odds_cmd(const cmd_ctx_t *ctx)
+// Live first, then the latest final, then the soonest still to come.
+// The list is in start order, so the last final seen is the latest.
+static const oddsapi_score_t *
+oddsapi_score_pick(const oddsapi_scores_t *sc, const char *query)
 {
-  oddsapi_args_t  a;
-  oddsapi_req_t  *r;
-  async_rc_t      rc;
+  const oddsapi_score_t *final = NULL;
+  const oddsapi_score_t *next  = NULL;
 
-  if(!oddsapi_args_parse(ctx->args, &a))
+  for(uint32_t i = 0; i < sc->n; i++)
   {
-    oddsapi_usage(ctx);
-    return;
+    const oddsapi_score_t *s = &sc->scores[i];
+
+    if(!oddsapi_team_match(s->home, query)
+        && !oddsapi_team_match(s->away, query))
+      continue;
+
+    if(!s->completed && s->has_scores)
+      return(s);
+
+    if(s->completed)
+      final = s;
+
+    else if(next == NULL)
+      next = s;
+  }
+
+  return(final != NULL ? final : next);
+}
+
+// A team's one game. When the scores window does not hold it, the game
+// the search found is still the team's next one, with nothing to score.
+static void
+oddsapi_on_score_team(const oddsapi_res_t *res, void *user)
+{
+  oddsapi_req_t         *r    = user;
+  const oddsapi_hit_t   *hit  = &r->hits[0];
+  const oddsapi_score_t *pick = NULL;
+  oddsapi_score_t        next;
+
+  if(res->status == ODDSAPI_OK)
+    pick = oddsapi_score_pick(res->scores, r->query);
+
+  if(pick == NULL)
+  {
+    memset(&next, 0, sizeof(next));
+    strlcpy(next.home, hit->ev.home, sizeof(next.home));
+    strlcpy(next.away, hit->ev.away, sizeof(next.away));
+    next.commence = hit->ev.commence;
+    pick          = &next;
+  }
+
+  oddsapi_scores_head(&r->ctx, r->league, r->query, res);
+
+  if(res->status != ODDSAPI_OK)
+    cmd_reply(&r->ctx, oddsapi_status_note(res->status));
+
+  oddsapi_score_row(&r->ctx, pick, time(NULL));
+  oddsapi_render_also(r);
+  mem_free(r);
+}
+
+static void
+oddsapi_on_scores(const oddsapi_res_t *res, void *user)
+{
+  oddsapi_req_t *r = user;
+
+  if(res->status != ODDSAPI_OK)
+    cmd_reply(&r->ctx, oddsapi_status_note(res->status));
+
+  else
+    oddsapi_render_scores(&r->ctx, r->league, res);
+
+  mem_free(r);
+}
+
+// The snapshot is shared and immutable, so the favourites are sorted on
+// a copy of its contenders.
+static void
+oddsapi_on_futures(const oddsapi_res_t *res, void *user)
+{
+  oddsapi_req_t     *r = user;
+  oddsapi_futures_t  f;
+  char               line[ODDSAPI_CMD_REPLY_SZ];
+
+  if(res->status != ODDSAPI_OK)
+    cmd_reply(&r->ctx, oddsapi_status_note(res->status));
+
+  else if(res->futures->n == 0)
+  {
+    snprintf(line, sizeof(line), "No %s futures posted right now.",
+        r->league->label);
+    cmd_reply(&r->ctx, line);
+  }
+
+  else
+  {
+    f            = *res->futures;
+    f.contenders = mem_alloc(ODDSAPI_CMD_CTX, "futures",
+        f.n * sizeof(*f.contenders));
+    memcpy(f.contenders, res->futures->contenders,
+        f.n * sizeof(*f.contenders));
+    oddsapi_futures_sort(&f);
+    oddsapi_render_futures(&r->ctx, r->league, res, &f);
+    mem_free(f.contenders);
+  }
+
+  mem_free(r);
+}
+
+// Both commands' front door: something to look up, and a key to look it
+// up with. False when it has already answered.
+static bool
+oddsapi_ready(const cmd_ctx_t *ctx, const oddsapi_args_t *a,
+    const char *usage)
+{
+  if(a == NULL)
+  {
+    oddsapi_usage(ctx, usage);
+    return(false);
   }
 
   if(!oddsapi_configured())
   {
     cmd_reply(ctx, "Odds aren't set up yet — the operator needs to set "
         "plugin.oddsapi.creds.apikey.");
-    return;
+    return(false);
   }
 
-  if(a.mode == ODDSAPI_MODE_TEAM && strlen(a.query) < ODDSAPI_QUERY_MIN)
+  if(a->query[0] != '\0' && strlen(a->query) < ODDSAPI_QUERY_MIN)
   {
     cmd_reply(ctx, "Give me at least three letters of a team's name.");
-    return;
+    return(false);
   }
 
-  r = oddsapi_req_new(ctx);
-  r->mode   = a.mode;
-  r->league = a.league;
-  strlcpy(r->query, a.query, sizeof(r->query));
+  return(true);
+}
 
-  // A named league is searched without asking whether it is in season:
-  // whoever typed it already decided.
-  if(a.mode == ODDSAPI_MODE_TEAM && a.league != NULL)
+static void
+oddsapi_start(const cmd_ctx_t *ctx, oddsapi_mode_t mode,
+    const oddsapi_args_t *a)
+{
+  oddsapi_req_t *r  = oddsapi_req_new(ctx);
+  async_rc_t     rc = ASYNC_FAILED_UNDELIVERED;
+
+  r->mode   = mode;
+  r->league = a->league;
+  strlcpy(r->query, a->query, sizeof(r->query));
+
+  switch(mode)
   {
-    oddsapi_search(r, NULL);
-    return;
+    case ODDSAPI_MODE_SLATE:
+      rc = oddsapi_odds_async(a->league->sport_key, oddsapi_on_slate, r);
+      break;
+
+    case ODDSAPI_MODE_FUTURES:
+      rc = oddsapi_futures_async(a->league->outright_key, oddsapi_on_futures,
+          r);
+      break;
+
+    case ODDSAPI_MODE_SCORES:
+      rc = oddsapi_scores_async(a->league->sport_key, oddsapi_on_scores, r);
+      break;
+
+    // A named league is searched without asking whether it is in
+    // season: whoever typed it already decided.
+    case ODDSAPI_MODE_TEAM:
+    case ODDSAPI_MODE_SCORES_TEAM:
+      if(a->league != NULL)
+      {
+        oddsapi_search(r, NULL);
+        return;
+      }
+
+      rc = oddsapi_sports_async(oddsapi_on_sports, r);
+      break;
   }
-
-  if(a.mode == ODDSAPI_MODE_SLATE)
-    rc = oddsapi_odds_async(a.league->sport_key, oddsapi_on_slate, r);
-
-  else
-    rc = oddsapi_sports_async(oddsapi_on_sports, r);
 
   if(rc == ASYNC_FAILED_UNDELIVERED)
   {
     cmd_reply(ctx, oddsapi_status_note(ODDSAPI_TRANSPORT));
     mem_free(r);
   }
+}
+
+static void
+oddsapi_odds_cmd(const cmd_ctx_t *ctx)
+{
+  oddsapi_args_t a;
+  bool           ok = oddsapi_args_parse(ctx->args, &a);
+  char           line[ODDSAPI_CMD_REPLY_SZ];
+
+  if(!oddsapi_ready(ctx, ok ? &a : NULL, ODDSAPI_ODDS_USAGE))
+    return;
+
+  if(!a.futures)
+  {
+    oddsapi_start(ctx, a.query[0] == '\0' ? ODDSAPI_MODE_SLATE
+        : ODDSAPI_MODE_TEAM, &a);
+    return;
+  }
+
+  if(a.league == NULL || a.query[0] != '\0')
+    oddsapi_usage(ctx, ODDSAPI_ODDS_USAGE);
+
+  else if(a.league->outright_key == NULL)
+  {
+    snprintf(line, sizeof(line), "No futures market for %s.",
+        a.league->label);
+    cmd_reply(ctx, line);
+  }
+
+  else
+    oddsapi_start(ctx, ODDSAPI_MODE_FUTURES, &a);
+}
+
+static void
+oddsapi_scores_cmd(const cmd_ctx_t *ctx)
+{
+  oddsapi_args_t a;
+  bool           ok = oddsapi_args_parse(ctx->args, &a);
+
+  if(!oddsapi_ready(ctx, ok && !a.futures ? &a : NULL,
+      ODDSAPI_SCORES_USAGE))
+    return;
+
+  oddsapi_start(ctx, a.query[0] == '\0' ? ODDSAPI_MODE_SCORES
+      : ODDSAPI_MODE_SCORES_TEAM, &a);
 }
 
 // ----------------------------------------------------------------------
@@ -1163,7 +1573,7 @@ static const cmd_decl_t show_odds_decl = {
 static const cmd_decl_t odds_decl = {
   .module      = ODDSAPI_CTX,
   .name        = "odds",
-  .usage       = "odds <league> | odds [<league>] <team>",
+  .usage       = ODDSAPI_ODDS_USAGE,
   .description = "Betting lines — a league's slate or one team's next game, "
                  "consensus and best price across US sportsbooks "
                  "(the-odds-api.com)",
@@ -1178,15 +1588,37 @@ static const cmd_decl_t odds_decl = {
                  "for plugin.oddsapi.odds_ttl and every answer says how old "
                  "it is; "
                  "when the month's credits run low, the cached copy is "
-                 "served with its age instead of spending more.",
+                 "served with its age instead of spending more. "
+                 "--futures (-f) lists a league's outright market, "
+                 "favourite first: the consensus price, the probability it "
+                 "implies — vig included, so the column sums past 100% — "
+                 "and the best price with its book.",
   .group       = USERNS_GROUP_EVERYONE,
   .scope       = CMD_SCOPE_ANY,
   .methods     = METHOD_T_ANY,
   .cb          = oddsapi_odds_cmd,
 };
 
-// Raised together: half a command surface is a half-loaded plugin, so
-// the second failure unwinds the first.
+static const cmd_decl_t scores_decl = {
+  .module      = ODDSAPI_CTX,
+  .name        = "scores",
+  .usage       = ODDSAPI_SCORES_USAGE,
+  .description = "Live and recent scores (the-odds-api.com)",
+  .help_long   = "A league lists its games live now, then finals from the "
+                 "last day, newest first, then the next to start. A team — "
+                 "with or without its league — shows its live game, else "
+                 "its latest final, else its next game. The source has no "
+                 "game clock, so a game in progress says only LIVE. "
+                 "`scores` alone lists the league names. A league's scores "
+                 "are cached for plugin.oddsapi.scores_ttl.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = oddsapi_scores_cmd,
+};
+
+// Raised together: half a command surface is a half-loaded plugin, so a
+// later failure unwinds what came before it.
 bool
 oddsapi_cmd_register(void)
 {
@@ -1199,14 +1631,22 @@ oddsapi_cmd_register(void)
     return(FAIL);
   }
 
-  clam(CLAM_INFO, ODDSAPI_CMD_CTX, "show odds and odds registered");
+  if(cmd_register(&scores_decl) != SUCCESS)
+  {
+    cmd_unregister_path("odds");
+    cmd_unregister_path("show/odds");
+    return(FAIL);
+  }
+
+  clam(CLAM_INFO, ODDSAPI_CMD_CTX, "show odds, odds and scores registered");
   return(SUCCESS);
 }
 
 void
 oddsapi_cmd_unregister(void)
 {
+  cmd_unregister_path("scores");
   cmd_unregister_path("odds");
   cmd_unregister_path("show/odds");
-  clam(CLAM_INFO, ODDSAPI_CMD_CTX, "show odds and odds unregistered");
+  clam(CLAM_INFO, ODDSAPI_CMD_CTX, "show odds, odds and scores unregistered");
 }
