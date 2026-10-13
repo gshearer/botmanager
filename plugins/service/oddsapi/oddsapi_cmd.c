@@ -1,7 +1,9 @@
 // botmanager — MIT
 // The oddsapi plugin's command surface. `show odds` reads only local
 // state — the quota as the API last described it, and the cache — so it
-// answers synchronously and costs nothing.
+// answers synchronously and costs nothing. `odds` renders a league's
+// slate or one team's card from the cached league pull, so a card costs
+// nothing past the slate it rides on.
 #define ODDSAPI_INTERNAL
 #define ODDSAPI_CMD_INTERNAL
 #include "oddsapi.h"
@@ -154,6 +156,990 @@ oddsapi_show_cmd(const cmd_ctx_t *ctx)
 }
 
 // ----------------------------------------------------------------------
+// odds — formatting
+// ----------------------------------------------------------------------
+
+// "as of 4m ago" — or, when the copy was served past its TTL, the same
+// in yellow with the provider's reason ("quota low", "rate limited").
+static void
+oddsapi_as_of(const oddsapi_res_t *res, time_t now, char *out, size_t cap)
+{
+  time_t d = now > res->fetched ? now - res->fetched : 0;
+  char   ago[24];
+
+  if(d < 60)
+    snprintf(ago, sizeof(ago), "%lds", (long)d);
+
+  else if(d < 3600)
+    snprintf(ago, sizeof(ago), "%ldm", (long)(d / 60));
+
+  else if(d < 86400)
+    snprintf(ago, sizeof(ago), "%ldh", (long)(d / 3600));
+
+  else
+    snprintf(ago, sizeof(ago), "%ldd", (long)(d / 86400));
+
+  if(res->stale)
+    snprintf(out, cap, CLR_YELLOW "as of %s ago · %s" CLR_RESET, ago,
+        res->message);
+
+  else
+    snprintf(out, cap, "as of %s ago", ago);
+}
+
+// A start time in the host zone; the daemon never touches TZ. The short
+// form is a slate cell — "Sun 1:00p", "Oct 18" past six days out, a red
+// LIVE once it has begun — and the full form a card's title.
+static void
+oddsapi_when(time_t t, time_t now, bool full, char *out, size_t cap)
+{
+  struct tm tm;
+  char      day[16];
+  char      zone[16];
+  int       hour;
+
+  if(!full && t <= now)
+  {
+    strlcpy(out, CLR_RED "LIVE" CLR_RESET, cap);
+    return;
+  }
+
+  if(localtime_r(&t, &tm) == NULL)
+  {
+    strlcpy(out, "?", cap);
+    return;
+  }
+
+  // strftime names the day, month and zone; the unpadded numbers are
+  // ours, since its '-' flag is a GNU extension.
+  hour = tm.tm_hour % 12 == 0 ? 12 : tm.tm_hour % 12;
+
+  if(full)
+  {
+    strftime(day, sizeof(day), "%a %b", &tm);
+    strftime(zone, sizeof(zone), "%Z", &tm);
+    snprintf(out, cap, "%s %d %d:%02d%s %s", day, tm.tm_mday, hour,
+        tm.tm_min, tm.tm_hour < 12 ? "am" : "pm", zone);
+  }
+
+  else if(t - now > 6 * 86400)
+  {
+    strftime(day, sizeof(day), "%b", &tm);
+    snprintf(out, cap, "%s %d", day, tm.tm_mday);
+  }
+
+  else
+  {
+    strftime(day, sizeof(day), "%a", &tm);
+    snprintf(out, cap, "%s %d:%02d%s", day, hour, tm.tm_min,
+        tm.tm_hour < 12 ? "a" : "p");
+  }
+}
+
+// An American price, "—" when absent, with the quoting book's code after
+// it when there is one.
+static void
+oddsapi_px(int32_t px, const char *code, char *out, size_t cap)
+{
+  if(px == 0)
+    strlcpy(out, "—", cap);
+
+  else if(code != NULL)
+    snprintf(out, cap, "%+d %s", (int)px, code);
+
+  else
+    snprintf(out, cap, "%+d", (int)px);
+}
+
+static void
+oddsapi_spread_pt(float pt, char *out, size_t cap)
+{
+  if(fabsf(pt) < ODDSAPI_PT_EPS)
+    strlcpy(out, "PK", cap);
+
+  else
+    snprintf(out, cap, "%+.1f", (double)pt);
+}
+
+static const char *
+oddsapi_book_code(const oddsapi_line_t *l, char *buf, size_t cap)
+{
+  for(size_t i = 0;
+      i < sizeof(oddsapi_book_codes) / sizeof(oddsapi_book_codes[0]); i++)
+  {
+    if(strcmp(l->key, oddsapi_book_codes[i].key) == 0)
+      return(oddsapi_book_codes[i].code);
+  }
+
+  display_fit(l->title, 4, buf, cap, NULL);
+  return(buf);
+}
+
+// Every failure obliges the same thing — say why and stop — so the
+// reason is phrased for whoever typed the command, not for the log.
+static const char *
+oddsapi_status_note(oddsapi_status_t st)
+{
+  switch(st)
+  {
+    case ODDSAPI_OK:           return("");
+    case ODDSAPI_NOT_FOUND:    return("The Odds API doesn't carry that league right now.");
+    case ODDSAPI_RATE_LIMITED: return(CLR_ORANGE "The Odds API is rate-limiting us — try again in a minute." CLR_RESET);
+    case ODDSAPI_AUTH:         return("The Odds API refused our key (check plugin.oddsapi.creds.apikey).");
+    case ODDSAPI_QUOTA:        return(CLR_YELLOW "This month's Odds API credits are spent, or nearly — nothing cached to show." CLR_RESET);
+    case ODDSAPI_TRANSPORT:    return("The Odds API is unreachable right now.");
+    case ODDSAPI_PARSE:        return("The Odds API sent a reply we couldn't read.");
+  }
+
+  return("The Odds API is unavailable right now.");
+}
+
+// ----------------------------------------------------------------------
+// odds <league> — the slate
+// ----------------------------------------------------------------------
+
+// "+115 / -135", or away / draw / home in a three-way sport — each price
+// right-aligned to `pw` so the slashes stack down the column.
+static void
+oddsapi_slate_ml(const oddsapi_consensus_t *c, bool draw, int pw, char *out,
+    size_t cap)
+{
+  int32_t px[3];
+  uint8_t n = 0;
+
+  px[n++] = c->px[ODDSAPI_COL_ML_AWAY];
+
+  if(draw)
+    px[n++] = c->px[ODDSAPI_COL_ML_DRAW];
+
+  px[n++] = c->px[ODDSAPI_COL_ML_HOME];
+  out[0]  = '\0';
+
+  for(uint8_t i = 0; i < n; i++)
+  {
+    char cell[ODDSAPI_CELL_SZ];
+
+    oddsapi_px(px[i], NULL, cell, sizeof(cell));
+    display_align_right(cell, sizeof(cell), pw);
+
+    if(i > 0)
+      display_cat(out, cap, " / ");
+
+    display_cat(out, cap, cell);
+  }
+}
+
+static void
+oddsapi_render_slate(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
+    const oddsapi_res_t *res)
+{
+  const oddsapi_slate_t *s      = res->slate;
+  uint32_t               rows   = (uint32_t)kv_get_uint("plugin.oddsapi.rows");
+  uint32_t               shown  = s->ngames < rows ? s->ngames : rows;
+  time_t                 now    = time(NULL);
+  uint8_t                books  = 0;
+  bool                   draw   = false;
+  int                    pw     = ODDSAPI_PX_W;
+  int                    spr_w  = 0;
+  int                    tot_w  = 0;
+  int                    ml_w, away_w, home_w, names;
+  char                   line[ODDSAPI_CMD_REPLY_SZ];
+  char                   as_of[ODDSAPI_CELL_SZ * 3];
+
+  if(s->ngames == 0)
+  {
+    snprintf(line, sizeof(line), "No %s lines posted right now.",
+        league->label);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  // The header counts the books that actually quoted, never the KV list:
+  // a configured book that does not carry the league is simply absent.
+  for(uint32_t i = 0; i < s->ngames; i++)
+  {
+    if(s->games[i].nbooks > books)
+      books = s->games[i].nbooks;
+  }
+
+  // The rows it will show size the money line, and decide whether a
+  // spread or total column says anything at all (`include/display.h`).
+  for(uint32_t i = 0; i < shown; i++)
+  {
+    oddsapi_consensus_t c;
+
+    oddsapi_consensus(&s->games[i], &c);
+
+    if(c.px[ODDSAPI_COL_ML_DRAW] != 0)
+      draw = true;
+
+    if(c.px[ODDSAPI_COL_SPR_HOME] != 0 || c.px[ODDSAPI_COL_SPR_AWAY] != 0)
+      spr_w = ODDSAPI_SLATE_SPR_W;
+
+    if(c.px[ODDSAPI_COL_OVER] != 0 || c.px[ODDSAPI_COL_UNDER] != 0)
+      tot_w = ODDSAPI_SLATE_TOT_W;
+
+    for(int col = ODDSAPI_COL_ML_AWAY; col <= ODDSAPI_COL_ML_DRAW; col++)
+    {
+      char cell[ODDSAPI_CELL_SZ];
+      int  w;
+
+      oddsapi_px(c.px[col], NULL, cell, sizeof(cell));
+      w = (int)display_vis_len(cell);
+
+      if(w > pw)
+        pw = w;
+    }
+  }
+
+  // Two gutters lead the money line; the team names pay for the rest.
+  ml_w   = draw ? 3 * pw + 6 + 2 : 2 * pw + 3 + 2;
+  names  = DISPLAY_COLS - ODDSAPI_SLATE_WHEN_W - ml_w - spr_w - tot_w;
+  away_w = names / 2;
+  home_w = names - away_w;
+
+  oddsapi_as_of(res, now, as_of, sizeof(as_of));
+  snprintf(line, sizeof(line), CLR_BOLD "%s" CLR_RESET
+      " · consensus of %u book%s · %s", league->label, books,
+      books == 1 ? "" : "s", as_of);
+  cmd_reply(ctx, line);
+
+  line[0] = '\0';
+  oddsapi_cell(line, sizeof(line), CLR_GRAY "when", ODDSAPI_SLATE_WHEN_W,
+      false);
+  oddsapi_cell(line, sizeof(line), "away", away_w, false);
+  oddsapi_cell(line, sizeof(line), "  home", home_w, false);
+  oddsapi_cell(line, sizeof(line), draw ? "ML away/draw/home"
+      : "ML away/home", ml_w, true);
+  if(spr_w > 0)
+    oddsapi_cell(line, sizeof(line), "home spr", spr_w, true);
+
+  if(tot_w > 0)
+    oddsapi_cell(line, sizeof(line), "total", tot_w, true);
+
+  display_cat(line, sizeof(line), CLR_RESET);
+  cmd_reply(ctx, line);
+
+  for(uint32_t i = 0; i < shown; i++)
+  {
+    const oddsapi_game_t *g = &s->games[i];
+    oddsapi_consensus_t   c;
+    char                  when[ODDSAPI_WHEN_SZ];
+    char                  away[ODDSAPI_TEAM_SZ + 8];
+    char                  home[ODDSAPI_TEAM_SZ + 8];
+    char                  ml[ODDSAPI_CELL_SZ];
+    char                  spr[ODDSAPI_CELL_SZ];
+    char                  tot[ODDSAPI_CELL_SZ];
+
+    oddsapi_consensus(g, &c);
+    oddsapi_when(g->commence, now, false, when, sizeof(when));
+
+    // Budget one column for the mark and one for the gutter; the home
+    // cell also carries its "@ ".
+    display_fit(g->away, away_w - 2, away, sizeof(away), "…");
+    strlcpy(home, "@ ", sizeof(home));
+    display_fit(g->home, home_w - 4, home + 2, sizeof(home) - 2, "…");
+    oddsapi_slate_ml(&c, draw, pw, ml, sizeof(ml));
+
+    if(c.px[ODDSAPI_COL_SPR_HOME] != 0 || c.px[ODDSAPI_COL_SPR_AWAY] != 0)
+      oddsapi_spread_pt(c.spr_home_pt, spr, sizeof(spr));
+
+    else
+      strlcpy(spr, "—", sizeof(spr));
+
+    if(c.px[ODDSAPI_COL_OVER] != 0 || c.px[ODDSAPI_COL_UNDER] != 0)
+      snprintf(tot, sizeof(tot), "%.1f", (double)c.tot_pt);
+
+    else
+      strlcpy(tot, "—", sizeof(tot));
+
+    line[0] = '\0';
+    oddsapi_cell(line, sizeof(line), when, ODDSAPI_SLATE_WHEN_W, false);
+    oddsapi_cell(line, sizeof(line), away, away_w, false);
+    oddsapi_cell(line, sizeof(line), home, home_w, false);
+    oddsapi_cell(line, sizeof(line), ml, ml_w, true);
+    if(spr_w > 0)
+      oddsapi_cell(line, sizeof(line), spr, spr_w, true);
+
+    if(tot_w > 0)
+      oddsapi_cell(line, sizeof(line), tot, tot_w, true);
+
+    cmd_reply(ctx, line);
+  }
+
+  if(s->ngames > shown)
+  {
+    snprintf(line, sizeof(line), CLR_GRAY "+%u more — odds %s <team>"
+        CLR_RESET, s->ngames - shown, league->alias);
+    cmd_reply(ctx, line);
+  }
+}
+
+// ----------------------------------------------------------------------
+// odds [<league>] <team> — the card
+// ----------------------------------------------------------------------
+
+// One row's cells after the label: away, [draw,] home, spread, total —
+// the slate's money-line order.
+// `codes`, when given, names the book behind each column's price — the
+// best row. Returns the row's cell count, label included.
+static uint8_t
+oddsapi_card_row(const oddsapi_line_t *l, const char *const *codes,
+    bool draw, char cells[ODDSAPI_CARD_COLS][ODDSAPI_CELL_SZ])
+{
+  uint8_t n = 1;
+  char    pt[16];
+  char    a[ODDSAPI_PX_SZ];
+  char    b[ODDSAPI_PX_SZ];
+
+  oddsapi_px(l->ml_away, codes != NULL ? codes[ODDSAPI_COL_ML_AWAY] : NULL,
+      cells[n++], ODDSAPI_CELL_SZ);
+
+  if(draw)
+    oddsapi_px(l->ml_draw, codes != NULL ? codes[ODDSAPI_COL_ML_DRAW] : NULL,
+        cells[n++], ODDSAPI_CELL_SZ);
+
+  oddsapi_px(l->ml_home, codes != NULL ? codes[ODDSAPI_COL_ML_HOME] : NULL,
+      cells[n++], ODDSAPI_CELL_SZ);
+
+  if(l->spr_home_px == 0 && l->spr_away_px == 0)
+    strlcpy(cells[n++], "—", ODDSAPI_CELL_SZ);
+
+  else
+  {
+    oddsapi_spread_pt(l->spr_home_pt, pt, sizeof(pt));
+    oddsapi_px(l->spr_home_px,
+        codes != NULL ? codes[ODDSAPI_COL_SPR_HOME] : NULL, a, sizeof(a));
+    oddsapi_px(l->spr_away_px,
+        codes != NULL ? codes[ODDSAPI_COL_SPR_AWAY] : NULL, b, sizeof(b));
+    snprintf(cells[n++], ODDSAPI_CELL_SZ, "%s %s / %s", pt, a, b);
+  }
+
+  if(l->over_px == 0 && l->under_px == 0)
+    strlcpy(cells[n++], "—", ODDSAPI_CELL_SZ);
+
+  else
+  {
+    oddsapi_px(l->over_px, codes != NULL ? codes[ODDSAPI_COL_OVER] : NULL,
+        a, sizeof(a));
+    oddsapi_px(l->under_px, codes != NULL ? codes[ODDSAPI_COL_UNDER] : NULL,
+        b, sizeof(b));
+    snprintf(cells[n++], ODDSAPI_CELL_SZ, "%.1f o%s u%s",
+        (double)l->tot_pt, a, b);
+  }
+
+  return(n);
+}
+
+// "Kansas City Chiefs @ Buffalo Bills · NFL · Sun Oct 11 1:00pm EDT",
+// LIVE once begun, and `tail` (the card's freshness) when given.
+static void
+oddsapi_render_title(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
+    const char *away, const char *home, time_t commence, const char *tail)
+{
+  time_t now = time(NULL);
+  char   when[ODDSAPI_WHEN_SZ];
+  char   line[ODDSAPI_CMD_REPLY_SZ];
+
+  oddsapi_when(commence, now, true, when, sizeof(when));
+  snprintf(line, sizeof(line), CLR_BOLD "%s @ %s" CLR_RESET " · %s · %s%s%s%s",
+      away, home, league->label, when,
+      commence <= now ? " · " CLR_RED "LIVE" CLR_RESET : "",
+      tail != NULL ? " · " : "", tail != NULL ? tail : "");
+  cmd_reply(ctx, line);
+}
+
+// Column `k`'s width over the header and rows [0, nrows), with the two
+// gutters every column but the last carries.
+static int
+oddsapi_card_width(char cells[][ODDSAPI_CARD_COLS][ODDSAPI_CELL_SZ],
+    char hdr[ODDSAPI_CARD_COLS][ODDSAPI_CELL_SZ], uint8_t nrows, uint8_t k,
+    uint8_t ncols)
+{
+  int w = (int)display_vis_len(hdr[k]);
+
+  for(uint8_t r = 0; r < nrows; r++)
+  {
+    int v = (int)display_vis_len(cells[r][k]);
+
+    if(v > w)
+      w = v;
+  }
+
+  return(k + 1 < ncols ? w + 2 : w);
+}
+
+// A spread or total column no book quotes says nothing on any row —
+// soccer's spread, as often as not — so it leaves the grid
+// (`include/display.h`). Columns [first, ncols) are the candidates.
+static void
+oddsapi_card_drop_empty(char cells[][ODDSAPI_CARD_COLS][ODDSAPI_CELL_SZ],
+    char hdr[ODDSAPI_CARD_COLS][ODDSAPI_CELL_SZ], uint8_t nrows,
+    uint8_t first, uint8_t *ncols)
+{
+  for(uint8_t k = *ncols; k-- > first;)
+  {
+    bool empty = true;
+
+    for(uint8_t r = 0; empty && r < nrows; r++)
+      empty = strcmp(cells[r][k], "—") == 0;
+
+    if(!empty)
+      continue;
+
+    for(uint8_t r = 0; r < nrows; r++)
+      memmove(cells[r][k], cells[r][k + 1],
+          (size_t)(*ncols - 1 - k) * ODDSAPI_CELL_SZ);
+
+    memmove(hdr[k], hdr[k + 1], (size_t)(*ncols - 1 - k) * ODDSAPI_CELL_SZ);
+    (*ncols)--;
+  }
+}
+
+// The card: a row per book, then consensus and best. Columns are sized
+// from their widest cell; when the best row — the widest, since it names
+// a book beside every price — cannot fit DISPLAY_COLS, it takes two
+// lines rather than squeeze the grid.
+static void
+oddsapi_render_game(const cmd_ctx_t *ctx, const oddsapi_league_t *league,
+    const oddsapi_game_t *g, const oddsapi_res_t *res)
+{
+  static const char *const head[ODDSAPI_CARD_COLS] = {
+    "book", "away", "draw", "home", "spread (home)", "total"
+  };
+
+  oddsapi_consensus_t c;
+  oddsapi_best_t      best[ODDSAPI_COL_COUNT];
+  oddsapi_line_t      cl, bl;
+  const char         *codes[ODDSAPI_COL_COUNT];
+  char                code_buf[ODDSAPI_COL_COUNT][ODDSAPI_CODE_SZ];
+  char                cells[ODDSAPI_CARD_ROWS][ODDSAPI_CARD_COLS][ODDSAPI_CELL_SZ];
+  char                hdr[ODDSAPI_CARD_COLS][ODDSAPI_CELL_SZ];
+  char                line[ODDSAPI_CMD_REPLY_SZ];
+  char                as_of[ODDSAPI_CELL_SZ * 3];
+  int                 w[ODDSAPI_CARD_COLS] = { 0 };
+  int                 total = 0;
+  uint8_t             nrows = 0;
+  uint8_t             ncols = 0;
+  uint8_t             lines;                // first spread/total column
+  uint8_t             best_row;
+  bool                draw  = false;
+  bool                split;
+
+  oddsapi_consensus(g, &c);
+  oddsapi_best(g, &c, best);
+  draw = c.px[ODDSAPI_COL_ML_DRAW] != 0;
+
+  oddsapi_as_of(res, time(NULL), as_of, sizeof(as_of));
+  oddsapi_render_title(ctx, league, g->away, g->home, g->commence, as_of);
+
+  // The header row is the grid's first row, so it sizes columns too.
+  for(uint8_t i = 0, k = 0; i < ODDSAPI_CARD_COLS; i++)
+  {
+    if(i == 2 && !draw)
+      continue;
+
+    strlcpy(hdr[k++], head[i], ODDSAPI_CELL_SZ);
+    ncols = k;
+  }
+
+  for(uint8_t b = 0; b < g->nbooks; b++)
+  {
+    display_fit(g->books[b].title, ODDSAPI_CARD_BOOK_W - 2, cells[nrows][0],
+        ODDSAPI_CELL_SZ, "…");
+    oddsapi_card_row(&g->books[b], NULL, draw, cells[nrows++]);
+  }
+
+  // Consensus and best are rows of the same shape as a book's, so one
+  // formatter draws all three. Both price the spread and total at the
+  // modal point.
+  memset(&cl, 0, sizeof(cl));
+  cl.ml_away     = c.px[ODDSAPI_COL_ML_AWAY];
+  cl.ml_home     = c.px[ODDSAPI_COL_ML_HOME];
+  cl.ml_draw     = c.px[ODDSAPI_COL_ML_DRAW];
+  cl.spr_home_pt = c.spr_home_pt;
+  cl.spr_home_px = c.px[ODDSAPI_COL_SPR_HOME];
+  cl.spr_away_px = c.px[ODDSAPI_COL_SPR_AWAY];
+  cl.tot_pt      = c.tot_pt;
+  cl.over_px     = c.px[ODDSAPI_COL_OVER];
+  cl.under_px    = c.px[ODDSAPI_COL_UNDER];
+  strlcpy(cells[nrows][0], "consensus", ODDSAPI_CELL_SZ);
+  oddsapi_card_row(&cl, NULL, draw, cells[nrows++]);
+
+  bl = cl;
+  bl.ml_away     = best[ODDSAPI_COL_ML_AWAY].px;
+  bl.ml_home     = best[ODDSAPI_COL_ML_HOME].px;
+  bl.ml_draw     = best[ODDSAPI_COL_ML_DRAW].px;
+  bl.spr_home_px = best[ODDSAPI_COL_SPR_HOME].px;
+  bl.spr_away_px = best[ODDSAPI_COL_SPR_AWAY].px;
+  bl.over_px     = best[ODDSAPI_COL_OVER].px;
+  bl.under_px    = best[ODDSAPI_COL_UNDER].px;
+
+  for(int col = 0; col < ODDSAPI_COL_COUNT; col++)
+    codes[col] = best[col].px != 0
+        ? oddsapi_book_code(&g->books[best[col].book], code_buf[col],
+            sizeof(code_buf[col]))
+        : NULL;
+
+  best_row = nrows;
+  strlcpy(cells[nrows][0], "best", ODDSAPI_CELL_SZ);
+  oddsapi_card_row(&bl, codes, draw, cells[nrows++]);
+
+  lines = draw ? 4 : 3;
+  oddsapi_card_drop_empty(cells, hdr, nrows, lines, &ncols);
+
+  for(uint8_t k = 0; k < ncols; k++)
+  {
+    w[k]   = oddsapi_card_width(cells, hdr, nrows, k, ncols);
+    total += w[k];
+  }
+
+  // Too wide: the spread and total columns are re-sized without the
+  // best row, whose prices there move to a second line.
+  split = total > DISPLAY_COLS;
+
+  for(uint8_t k = lines; split && k < ncols; k++)
+    w[k] = oddsapi_card_width(cells, hdr, best_row, k, ncols);
+
+  line[0] = '\0';
+  display_cat(line, sizeof(line), CLR_GRAY);
+
+  for(uint8_t k = 0; k < ncols; k++)
+    oddsapi_cell(line, sizeof(line), hdr[k], k + 1 < ncols ? w[k] : 0, false);
+
+  display_cat(line, sizeof(line), CLR_RESET);
+  cmd_reply(ctx, line);
+
+  for(uint8_t r = 0; r < nrows; r++)
+  {
+    uint8_t last = r == best_row && split ? lines : ncols;
+
+    // A book's title is bold and its prices plain; consensus is bold
+    // throughout, best green.
+    line[0] = '\0';
+    display_cat(line, sizeof(line), r == best_row ? CLR_GREEN : CLR_BOLD);
+
+    for(uint8_t k = 0; k < last; k++)
+    {
+      oddsapi_cell(line, sizeof(line), cells[r][k],
+          k + 1 < ncols ? w[k] : 0, false);
+
+      if(k == 0 && r + 1 < best_row)
+        display_cat(line, sizeof(line), CLR_RESET);
+    }
+
+    display_cat(line, sizeof(line), CLR_RESET);
+    cmd_reply(ctx, line);
+  }
+
+  // The second line names its columns: it cannot stand under them.
+  if(split)
+  {
+    line[0] = '\0';
+    oddsapi_cell(line, sizeof(line), "", w[0], false);
+    display_cat(line, sizeof(line), CLR_GREEN);
+
+    for(uint8_t k = lines; k < ncols; k++)
+    {
+      display_cat(line, sizeof(line), k > lines ? "   " : "");
+      display_cat(line, sizeof(line), hdr[k]);
+      display_cat(line, sizeof(line), " ");
+      display_cat(line, sizeof(line), cells[best_row][k]);
+    }
+
+    display_cat(line, sizeof(line), CLR_RESET);
+    cmd_reply(ctx, line);
+  }
+}
+
+// One gray line per other game the query matched, under the card.
+static void
+oddsapi_render_also(const oddsapi_req_t *r)
+{
+  time_t now = time(NULL);
+
+  for(uint8_t i = 1; i < r->nhits; i++)
+  {
+    const oddsapi_hit_t *h = &r->hits[i];
+    char                 when[ODDSAPI_WHEN_SZ];
+    char                 line[ODDSAPI_CMD_REPLY_SZ];
+
+    oddsapi_when(h->ev.commence, now, false, when, sizeof(when));
+    snprintf(line, sizeof(line), CLR_GRAY "also: %s %s @ %s " CLR_RESET "%s",
+        h->league->label, h->ev.away, h->ev.home, when);
+    cmd_reply(&r->ctx, line);
+  }
+}
+
+// ----------------------------------------------------------------------
+// odds — the request and its completions
+// ----------------------------------------------------------------------
+
+static oddsapi_req_t *
+oddsapi_req_new(const cmd_ctx_t *ctx)
+{
+  oddsapi_req_t *r = mem_alloc(ODDSAPI_CMD_CTX, "req", sizeof(*r));
+
+  memset(r, 0, sizeof(*r));
+  r->ctx = *ctx;
+
+  if(ctx->msg != NULL)
+    r->msg = *ctx->msg;
+
+  r->ctx.msg      = &r->msg;
+  r->ctx.args     = NULL;
+  r->ctx.username = NULL;
+  r->ctx.parsed   = NULL;
+
+  return(r);
+}
+
+// First word a league → a slate, or that league's team with the rest.
+// Otherwise the whole line is a team. False when there is nothing.
+static bool
+oddsapi_args_parse(const char *args, oddsapi_args_t *out)
+{
+  char   word[ODDSAPI_SPORT_KEY_SZ];
+  size_t n;
+
+  memset(out, 0, sizeof(*out));
+
+  if(args == NULL)
+    return(false);
+
+  args += strspn(args, " \t");
+  n     = strcspn(args, " \t");
+
+  if(n == 0)
+    return(false);
+
+  if(n < sizeof(word))
+  {
+    memcpy(word, args, n);
+    word[n]     = '\0';
+    out->league = oddsapi_league_find(word);
+  }
+
+  if(out->league != NULL)
+    args += n + strspn(args + n, " \t");
+
+  strlcpy(out->query, args, sizeof(out->query));
+  n = strlen(out->query);
+
+  while(n > 0 && (out->query[n - 1] == ' ' || out->query[n - 1] == '\t'))
+    out->query[--n] = '\0';
+
+  out->mode = out->league != NULL && n == 0 ? ODDSAPI_MODE_SLATE
+                                            : ODDSAPI_MODE_TEAM;
+  return(true);
+}
+
+static void
+oddsapi_usage(const cmd_ctx_t *ctx)
+{
+  size_t                  n;
+  const oddsapi_league_t *t = oddsapi_league_table(&n);
+  char                    line[ODDSAPI_CMD_REPLY_SZ];
+
+  cmd_reply(ctx, "usage: odds <league> | odds [<league>] <team>");
+  strlcpy(line, "leagues:", sizeof(line));
+
+  for(size_t i = 0; i < n; i++)
+  {
+    strlcat(line, " ", sizeof(line));
+    strlcat(line, t[i].alias, sizeof(line));
+
+    if(t[i].alt != NULL)
+    {
+      strlcat(line, "/", sizeof(line));
+      strlcat(line, t[i].alt, sizeof(line));
+    }
+  }
+
+  cmd_reply(ctx, line);
+}
+
+static void
+oddsapi_on_slate(const oddsapi_res_t *res, void *user)
+{
+  oddsapi_req_t *r = user;
+
+  if(res->status != ODDSAPI_OK)
+    cmd_reply(&r->ctx, oddsapi_status_note(res->status));
+
+  else
+    oddsapi_render_slate(&r->ctx, r->league, res);
+
+  mem_free(r);
+}
+
+// A bare team: the free sports list says which leagues are in season.
+// If it cannot be had, every configured league is searched — the events
+// lists are free either way.
+static void
+oddsapi_on_sports(const oddsapi_res_t *res, void *user)
+{
+  oddsapi_search((oddsapi_req_t *)user,
+      res->status == ODDSAPI_OK ? res->sports : NULL);
+}
+
+// Fan the free events call out over the leagues to search: the one
+// named, or plugin.oddsapi.search_leagues less any `sp` marks out of
+// season. Takes ownership of `r`.
+//
+// The join is wordnik's: `pending` starts at 1 for the submitter, +1
+// per submit, and the submitter's own release comes after the loop —
+// because a cached list answers INSIDE the submit call, and without
+// that hold the first league to answer would be the last.
+static void
+oddsapi_search(oddsapi_req_t *r, const oddsapi_sports_t *sp)
+{
+  char  csv[ODDSAPI_CMD_REPLY_SZ];
+  char *save = NULL;
+
+  if(r->league != NULL)
+    r->parts[r->nparts++].league = r->league;
+
+  else
+  {
+    strlcpy(csv, kv_get_str("plugin.oddsapi.search_leagues"), sizeof(csv));
+
+    for(char *tok = strtok_r(csv, ", ", &save);
+        tok != NULL && r->nparts < ODDSAPI_SEARCH_MAX;
+        tok = strtok_r(NULL, ", ", &save))
+    {
+      const oddsapi_league_t *lg   = oddsapi_league_find(tok);
+      bool                    skip = lg == NULL;
+
+      if(lg == NULL)
+        clam(CLAM_WARN, ODDSAPI_CMD_CTX, "search_leagues: no league '%s'",
+            tok);
+
+      for(uint8_t i = 0; !skip && i < r->nparts; i++)
+        skip = r->parts[i].league == lg;
+
+      for(uint32_t i = 0; !skip && sp != NULL && i < sp->n; i++)
+      {
+        if(strcmp(sp->sports[i].key, lg->sport_key) == 0)
+          skip = !sp->sports[i].active;
+      }
+
+      if(!skip)
+        r->parts[r->nparts++].league = lg;
+    }
+  }
+
+  if(r->nparts == 0)
+  {
+    cmd_reply(&r->ctx, "None of the leagues a team is searched in is in "
+        "season right now — name one: odds <league> <team>");
+    mem_free(r);
+    return;
+  }
+
+  r->pending = 1;
+
+  for(uint8_t i = 0; i < r->nparts; i++)
+  {
+    oddsapi_part_t *p = &r->parts[i];
+
+    p->req = r;
+    __atomic_fetch_add(&r->pending, 1, __ATOMIC_ACQ_REL);
+
+    if(oddsapi_events_async(p->league->sport_key, oddsapi_on_events, p)
+        == ASYNC_FAILED_UNDELIVERED)
+      __atomic_fetch_sub(&r->pending, 1, __ATOMIC_ACQ_REL);
+  }
+
+  oddsapi_search_release(r);
+}
+
+static void
+oddsapi_on_events(const oddsapi_res_t *res, void *user)
+{
+  oddsapi_part_t *p = user;
+  oddsapi_req_t  *r = p->req;
+
+  if(res->status != ODDSAPI_OK)
+    clam(CLAM_DEBUG, ODDSAPI_CMD_CTX, "%s events: %s", p->league->label,
+        res->message);
+
+  for(uint32_t i = 0; res->status == ODDSAPI_OK && i < res->events->n; i++)
+  {
+    const oddsapi_event_t *ev = &res->events->events[i];
+    oddsapi_hit_t          hit;
+
+    if(!oddsapi_team_match(ev->home, r->query)
+        && !oddsapi_team_match(ev->away, r->query))
+      continue;
+
+    hit.league = p->league;
+    hit.ev     = *ev;
+    oddsapi_hit_insert(p->hits, &p->nhits, &hit);
+  }
+
+  oddsapi_search_release(r);
+}
+
+// Keep the ODDSAPI_HITS_MAX soonest, in start order.
+static void
+oddsapi_hit_insert(oddsapi_hit_t *hits, uint8_t *n, const oddsapi_hit_t *hit)
+{
+  uint8_t pos = 0;
+
+  while(pos < *n && hits[pos].ev.commence <= hit->ev.commence)
+    pos++;
+
+  if(pos >= ODDSAPI_HITS_MAX)
+    return;
+
+  if(*n < ODDSAPI_HITS_MAX)
+    (*n)++;
+
+  memmove(&hits[pos + 1], &hits[pos], (size_t)(*n - 1 - pos) * sizeof(*hits));
+  hits[pos] = *hit;
+}
+
+// The last league to answer merges every part and spends the one odds
+// pull the soonest match needs — 3 credits cold, nothing on a warm
+// slate. Never touch `r` after calling this.
+static void
+oddsapi_search_release(oddsapi_req_t *r)
+{
+  char line[ODDSAPI_CMD_REPLY_SZ];
+
+  if(__atomic_fetch_sub(&r->pending, 1, __ATOMIC_ACQ_REL) != 1)
+    return;
+
+  for(uint8_t i = 0; i < r->nparts; i++)
+  {
+    for(uint8_t j = 0; j < r->parts[i].nhits; j++)
+      oddsapi_hit_insert(r->hits, &r->nhits, &r->parts[i].hits[j]);
+  }
+
+  if(r->nhits == 0)
+  {
+    snprintf(line, sizeof(line), "No upcoming game found for '%s' in",
+        r->query);
+
+    for(uint8_t i = 0; i < r->nparts; i++)
+    {
+      strlcat(line, i == 0 ? " " : ", ", sizeof(line));
+      strlcat(line, r->parts[i].league->alias, sizeof(line));
+    }
+
+    strlcat(line, ".", sizeof(line));
+    cmd_reply(&r->ctx, line);
+    mem_free(r);
+    return;
+  }
+
+  r->league = r->hits[0].league;
+
+  if(oddsapi_odds_async(r->league->sport_key, oddsapi_on_card, r)
+      == ASYNC_FAILED_UNDELIVERED)
+  {
+    oddsapi_render_title(&r->ctx, r->league, r->hits[0].ev.away,
+        r->hits[0].ev.home, r->hits[0].ev.commence, NULL);
+    cmd_reply(&r->ctx, oddsapi_status_note(ODDSAPI_TRANSPORT));
+    oddsapi_render_also(r);
+    mem_free(r);
+  }
+}
+
+// The card rides the league pull: the game is found in the slate by id,
+// and a game whose lines are not posted yet is named with no credit
+// spent on it beyond that pull.
+static void
+oddsapi_on_card(const oddsapi_res_t *res, void *user)
+{
+  oddsapi_req_t        *r   = user;
+  const oddsapi_hit_t  *hit = &r->hits[0];
+  const oddsapi_game_t *g   = NULL;
+  char                  line[ODDSAPI_CMD_REPLY_SZ];
+
+  for(uint32_t i = 0; res->status == ODDSAPI_OK && g == NULL
+      && i < res->slate->ngames; i++)
+  {
+    if(strcmp(res->slate->games[i].id, hit->ev.id) == 0)
+      g = &res->slate->games[i];
+  }
+
+  if(g != NULL)
+    oddsapi_render_game(&r->ctx, r->league, g, res);
+
+  else
+  {
+    oddsapi_render_title(&r->ctx, r->league, hit->ev.away, hit->ev.home,
+        hit->ev.commence, NULL);
+
+    if(res->status == ODDSAPI_OK)
+    {
+      snprintf(line, sizeof(line), CLR_GRAY "no lines posted yet" CLR_RESET);
+      cmd_reply(&r->ctx, line);
+    }
+
+    else
+      cmd_reply(&r->ctx, oddsapi_status_note(res->status));
+  }
+
+  oddsapi_render_also(r);
+  mem_free(r);
+}
+
+static void
+oddsapi_odds_cmd(const cmd_ctx_t *ctx)
+{
+  oddsapi_args_t  a;
+  oddsapi_req_t  *r;
+  async_rc_t      rc;
+
+  if(!oddsapi_args_parse(ctx->args, &a))
+  {
+    oddsapi_usage(ctx);
+    return;
+  }
+
+  if(!oddsapi_configured())
+  {
+    cmd_reply(ctx, "Odds aren't set up yet — the operator needs to set "
+        "plugin.oddsapi.creds.apikey.");
+    return;
+  }
+
+  if(a.mode == ODDSAPI_MODE_TEAM && strlen(a.query) < ODDSAPI_QUERY_MIN)
+  {
+    cmd_reply(ctx, "Give me at least three letters of a team's name.");
+    return;
+  }
+
+  r = oddsapi_req_new(ctx);
+  r->mode   = a.mode;
+  r->league = a.league;
+  strlcpy(r->query, a.query, sizeof(r->query));
+
+  // A named league is searched without asking whether it is in season:
+  // whoever typed it already decided.
+  if(a.mode == ODDSAPI_MODE_TEAM && a.league != NULL)
+  {
+    oddsapi_search(r, NULL);
+    return;
+  }
+
+  if(a.mode == ODDSAPI_MODE_SLATE)
+    rc = oddsapi_odds_async(a.league->sport_key, oddsapi_on_slate, r);
+
+  else
+    rc = oddsapi_sports_async(oddsapi_on_sports, r);
+
+  if(rc == ASYNC_FAILED_UNDELIVERED)
+  {
+    cmd_reply(ctx, oddsapi_status_note(ODDSAPI_TRANSPORT));
+    mem_free(r);
+  }
+}
+
+// ----------------------------------------------------------------------
 // Registration
 // ----------------------------------------------------------------------
 
@@ -174,19 +1160,53 @@ static const cmd_decl_t show_odds_decl = {
   .parent_path = "show",
 };
 
+static const cmd_decl_t odds_decl = {
+  .module      = ODDSAPI_CTX,
+  .name        = "odds",
+  .usage       = "odds <league> | odds [<league>] <team>",
+  .description = "Betting lines — a league's slate or one team's next game, "
+                 "consensus and best price across US sportsbooks "
+                 "(the-odds-api.com)",
+  .help_long   = "A league alone lists its games: the consensus money line, "
+                 "home spread and total, each the median across the books "
+                 "that quote it. A team — with or without its league — "
+                 "shows its next game book by book, then the consensus and "
+                 "the best price with the book offering it. Spreads and "
+                 "totals are priced at the line most books agree on, so a "
+                 "best price is never one from a different line. `odds` "
+                 "alone lists the league names. A league's lines are cached "
+                 "for plugin.oddsapi.odds_ttl and every answer says how old "
+                 "it is; "
+                 "when the month's credits run low, the cached copy is "
+                 "served with its age instead of spending more.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = oddsapi_odds_cmd,
+};
+
+// Raised together: half a command surface is a half-loaded plugin, so
+// the second failure unwinds the first.
 bool
 oddsapi_cmd_register(void)
 {
   if(cmd_register(&show_odds_decl) != SUCCESS)
     return(FAIL);
 
-  clam(CLAM_INFO, ODDSAPI_CMD_CTX, "show odds registered");
+  if(cmd_register(&odds_decl) != SUCCESS)
+  {
+    cmd_unregister_path("show/odds");
+    return(FAIL);
+  }
+
+  clam(CLAM_INFO, ODDSAPI_CMD_CTX, "show odds and odds registered");
   return(SUCCESS);
 }
 
 void
 oddsapi_cmd_unregister(void)
 {
+  cmd_unregister_path("odds");
   cmd_unregister_path("show/odds");
-  clam(CLAM_INFO, ODDSAPI_CMD_CTX, "show odds unregistered");
+  clam(CLAM_INFO, ODDSAPI_CMD_CTX, "show odds and odds unregistered");
 }
