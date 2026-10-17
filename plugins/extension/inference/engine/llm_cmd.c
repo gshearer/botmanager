@@ -1522,7 +1522,54 @@ cmd_llm_del_model(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "ok");
 }
 
+// Applies `assign` (a trusted `column=value` built by the caller) to one
+// model's row and re-reads the registry. Replies its own failure, so
+// false means the caller has nothing left to say.
+static bool
+llm_model_update(const cmd_ctx_t *ctx, const char *name, const char *assign)
+{
+  char        *e_name;
+  db_result_t *res;
+  char         sql[256];
+  char         msg[512];
+
+  e_name = db_escape(name);
+
+  if(e_name == NULL)
+  {
+    cmd_reply(ctx, "error: database unavailable");
+    return(false);
+  }
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE llm_models SET %s WHERE name='%s'", assign, e_name);
+  mem_free(e_name);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    snprintf(msg, sizeof(msg), "update failed: %s", res->error);
+    cmd_reply(ctx, msg);
+    db_result_free(res);
+    return(false);
+  }
+
+  if(res->rows_affected == 0)
+  {
+    snprintf(msg, sizeof(msg), "no such model: %s", name);
+    cmd_reply(ctx, msg);
+    db_result_free(res);
+    return(false);
+  }
+
+  db_result_free(res);
+  llm_models_reload();
+  return(true);
+}
+
 // /llm set model <name> max_context <tokens>
+// /llm set model <name> enabled <on|off>
 //
 // max_context is otherwise seeded once, at `llm add model`, from the
 // service's cached /models entry — and only a vLLM-style service
@@ -1533,22 +1580,26 @@ cmd_llm_del_model(const cmd_ctx_t *ctx)
 // ⛔ There is no probe behind this. A provider's published window is a
 // document, not an endpoint: a request that overruns comes back 400, and
 // a 400 from Google means quota just as often as it means length.
+//
+// enabled is the off switch for a model whose endpoint is down on
+// purpose — a maintenance window, or a rollback kept beside its
+// successor. The row stays registered, so its declared efforts and every
+// KV naming it survive, and the engine refuses it before the wire.
 static void
 cmd_llm_set_model(const cmd_ctx_t *ctx)
 {
-  const char  *name;
-  const char  *field;
-  const char  *value;
-  char        *e_name;
-  char        *endp;
-  db_result_t *res;
+  const char   *name;
+  const char   *field;
+  const char   *value;
+  char         *endp;
   unsigned long tokens;
-  char         sql[256];
-  char         msg[512];
+  char          assign[64];
+  char          msg[512];
 
   if(ctx->parsed == NULL || ctx->parsed->argc < 3)
   {
-    cmd_reply(ctx, "usage: llm set model <name> max_context <tokens>");
+    cmd_reply(ctx, "usage: llm set model <name> max_context <tokens>"
+        "  |  enabled <on|off>");
     return;
   }
 
@@ -1556,58 +1607,44 @@ cmd_llm_set_model(const cmd_ctx_t *ctx)
   field = ctx->parsed->argv[1];
   value = ctx->parsed->argv[2];
 
-  if(strcasecmp(field, "max_context") != 0)
+  if(strcasecmp(field, "max_context") == 0)
   {
-    cmd_reply(ctx, "error: only 'max_context' is settable");
+    errno  = 0;
+    tokens = strtoul(value, &endp, 10);
+
+    if(errno != 0 || endp == value || *endp != '\0'
+        || tokens == 0 || tokens > UINT32_MAX)
+    {
+      cmd_reply(ctx, "error: max_context must be a positive token count");
+      return;
+    }
+
+    snprintf(assign, sizeof(assign), "max_context=%lu", tokens);
+    snprintf(msg, sizeof(msg), "%s max_context = %lu tokens", name, tokens);
+  }
+
+  else if(strcasecmp(field, "enabled") == 0)
+  {
+    bool on = strcasecmp(value, "on") == 0;
+
+    if(!on && strcasecmp(value, "off") != 0)
+    {
+      cmd_reply(ctx, "error: enabled takes 'on' or 'off'");
+      return;
+    }
+
+    snprintf(assign, sizeof(assign), "enabled=%s", on ? "TRUE" : "FALSE");
+    snprintf(msg, sizeof(msg), "%s %s", name, on ? "enabled" : "disabled");
+  }
+
+  else
+  {
+    cmd_reply(ctx, "error: settable fields are 'max_context' and 'enabled'");
     return;
   }
 
-  errno  = 0;
-  tokens = strtoul(value, &endp, 10);
-
-  if(errno != 0 || endp == value || *endp != '\0'
-      || tokens == 0 || tokens > UINT32_MAX)
-  {
-    cmd_reply(ctx, "error: max_context must be a positive token count");
-    return;
-  }
-
-  e_name = db_escape(name);
-
-  if(e_name == NULL)
-  {
-    cmd_reply(ctx, "error: database unavailable");
-    return;
-  }
-
-  snprintf(sql, sizeof(sql),
-      "UPDATE llm_models SET max_context=%lu WHERE name='%s'",
-      tokens, e_name);
-  mem_free(e_name);
-
-  res = db_result_alloc();
-
-  if(db_query(sql, res) != SUCCESS || !res->ok)
-  {
-    snprintf(msg, sizeof(msg), "update failed: %s", res->error);
+  if(llm_model_update(ctx, name, assign))
     cmd_reply(ctx, msg);
-    db_result_free(res);
-    return;
-  }
-
-  if(res->rows_affected == 0)
-  {
-    snprintf(msg, sizeof(msg), "no such model: %s", name);
-    cmd_reply(ctx, msg);
-    db_result_free(res);
-    return;
-  }
-
-  db_result_free(res);
-  llm_models_reload();
-
-  snprintf(msg, sizeof(msg), "%s max_context = %lu tokens", name, tokens);
-  cmd_reply(ctx, msg);
 }
 
 // /llm set service <name> url <base_url>
@@ -2414,6 +2451,7 @@ static void
 cmd_llm_set_usage(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: llm set model <name> max_context <tokens>");
+  cmd_reply(ctx, "       llm set model <name> enabled <on|off>");
   cmd_reply(ctx, "       llm set service <name> url <base_url>");
 }
 
@@ -2507,8 +2545,8 @@ static const cmd_decl_t llm_set_decl = {
 static const cmd_decl_t llm_set_model_decl = {
   .module      = "llm",
   .name        = "model",
-  .usage       = "llm set model <name> max_context <tokens>",
-  .description = "Declare a model's context window in tokens",
+  .usage       = "llm set model <name> <max_context <tokens>|enabled <on|off>>",
+  .description = "Declare a model's context window, or switch it off",
   .group       = USERNS_GROUP_ADMIN,
   .level       = 100,
   .scope       = CMD_SCOPE_ANY,
