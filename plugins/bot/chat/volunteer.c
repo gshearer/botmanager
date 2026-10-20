@@ -380,25 +380,6 @@ volunteer_embed_ring_stamp_locked(chatbot_volunteer_state_t *v,
   memcpy(v->embed_ring[oldest].vec, vec, sizeof(float) * dim);
 }
 
-// Channel-activity lookups via the engagement ring. The engagement ring
-// tracks per-(channel, user) last_seen; the most-recent entry for a
-// channel is a good approximation of "last witnessed activity".
-
-static time_t
-volunteer_channel_last_activity(chatbot_state_t *st, const char *chan)
-{
-  time_t newest = 0;
-
-  pthread_mutex_lock(&st->engagement.mutex);
-  for(size_t i = 0; i < CHATBOT_ENGAGEMENT_SLOTS; i++)
-    if(strcmp(st->engagement.slots[i].channel, chan) == 0
-        && st->engagement.slots[i].last_seen > newest)
-      newest = st->engagement.slots[i].last_seen;
-  pthread_mutex_unlock(&st->engagement.mutex);
-
-  return(newest);
-}
-
 // Gate cascade. Each gate that drops logs a CLAM_DEBUG line naming the
 // reason so operators can tune. Returns true if the post should proceed.
 // On success, `pick` is populated.
@@ -631,9 +612,26 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
       continue;
     }
 
-    // (g/h) Active/dead channel windows.
-    last_activity = volunteer_channel_last_activity(st, chan);
-    if(last_activity > 0)
+    // (g/h) Active/dead channel windows, measured from the last HUMAN
+    // line. ⚠ Not the engagement ring: that one is stamped only when the
+    // bot answers someone and is zeroed by every line opening with
+    // another nick, so on 10-19 two lines of "pops, …" / "doc, …" left
+    // #cabal reading as unknown and hedgehogg posted through the night.
+    // A room nobody has spoken in since this handle was created is
+    // cold, not unknown.
+    last_activity = chatbot_channel_last_human(st, chan);
+    if(last_activity == 0)
+    {
+      if(max_quiet > 0)
+      {
+        clam(CLAM_DEBUG, "chatbot",
+            "volunteer skip bot=%s chan=%s reason=cold_channel",
+            bot_name, chan);
+        continue;
+      }
+    }
+
+    else
     {
       time_t age = now - last_activity;
 
@@ -653,8 +651,6 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
         continue;
       }
     }
-    // Unknown (no engagement entry yet) — fall through. Don't block the
-    // first post into a fresh channel.
 
     // (i) Bot-own cooldown via chatbot_inflight_last_reply.
     own_last = chatbot_inflight_last_reply(st, chan);

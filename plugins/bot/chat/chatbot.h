@@ -978,6 +978,11 @@ void chatbot_inflight_record_reply(chatbot_state_t *st,
 time_t chatbot_inflight_last_reply(chatbot_state_t *st,
     const char *channel_or_sender);
 
+// Newest human line on `channel`, read from the CV-12 handoff ring. 0
+// means none since this handle was created — deliberately unfloored, so
+// a caller asking whether a room is alive reads a reload as "cold".
+time_t chatbot_channel_last_human(chatbot_state_t *st, const char *channel);
+
 // VF-3 — witness-interject cooldown helpers. Keyed by `target`
 // (channel for channel traffic, sender for DMs), over a cooldown.h
 // slot table under the dedicated witness_cd.mutex. TEXT-COOLDOWN-1:

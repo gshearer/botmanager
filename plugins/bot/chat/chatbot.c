@@ -467,8 +467,9 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     "Minimum seconds between successful volunteer posts in the"
     " same channel.", NULL },
   { "behavior.volunteer.max_quiet_secs", KV_UINT32, "3600",
-    "Skip channels whose last witnessed activity is older than"
-    " this many seconds (don't volunteer into a dead channel).", NULL },
+    "Skip channels where no human has spoken for this many seconds,"
+    " or at all since the bot came up (don't volunteer into a dead"
+    " channel). 0 disables.", NULL },
   { "behavior.volunteer.min_quiet_secs", KV_UINT32, "120",
     "Skip channels where anyone spoke within this many seconds"
     " (don't barge into a live conversation).", NULL },
@@ -1259,6 +1260,30 @@ chatbot_handoff_peek_other(chatbot_handoff_t *h,
 
   pthread_mutex_unlock(&h->mutex);
   return(found);
+}
+
+// The handoff ring is also the one per-channel record that every human
+// line stamps, which makes it the answer to "when did anybody last speak
+// here?". Case folds because the asker's spelling of the channel comes
+// from the method's join list, not from the line that stamped it.
+time_t
+chatbot_channel_last_human(chatbot_state_t *st, const char *channel)
+{
+  chatbot_handoff_t *h = &st->handoff;
+  time_t newest = 0;
+
+  if(channel == NULL || channel[0] == '\0')
+    return(0);
+
+  pthread_mutex_lock(&h->mutex);
+
+  for(int i = 0; i < CHATBOT_HANDOFF_SLOTS; i++)
+    if(h->slots[i].last_seen > newest
+        && strcasecmp(h->slots[i].channel, channel) == 0)
+      newest = h->slots[i].last_seen;
+
+  pthread_mutex_unlock(&h->mutex);
+  return(newest);
 }
 
 // ---------- TURN-1 floor ring ----------
@@ -2838,6 +2863,24 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   // being waited for, which is nearly always.
   soul_on_seen(botname, msg);
 
+  // CV-12: after classification, record this line's sender as the
+  // channel's most recent non-bot speaker so the *next* inbound line
+  // can consult the handoff ring. Stamping AFTER the classify call is
+  // deliberate — otherwise handoff_peek_other would self-exclude the
+  // current sender and the ring would never return a different user.
+  // Bot's own outbound lines don't flow through this path, but a
+  // belt-and-braces self-compare is cheap insurance.
+  //
+  // Ahead of the witness-log drop for the same reason as the sighting
+  // above: volunteer speech reads this ring as the room's pulse
+  // (chatbot_channel_last_human), and an unlogged line is still a
+  // person in the room.
+  if(msg->channel[0] != '\0' && msg->sender[0] != '\0'
+      && !(names.nick[0] != '\0'
+          && strcasecmp(msg->sender, names.nick) == 0))
+    chatbot_handoff_stamp(&st->handoff, msg->channel, msg->sender,
+        time(NULL));
+
   // Drop WITNESS lines if witness logging is disabled for this instance.
   if(kind == MEM_MSG_WITNESS)
   {
@@ -2846,19 +2889,6 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   }
 
   chatbot_log_line(st, msg, kind);
-
-  // CV-12: after classification, record this line's sender as the
-  // channel's most recent non-bot speaker so the *next* inbound line
-  // can consult the handoff ring. Stamping AFTER the classify call is
-  // deliberate — otherwise handoff_peek_other would self-exclude the
-  // current sender and the ring would never return a different user.
-  // Bot's own outbound lines don't flow through this path, but a
-  // belt-and-braces self-compare is cheap insurance.
-  if(msg->channel[0] != '\0' && msg->sender[0] != '\0'
-      && !(names.nick[0] != '\0'
-          && strcasecmp(msg->sender, names.nick) == 0))
-    chatbot_handoff_stamp(&st->handoff, msg->channel, msg->sender,
-        time(NULL));
 
   // Ensure the reactive topic cache reflects the currently active
   // personality before the scan runs. Steady-state this is a
