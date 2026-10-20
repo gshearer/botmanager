@@ -622,10 +622,28 @@ nl_render_dispatch_text(const char *tmpl, const char *botname,
   return(SUCCESS);
 }
 
+// True when `key` is one this bot may advertise or read over /kv: a
+// global key, or one under its own "bot.<self>." prefix. The NL KV
+// registry is process-wide, so every bot's per-bot knobs sit in it side
+// by side (#115: botman's prompt listed bot.karan.chat_model).
+static bool
+chatbot_nl_kv_is_own(const char *key, const char *botname)
+{
+  size_t blen;
+
+  if(strncmp(key, "bot.", 4) != 0)
+    return(true);
+
+  blen = strlen(botname);
+
+  return(blen > 0 && strncmp(key + 4, botname, blen) == 0
+      && key[4 + blen] == '.');
+}
+
 // Bridge-reserved "/kv <suffix>" intercept.
 //
 // Resolves `suffix` against the NL KV registry (bot-scoped first, then
-// literal) and renders the declared response_template with "$value"
+// literal, never another bot's) and renders the declared response_template with "$value"
 // substitution. No cmd_register, no command-tree node, no task-pool
 // hop — replies directly via method_send on the curl_multi thread. The
 // handler is a bridge-internal reaction to an LLM-emitted slash-token
@@ -662,7 +680,8 @@ nl_bridge_handle_kv(chatbot_req_t *r, const char *suffix)
       < (int)sizeof(key))
     nl = kv_get_nl(key);
 
-  if(nl == NULL && strlcpy(key, suffix, sizeof(key)) < sizeof(key))
+  if(nl == NULL && chatbot_nl_kv_is_own(suffix, botname)
+      && strlcpy(key, suffix, sizeof(key)) < sizeof(key))
     nl = kv_get_nl(key);
 
   if(nl == NULL)
@@ -2314,6 +2333,7 @@ typedef struct
   char            keys[CHATBOT_NL_KV_CANDIDATES][KV_KEY_SZ];
   const kv_nl_t  *nls [CHATBOT_NL_KV_CANDIDATES];
   size_t          n;
+  const char     *botname;
 } chatbot_nl_kv_collect_t;
 
 static void
@@ -2323,6 +2343,7 @@ chatbot_nl_kv_collect_cb(const char *key, const kv_nl_t *nl, void *data)
 
   if(col->n >= CHATBOT_NL_KV_CANDIDATES) return;
   if(key == NULL || nl == NULL) return;
+  if(!chatbot_nl_kv_is_own(key, col->botname)) return;
 
   strlcpy(col->keys[col->n], key, KV_KEY_SZ);
   col->nls[col->n] = nl;
@@ -2464,7 +2485,7 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
   const cmd_def_t *kept[CHATBOT_NL_CMD_CANDIDATES];
   size_t           nkept;
   chatbot_nl_collect_t    col    = {{0}, 0};
-  chatbot_nl_kv_collect_t kv_col = {{{0}}, {0}, 0};
+  chatbot_nl_kv_collect_t kv_col = {{{0}}, {0}, 0, NULL};
   const char *botname;
 
   if(r == NULL || preflight == NULL || dst == NULL || dst_sz == 0)
@@ -2519,6 +2540,12 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
   // KV pass — gated by the single allowlist token "kv". Per-KV exposure
   // is already opt-in via kv_register_nl attachment.
   kv_enabled = nl_bridge_list_permits(r->nl_bridge_cmds, "kv");
+
+  botname = bot_inst_name(r->st->inst);
+
+  if(botname == NULL) botname = "";
+
+  kv_col.botname = botname;
 
   if(kv_enabled)
     kv_iterate_nl(chatbot_nl_kv_collect_cb, &kv_col);
@@ -2660,8 +2687,6 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
 
   // KV stanzas. Rendered inline beneath the command list under the same
   // hard cap — a single truncation sentinel at the end is sufficient.
-  botname = bot_inst_name(r->st->inst);
-
   for(size_t i = 0; i < kv_col.n && !truncated; i++)
   {
     const kv_nl_t *nl = kv_col.nls[i];
