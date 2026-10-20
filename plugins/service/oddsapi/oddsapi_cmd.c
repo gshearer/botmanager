@@ -1720,7 +1720,9 @@ static const cmd_nl_slot_t oddsapi_nl_slots[] = {
 // Measured, not written: on q38nv every wording variant tried moved
 // routing, most for the worse, and dropping the props example dropped
 // odds routing everywhere. That example also teaches its own team, so
-// another player's prop pulls the Chiefs' game. AGENTS.md §Chat.
+// another player's prop pulls the Chiefs' game. A team in the /scores
+// examples is borrowed by odds asks too: with "did the bruins win?",
+// "are the penguins favoured?" became /odds bruins. AGENTS.md §Chat.
 static const cmd_nl_example_t odds_nl_examples[] = {
   { .utterance  = "who's favoured in the nba tonight?",
     .invocation = "/odds nba" },
@@ -1755,8 +1757,8 @@ static const cmd_nl_example_t scores_nl_examples[] = {
     .invocation = "/scores yankees" },
   { .utterance  = "nfl scores from yesterday",
     .invocation = "/scores nfl" },
-  { .utterance  = "did the bruins win?",
-    .invocation = "/scores bruins" },
+  { .utterance  = "did the packers win?",
+    .invocation = "/scores packers" },
 };
 
 static const cmd_nl_t scores_nl = {
