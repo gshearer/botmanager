@@ -477,7 +477,7 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   // ⭑ Only at one line: a multi-line capture is a rendered block, and
   // putting one on the wire unvoiced is the bare tool dump this module
   // exists to prevent.
-  chatbot_reply_submit(st, &msg, was_addressed, is_direct, true,
+  chatbot_reply_submit(st, &msg, false, was_addressed, is_direct, true,
       lines == 1 ? capture : NULL, NULL);
 }
 

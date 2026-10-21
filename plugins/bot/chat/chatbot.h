@@ -891,6 +891,11 @@ bool chatbot_label_is_zip(const char *label);
 // Entry point for the reply pipeline. Called from chatbot_observe
 // when speak_policy returns REPLY or INTERJECT. Ownership of st/msg is
 // *not* transferred; the function copies what it needs.
+// is_heard is true only when msg->text is a line a person said — the
+// observe path, coalesced or not. Every cue (volunteer, soul, deferred,
+// interpret, NL-ask) passes false: its text is the bot's own synthetic
+// instruction, and only a heard line is rendered "<sender> text" as the
+// live user turn (see chatbot_req_t.is_heard).
 // is_direct_address is true only when the current line literally
 // addressed the bot (nick match or DM); sticky-promoted WITNESS lines
 // must pass false so the CV-4 fallback does not fire on them.
@@ -906,8 +911,8 @@ bool chatbot_label_is_zip(const char *label);
 // KNOWLEDGE block under CHATBOT_PIN_LABEL whatever retrieval returns.
 // NULL on every submit but volunteer's. Copied; the caller keeps it.
 void chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
-    bool was_addressed, bool is_direct_address, bool nl_bridge_off,
-    const char *fallback, const knowledge_chunk_t *pin);
+    bool is_heard, bool was_addressed, bool is_direct_address,
+    bool nl_bridge_off, const char *fallback, const knowledge_chunk_t *pin);
 
 // Image-vision sibling of chatbot_reply_submit. Seeds the vision
 // fields (image_b64 ownership transfers in from the caller; mime is
@@ -1162,6 +1167,12 @@ typedef struct
   // fallback does not fire on overheard chatter.
   bool            is_direct_address;
   bool            is_action_at_bot;
+  // The live user turn is rendered "<sender> text", exactly as
+  // req_load_history renders every history turn, only when this is set.
+  // An untagged last turn leaves the model guessing who spoke it, and it
+  // guesses from the backscroll. Kept out of r->text, which feeds the
+  // retrieval queries.
+  bool            is_heard;
 
   char            sender[METHOD_SENDER_SZ];
   // Protocol-level sender identity snapshotted from the incoming

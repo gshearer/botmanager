@@ -977,7 +977,7 @@ soul_wx_announce(chatbot_state_t *st, method_inst_t *method,
       tgt->dm_watcher != NULL ? lead->label : tgt->channel,
       (unsigned)tgt->total, (unsigned)tgt->n_alerts);
 
-  chatbot_reply_submit(st, &msg, false, false, true, NULL, NULL);
+  chatbot_reply_submit(st, &msg, false, false, false, true, NULL, NULL);
 }
 
 // The sweep lands here on a task worker once every fetch has answered:

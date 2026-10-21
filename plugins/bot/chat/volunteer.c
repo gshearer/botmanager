@@ -865,7 +865,8 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   // nl_bridge_off=false: the volunteer cue never embeds tool output, so
   // it keeps the bridge — a volunteered line may legitimately reach for
   // a command.
-  chatbot_reply_submit(st, &msg, false, false, false, NULL, &job->chunk);
+  chatbot_reply_submit(st, &msg, false, false, false, false, NULL,
+      &job->chunk);
   method_release(method);
 }
 
